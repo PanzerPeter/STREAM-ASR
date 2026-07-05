@@ -1,0 +1,21 @@
+frontend_channels: 128
+encoder_dims: [192, 256, 384, 512, 384, 256]
+encoder_downsampling: [1, 2, 4, 8, 4, 2]
+encoder_layers: [2, 2, 3, 4, 3, 2]
+encoder_heads: [4, 4, 6, 8, 6, 4]
+ffn_expansion: 4
+conv_kernel_size: 15
+encoder_dropout: 0.1
+final_downsample: 2
+rope_base: 10000.0
+vocab_size: 500
+
+# Attention decoder (Stage B, U2++ bidirectional). decoder_dim projects the 256-dim encoder
+# memory up for cross-attention capacity; left decoder is L2R, right decoder consumes reversed
+# targets. SOS/EOS/decoder vocab are derived in the schema.
+decoder_dim: 512
+decoder_left_layers: 6
+decoder_right_layers: 3
+decoder_heads: 8
+decoder_ffn_expansion: 4
+decoder_dropout: 0.1

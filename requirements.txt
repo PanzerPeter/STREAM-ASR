@@ -1,0 +1,18 @@
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch
+torchaudio
+sentencepiece
+jiwer
+soundfile
+numpy
+tqdm
+tensorboard
+loguru
+rich
+pydantic
+pyyaml
+pytest
+# dev tooling (lint/format/type)
+black
+flake8
+mypy

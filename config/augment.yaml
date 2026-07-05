@@ -1,0 +1,8 @@
+speed_perturb_factors: [0.9, 1.0, 1.1]
+# SpecAugment "LD" policy. Disabled during the Stage-A diagnostic (full-strength masking from
+# step 0 pinned the from-scratch model in CTC blank collapse); restored to designed strength now
+# that collapse is escaped and Stage B warm-starts from a healthy encoder, not a random one.
+specaug_num_freq_masks: 2
+specaug_freq_width: 27
+specaug_time_ratio: 0.05
+specaug_max_time_masks: 10

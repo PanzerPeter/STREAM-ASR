@@ -1,0 +1,287 @@
+# src/slices/TrainAcousticModel/StageATrainer_Handler.py
+import math
+import os
+import time
+
+import torch
+from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
+import jiwer
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+
+from src.shared_kernel.Checkpoint_Adapter import save_checkpoint
+from src.shared_kernel.Config_Adapter import get_config
+from src.shared_kernel.Logging_Adapter import configure_logging
+from src.shared_kernel.Tokenizer_Adapter import SentencePieceTokenizer
+from src.slices.ExtractFeatures.LibriSpeechDataset import LibriSpeechDataset
+from src.slices.ExtractFeatures.FeatureCollator import collate_features
+from src.slices.ExtractFeatures.FrameBucketSampler import FrameBucketSampler
+from src.slices.TrainAcousticModel.AcousticModel import AcousticModel
+from src.slices.TrainAcousticModel.CtcGreedyDecoder import ctc_greedy_decode
+from src.slices.TrainAcousticModel.StageATrainer_Command import StageATrainCommand
+
+
+def _lr_at(step: int, peak: float, warmup: int, total: int) -> float:
+    if step < warmup:
+        return peak * step / max(1, warmup)
+    progress = (step - warmup) / max(1, total - warmup)  # cosine decay to 0
+    return peak * 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+
+
+def _fmt_hms(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:d}:{m:02d}:{s:02d}"
+
+
+def _startup_table(
+    cmd: StageATrainCommand,
+    device: str,
+    n_params: int,
+    n_train: int,
+    n_dev: int,
+    checkpointed: bool,
+) -> Table:
+    sa = get_config().training.stage_a
+    t = Table(show_header=False, box=None, padding=(0, 2))
+    t.add_column("k", style="cyan", justify="right")
+    t.add_column("v", style="white")
+    precision = "bf16 autocast" if device == "cuda" else "fp32"
+    if cmd.compile_model:
+        accel = "torch.compile"
+    else:
+        accel = "eager + grad-checkpoint" if checkpointed else "eager"
+    rows = [
+        ("device", device),
+        ("params", f"{n_params / 1e6:.1f} M"),
+        ("train / dev utts", f"{n_train:,} / {n_dev:,}"),
+        ("total steps", f"{cmd.total_steps:,}"),
+        ("max frames / batch", f"{sa.max_frames_per_batch:,}"),
+        ("grad accum", str(sa.grad_accum)),
+        ("lr peak / warmup", f"{sa.lr_peak:g} / {sa.warmup_steps:,}"),
+        ("precision", precision),
+        ("execution", accel),
+        ("checkpoints → ", cmd.ckpt_dir),
+        ("tensorboard → ", cmd.log_dir),
+    ]
+    for k, v in rows:
+        t.add_row(k, v)
+    return t
+
+
+@torch.no_grad()
+def _dev_wer(model, loader, tokenizer, device) -> tuple[float, float, list[tuple[str, str]]]:
+    """Returns (WER, mean blank-argmax fraction, a few (ref, hyp) samples). The blank fraction
+    and samples make the early-CTC blank plateau observable: WER sits pinned at 1.0 while the
+    model emits blank everywhere, so blank_frac falling from ~1.0 — and hyps turning non-empty —
+    is the earliest signal that alignment is forming, well before WER moves."""
+    blank_id = get_config().model.blank_id
+    model.eval()
+    refs, hyps = [], []
+    blank_frames = 0
+    total_frames = 0
+    samples: list[tuple[str, str]] = []
+    for batch in loader:
+        logits, out_len = model(batch.features.to(device), batch.feature_lengths.to(device))
+        best = logits.float().cpu().argmax(dim=-1)  # [B, T]
+        for b in range(best.shape[0]):
+            valid = int(out_len[b])
+            blank_frames += int((best[b, :valid] == blank_id).sum())
+            total_frames += valid
+        batch_hyps = ctc_greedy_decode(logits.float().cpu(), out_len.cpu(), tokenizer)
+        hyps.extend(batch_hyps)
+        for i in range(batch.tokens.shape[0]):
+            ref = tokenizer.decode(batch.tokens[i, : batch.token_lengths[i]].tolist())
+            refs.append(ref)
+            if len(samples) < 3:
+                samples.append((ref, batch_hyps[i]))
+    model.train()
+    blank_frac = blank_frames / max(total_frames, 1)
+    return jiwer.wer(refs, hyps), blank_frac, samples
+
+
+class _Checkpointed(torch.nn.Module):
+    """Wraps a stack so its forward runs under activation checkpointing."""
+
+    def __init__(self, module: torch.nn.Module) -> None:
+        super().__init__()
+        self.module = module
+
+    def forward(self, x, lengths, pad_mask, chunk_size=0):
+        return torch.utils.checkpoint.checkpoint(
+            self.module, x, lengths, pad_mask, chunk_size, use_reentrant=False
+        )
+
+
+def run_stage_a(cmd: StageATrainCommand) -> str:
+    log = configure_logging()
+    console = Console()
+    os.makedirs(cmd.ckpt_dir, exist_ok=True)
+    device = cmd.device if torch.cuda.is_available() else "cpu"
+    if cmd.device == "cuda" and device == "cpu":
+        log.warning("CUDA requested but unavailable — falling back to CPU (training will be slow).")
+    # TF32 tensor-core path for the fp32 ops outside bf16 autocast (CTC log-softmax, norms).
+    torch.set_float32_matmul_precision("high")
+    log.info(f"Stage-A CTC training on <{device}>")
+    tokenizer = SentencePieceTokenizer(cmd.tokenizer_model)
+    writer = SummaryWriter(cmd.log_dir)
+    sa = get_config().training.stage_a
+
+    train_ds = LibriSpeechDataset(cmd.train_manifest, tokenizer, train=True)
+    train_sampler = FrameBucketSampler(cmd.train_manifest, sa.max_frames_per_batch)
+    train_loader = DataLoader(
+        train_ds,
+        batch_sampler=train_sampler,
+        collate_fn=collate_features,
+        num_workers=4,
+        pin_memory=True,
+    )
+
+    dev_ds = LibriSpeechDataset(cmd.dev_manifest, tokenizer, train=False)
+    dev_sampler = FrameBucketSampler(cmd.dev_manifest, sa.max_frames_per_batch)
+    dev_loader = DataLoader(dev_ds, batch_sampler=dev_sampler, collate_fn=collate_features)
+
+    cmvn = cmd.cmvn_path if os.path.isfile(cmd.cmvn_path) else None
+    model = AcousticModel(cmvn_path=cmvn).to(device)
+
+    # torch.compile rematerializes activations via its own partitioner, so checkpointing only
+    # applies to the eager path, and is skipped unless config asks for it (VRAM has ~7 GB of
+    # headroom at 20k frames, and checkpointing costs ~30% step time — see grad_checkpoint).
+    checkpointed = not cmd.compile_model and sa.grad_checkpoint
+    if cmd.compile_model:
+        # Inductor's min-cut partitioner rematerializes activations itself, so we do NOT also
+        # wrap stacks in torch.utils.checkpoint — that combo breaks the partitioner under bf16.
+        # dynamic=True compiles once for variable-length batches; max-autotune is skipped because
+        # per-shape autotune recompiles are impractical for dynamic ASR batch shapes (spec §9).
+        forward = torch.compile(model, dynamic=True)
+    else:
+        if checkpointed:
+            # Bound activation memory by recomputing each stack's forward in the backward pass.
+            model.encoder.stacks = torch.nn.ModuleList(
+                [_Checkpointed(s) for s in model.encoder.stacks]
+            )
+        forward = model
+    opt = torch.optim.AdamW(
+        model.parameters(),
+        lr=sa.lr_peak,
+        weight_decay=sa.weight_decay,
+        betas=(0.9, 0.98),
+        fused=(device == "cuda"),  # fused CUDA kernel — faster optimizer step, identical math
+    )
+
+    n_params = sum(p.numel() for p in model.parameters())
+    console.print(
+        Panel(
+            _startup_table(cmd, device, n_params, len(train_ds), len(dev_ds), checkpointed),
+            title="[bold]STREAM · Stage-A[/bold]",
+            border_style="cyan",
+            expand=False,
+        )
+    )
+
+    last_ckpt = os.path.join(cmd.ckpt_dir, "stage_a_last.pt")
+    best_wer = math.inf
+    step = 0
+    run_start = time.perf_counter()
+    win_start, win_step = run_start, 0  # throughput/ETA window
+    win_loss = torch.zeros((), device=device)  # accumulate on-device; sync only at log_every
+    model.train()
+    log.info(f"Training loop started — target {cmd.total_steps:,} steps.")
+    while step < cmd.total_steps:
+        for batch in train_loader:
+            lr = _lr_at(step, sa.lr_peak, sa.warmup_steps, cmd.total_steps)
+            for g in opt.param_groups:
+                g["lr"] = lr
+
+            with torch.autocast(
+                device_type="cuda", dtype=torch.bfloat16, enabled=(device == "cuda")
+            ):
+                logits, out_len = forward(
+                    batch.features.to(device, non_blocking=True),
+                    batch.feature_lengths.to(device, non_blocking=True),
+                )
+                loss = (
+                    model.ctc_loss(
+                        logits,
+                        out_len,
+                        batch.tokens.to(device, non_blocking=True),
+                        batch.token_lengths.to(device, non_blocking=True),
+                    )
+                    / sa.grad_accum
+                )
+            loss.backward()
+
+            if (step + 1) % sa.grad_accum == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), sa.grad_clip)
+                opt.step()
+                opt.zero_grad(set_to_none=True)
+
+            win_loss += loss.detach() * sa.grad_accum  # kept on-device; no per-step sync
+
+            if step % sa.log_every == 0:
+                now = time.perf_counter()
+                its = (step - win_step) / max(now - win_start, 1e-9)
+                avg_loss = (win_loss / max(step - win_step, 1)).item()  # single sync per window
+                # its is 0 on the first log (no window elapsed yet) — show a placeholder ETA
+                # rather than the step/0 → 33333333333:20:00 artifact.
+                eta = _fmt_hms((cmd.total_steps - step) / its) if its > 0 else "—"
+                pct = 100.0 * step / cmd.total_steps
+                log.info(
+                    f"step {step:>7,}/{cmd.total_steps:,} ({pct:4.1f}%) │ "
+                    f"loss {avg_loss:7.3f} │ lr {lr:.2e} │ {its:5.2f} it/s │ eta {eta}"
+                )
+                writer.add_scalar("train/loss", avg_loss, step)
+                writer.add_scalar("train/lr", lr, step)
+                writer.add_scalar("train/it_per_s", its, step)
+                win_start, win_step = now, step
+                win_loss.zero_()
+            if step > 0 and step % sa.val_every == 0:
+                wer, blank_frac, samples = _dev_wer(model, dev_loader, tokenizer, device)
+                writer.add_scalar("dev/wer", wer, step)
+                writer.add_scalar("dev/blank_frac", blank_frac, step)
+                best = wer < best_wer
+                best_wer = min(best_wer, wer)
+                marker = "  ← best" if best else f"  (best {best_wer:.4f})"
+                log.log(
+                    "SUCCESS" if best else "INFO",
+                    f"dev WER {wer:.4f}{marker} │ blank {blank_frac:.3f}  @ step {step:,}",
+                )
+                # Sample decodes surface the phase transition before WER numerically moves.
+                for ref, hyp in samples:
+                    log.debug(f"  ref: {ref[:80]!r}")
+                    log.debug(f"  hyp: {hyp[:80]!r}")
+                # Fast-fail the blank-collapse trap: if CTC has not left the all-blank saddle by
+                # escape_check_step, alignment never formed and the rest of the run is wasted.
+                if step >= sa.escape_check_step and blank_frac > sa.escape_max_blank_frac:
+                    writer.close()
+                    raise RuntimeError(
+                        f"CTC blank collapse: blank_frac {blank_frac:.3f} > "
+                        f"{sa.escape_max_blank_frac} at step {step:,} (> escape_check_step "
+                        f"{sa.escape_check_step:,}). Model never left the all-blank saddle — raise "
+                        f"lr_peak / lengthen warmup or add the Zipformer stabilizers, then restart."
+                    )
+            if step > 0 and step % sa.ckpt_every == 0:
+                save_checkpoint(last_ckpt, model, opt, step)
+                log.debug(f"checkpoint saved → {last_ckpt}  @ step {step:,}")
+
+            step += 1
+            if step >= cmd.total_steps:
+                break
+
+    save_checkpoint(last_ckpt, model, opt, step)
+    writer.close()
+    elapsed = _fmt_hms(time.perf_counter() - run_start)
+    console.print(
+        Panel(
+            f"steps {step:,} · elapsed {elapsed} · best dev WER "
+            f"{best_wer if math.isfinite(best_wer) else float('nan'):.4f}\n"
+            f"checkpoint → {last_ckpt}",
+            title="[bold green]Stage-A complete[/bold green]",
+            border_style="green",
+            expand=False,
+        )
+    )
+    return last_ckpt
