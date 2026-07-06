@@ -131,7 +131,7 @@ def run_stage_a(cmd: StageATrainCommand) -> str:
     sa = get_config().training.stage_a
 
     train_ds = LibriSpeechDataset(cmd.train_manifest, tokenizer, train=True)
-    train_sampler = FrameBucketSampler(cmd.train_manifest, sa.max_frames_per_batch)
+    train_sampler = FrameBucketSampler(cmd.train_manifest, sa.max_frames_per_batch, shuffle=True)
     train_loader = DataLoader(
         train_ds,
         batch_sampler=train_sampler,
@@ -183,6 +183,7 @@ def run_stage_a(cmd: StageATrainCommand) -> str:
     )
 
     last_ckpt = os.path.join(cmd.ckpt_dir, "stage_a_last.pt")
+    best_ckpt = os.path.join(cmd.ckpt_dir, "stage_a_best.pt")
     best_wer = math.inf
     step = 0
     run_start = time.perf_counter()
@@ -249,6 +250,10 @@ def run_stage_a(cmd: StageATrainCommand) -> str:
                     "SUCCESS" if best else "INFO",
                     f"dev WER {wer:.4f}{marker} │ blank {blank_frac:.3f}  @ step {step:,}",
                 )
+                # Persist the best-WER weights separately: `..._last.pt` can drift/overfit past the
+                # optimum over a long run, so the shippable checkpoint is this one.
+                if best:
+                    save_checkpoint(best_ckpt, model, opt, step)
                 # Sample decodes surface the phase transition before WER numerically moves.
                 for ref, hyp in samples:
                     log.debug(f"  ref: {ref[:80]!r}")
@@ -278,7 +283,7 @@ def run_stage_a(cmd: StageATrainCommand) -> str:
         Panel(
             f"steps {step:,} · elapsed {elapsed} · best dev WER "
             f"{best_wer if math.isfinite(best_wer) else float('nan'):.4f}\n"
-            f"checkpoint → {last_ckpt}",
+            f"last → {last_ckpt}\nbest → {best_ckpt}",
             title="[bold green]Stage-A complete[/bold green]",
             border_style="green",
             expand=False,

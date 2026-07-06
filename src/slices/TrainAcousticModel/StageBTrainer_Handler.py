@@ -16,6 +16,7 @@ from src.shared_kernel.Config_Adapter import get_config
 from src.shared_kernel.Logging_Adapter import configure_logging
 from src.shared_kernel.Tokenizer_Adapter import SentencePieceTokenizer
 from src.slices.ExtractFeatures.LibriSpeechDataset import LibriSpeechDataset
+from src.slices.ExtractFeatures.FeatureBatch_Response import FeatureBatch
 from src.slices.ExtractFeatures.FeatureCollator import collate_features
 from src.slices.ExtractFeatures.FrameBucketSampler import FrameBucketSampler
 from src.slices.TrainAcousticModel.CtcGreedyDecoder import ctc_greedy_decode
@@ -40,12 +41,19 @@ def _warm_start(model: HybridCtcAttention, path: str, log) -> None:
 
 
 @torch.no_grad()
-def _dev_wer(model, loader, tokenizer, device) -> tuple[float, float]:
+def _dev_wer(model, loader, tokenizer, device) -> tuple[float, float, float]:
+    """Greedy-CTC WER + blank fraction (first-pass / encoder health) and teacher-forced attention
+    cross-entropy (decoder health). The CE is the cheap proxy for the two-pass rescoring quality
+    that greedy-CTC WER is blind to — the decoder can improve rescoring while CTC WER plateaus, and
+    it can overfit while CTC WER holds. Token-weighted mean over the dev set."""
     blank_id = get_config().model.blank_id
     model.eval()
     refs, hyps, blank_frames, total_frames = [], [], 0, 0
+    attn_ce_sum, attn_tok = 0.0, 0
     for batch in loader:
-        ctc_logits, _, out_len = model(batch.features.to(device), batch.feature_lengths.to(device))
+        ctc_logits, memory, out_len = model(
+            batch.features.to(device), batch.feature_lengths.to(device)
+        )
         best = ctc_logits.float().cpu().argmax(dim=-1)
         for b in range(best.shape[0]):
             valid = int(out_len[b])
@@ -54,8 +62,31 @@ def _dev_wer(model, loader, tokenizer, device) -> tuple[float, float]:
         hyps.extend(ctc_greedy_decode(ctc_logits.float().cpu(), out_len.cpu(), tokenizer))
         for i in range(batch.tokens.shape[0]):
             refs.append(tokenizer.decode(batch.tokens[i, : batch.token_lengths[i]].tolist()))
+
+        n_tok = int(batch.dec_lengths.sum())  # non-ignored CE positions in this batch
+        attn = model.attention_loss(
+            memory,
+            out_len,
+            FeatureBatch(
+                batch.features,
+                batch.feature_lengths,
+                batch.tokens,
+                batch.token_lengths,
+                batch.dec_in_l2r.to(device),
+                batch.dec_out_l2r.to(device),
+                batch.dec_in_r2l.to(device),
+                batch.dec_out_r2l.to(device),
+                batch.dec_lengths.to(device),
+            ),
+        )
+        attn_ce_sum += attn.item() * n_tok
+        attn_tok += n_tok
     model.train()
-    return jiwer.wer(refs, hyps), blank_frames / max(total_frames, 1)
+    return (
+        jiwer.wer(refs, hyps),
+        blank_frames / max(total_frames, 1),
+        attn_ce_sum / max(attn_tok, 1),
+    )
 
 
 def run_stage_b(cmd: StageBTrainCommand) -> str:
@@ -71,7 +102,7 @@ def run_stage_b(cmd: StageBTrainCommand) -> str:
     train_ds = LibriSpeechDataset(cmd.train_manifest, tokenizer, train=True)
     train_loader = DataLoader(
         train_ds,
-        batch_sampler=FrameBucketSampler(cmd.train_manifest, sb.max_frames_per_batch),
+        batch_sampler=FrameBucketSampler(cmd.train_manifest, sb.max_frames_per_batch, shuffle=True),
         collate_fn=collate_features,
         num_workers=4,
         pin_memory=True,
@@ -114,7 +145,9 @@ def run_stage_b(cmd: StageBTrainCommand) -> str:
     )
 
     last_ckpt = os.path.join(cmd.ckpt_dir, "stage_b_last.pt")
-    best_wer, step = math.inf, 0
+    best_ckpt = os.path.join(cmd.ckpt_dir, "stage_b_best.pt")
+    best_attn_ckpt = os.path.join(cmd.ckpt_dir, "stage_b_best_attn.pt")
+    best_wer, best_attn, step = math.inf, math.inf, 0
     run_start = time.perf_counter()
     win_start, win_step = run_start, 0
     model.train()
@@ -152,14 +185,26 @@ def run_stage_b(cmd: StageBTrainCommand) -> str:
                 writer.add_scalar("train/lr", lr, step)
                 win_start, win_step = now, step
             if step > 0 and step % sb.val_every == 0:
-                wer, blank_frac = _dev_wer(model, dev_loader, tokenizer, device)
+                wer, blank_frac, attn_ce = _dev_wer(model, dev_loader, tokenizer, device)
                 writer.add_scalar("dev/wer", wer, step)
                 writer.add_scalar("dev/blank_frac", blank_frac, step)
+                writer.add_scalar("dev/attn_ce", attn_ce, step)
                 best = wer < best_wer
                 best_wer = min(best_wer, wer)
+                best_a = attn_ce < best_attn
+                best_attn = min(best_attn, attn_ce)
+                # Two independent gates: greedy-CTC WER guards the first pass / encoder; attention
+                # CE guards the rescorer (Stage B's real deliverable, which greedy-CTC can't see).
+                # Save both bests so Phase-2 two-pass eval has the right candidate to pick from.
+                if best:
+                    save_checkpoint(best_ckpt, model, opt, step)
+                if best_a:
+                    save_checkpoint(best_attn_ckpt, model, opt, step)
                 log.log(
-                    "SUCCESS" if best else "INFO",
+                    "SUCCESS" if (best or best_a) else "INFO",
                     f"dev WER {wer:.4f}{'  ← best' if best else f'  (best {best_wer:.4f})'} │ "
+                    f"attn_ce {attn_ce:.4f}"
+                    f"{'  ← best' if best_a else f'  (best {best_attn:.4f})'} │ "
                     f"blank {blank_frac:.3f} @ step {step:,}",
                 )
                 if step >= sb.escape_check_step and blank_frac > sb.escape_max_blank_frac:
@@ -179,8 +224,9 @@ def run_stage_b(cmd: StageBTrainCommand) -> str:
     console.print(
         Panel(
             f"steps {step:,} · elapsed {_fmt_hms(time.perf_counter() - run_start)} · "
-            f"best dev WER {best_wer if math.isfinite(best_wer) else float('nan'):.4f}\n"
-            f"checkpoint → {last_ckpt}",
+            f"best dev WER {best_wer if math.isfinite(best_wer) else float('nan'):.4f} · "
+            f"best attn_ce {best_attn if math.isfinite(best_attn) else float('nan'):.4f}\n"
+            f"last → {last_ckpt}\nbest(WER) → {best_ckpt}\nbest(attn) → {best_attn_ckpt}",
             title="[bold green]Stage-B complete[/bold green]",
             border_style="green",
             expand=False,
