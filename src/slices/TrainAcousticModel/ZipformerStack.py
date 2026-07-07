@@ -1,9 +1,12 @@
 # src/slices/TrainAcousticModel/ZipformerStack.py
+from typing import cast
+
 import torch
 import torch.nn as nn
 
 from src.shared_kernel.MaskUtils import make_chunk_mask, make_pad_mask
 from src.slices.TrainAcousticModel.Resample import SimpleDownsample, SimpleUpsample
+from src.slices.TrainAcousticModel.StreamCache import AttnCache, ConvCache
 from src.slices.TrainAcousticModel.ZipformerBlock import ZipformerBlock
 
 
@@ -53,3 +56,31 @@ class ZipformerStack(nn.Module):
 
         bypass = self.bypass.clamp(0.0, 1.0)
         return residual + bypass * (x - residual)
+
+    def streaming_forward(
+        self,
+        x: torch.Tensor,
+        attn_caches: list[AttnCache],
+        conv_caches: list[ConvCache],
+    ) -> tuple[torch.Tensor, list[AttnCache], list[ConvCache]]:
+        # Chunks are aligned to downsample factor, so downsample never straddles boundary.
+        # Bypass and up/down-sample are per-frame linear ops. Streaming reduces to running
+        # each block (causal conv + KV-cached attn) at the stack's rate.
+        x = self.in_proj(x)
+        residual = x
+        base_len: int = x.shape[1]
+        if self.downsample is not None:
+            frame_len: int = x.shape[1]
+            lengths: torch.Tensor = torch.tensor([frame_len], device=x.device)
+            x, _ = self.downsample(x, lengths)
+        new_ac: list[AttnCache] = []
+        new_cc: list[ConvCache] = []
+        for i, (ac, cc) in enumerate(zip(attn_caches, conv_caches)):
+            block = cast(ZipformerBlock, self.blocks[i])
+            x, ac_new, cc_new = block.streaming_forward(x, ac, cc)
+            new_ac.append(ac_new)
+            new_cc.append(cc_new)
+        if self.upsample is not None:
+            x = self.upsample(x, out_len=base_len)
+        bypass = self.bypass.clamp(0.0, 1.0)
+        return residual + bypass * (x - residual), new_ac, new_cc

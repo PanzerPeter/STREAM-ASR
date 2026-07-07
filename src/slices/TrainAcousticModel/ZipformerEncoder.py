@@ -1,5 +1,7 @@
 # src/slices/TrainAcousticModel/ZipformerEncoder.py
+import math
 import os
+from typing import cast
 
 import torch
 import torch.nn as nn
@@ -10,6 +12,7 @@ from src.slices.TrainAcousticModel.Conv2dSubsampling import Conv2dSubsampling
 from src.slices.TrainAcousticModel.Resample import SimpleDownsample
 from src.slices.TrainAcousticModel.ZipformerStack import ZipformerStack
 from src.slices.TrainAcousticModel.BiasNorm import BiasNorm
+from src.slices.TrainAcousticModel.StreamCache import FrontendCache, StreamCache
 
 
 class ZipformerEncoder(nn.Module):
@@ -68,3 +71,41 @@ class ZipformerEncoder(nn.Module):
         x, out_lengths = self.final_downsample(x, lengths)  # ×2 -> ~25 Hz
         x = self.out_norm(x)
         return x, out_lengths
+
+    def chunk_lcm(self) -> int:
+        # Base-rate chunk boundaries must land cleanly at every stack's rate and the final
+        # downsample. Downsampling factors are lcm'd to ensure streaming input boundaries
+        # align with frame boundaries at all subsampled rates.
+        model = get_config().model
+        factors = list(model.encoder_downsampling) + [model.final_downsample]
+        lcm = 1
+        for f in factors:
+            lcm = lcm * f // math.gcd(lcm, f)
+        return lcm
+
+    def streaming_forward(
+        self, features_chunk: torch.Tensor, cache: StreamCache
+    ) -> tuple[torch.Tensor, StreamCache]:
+        # Process a feature-rate chunk through the encoder (frontend + stacks + final_downsample)
+        # with causal context carried in cache. Returns (memory_chunk, updated_cache).
+        # Callers feed chunks that are multiples of 2*chunk_lcm() so every stack's downsample
+        # aligns; see test_streaming_forward_equivalence for the exactness guarantee.
+        x = (features_chunk - self.cmvn_mean) / self.cmvn_std
+        x, in_tail, mid_tail = self.frontend.streaming_forward(
+            x, cache.frontend.in_tail, cache.frontend.mid_tail
+        )
+        cache.frontend = FrontendCache(in_tail=in_tail, mid_tail=mid_tail)
+        i = 0
+        for stack in self.stacks:
+            stack = cast(ZipformerStack, stack)
+            n = len(stack.blocks)
+            x, new_ac, new_cc = stack.streaming_forward(
+                x, cache.attn[i : i + n], cache.conv[i : i + n]
+            )
+            cache.attn[i : i + n] = new_ac
+            cache.conv[i : i + n] = new_cc
+            i += n
+        lengths = torch.tensor([x.shape[1]], device=x.device)
+        x, _ = self.final_downsample(x, lengths)
+        x = self.out_norm(x)
+        return x, cache

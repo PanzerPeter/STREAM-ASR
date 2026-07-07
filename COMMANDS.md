@@ -81,12 +81,25 @@ Dev WER stays CTC-greedy in this stage; the two-pass attention-rescore / streami
 (the future `Decode` slice). If the run OOMs, lower `training.yaml` `stage_b.max_frames_per_batch`
 (or set `stage_b.grad_checkpoint: true` for ~30 % slower but bounded VRAM).
 
+### Step 5: Streaming Decode (Phase 2)
+
+```bash
+# Offline two-pass (full context, best WER ~8–10 %)
+PYTHONPATH=. .venv/bin/python -m src.slices.Decode.streaming_decode data/Val/dev-clean/1272/128104/1272-128104-0000.flac --offline
+
+# Streaming two-pass (chunked, cached, latency-optimized ~10–12 %)
+PYTHONPATH=. .venv/bin/python -m src.slices.Decode.streaming_decode data/Val/dev-clean/1272/128104/1272-128104-0000.flac
+```
+
+Default checkpoint is `data/checkpoints/stage_b_best.pt`; tokenizer is `data/tokenizer/bpe500.model`.
+Decoding parameters (chunk_size, left_context, beam_size, etc.) are controlled by `config/decode.yaml`.
+
 ---
 
 ## 2. Tests
 
 ```bash
-# Fast suite (slow/GPU gates deselected) — expect 37 passed, 3 deselected
+# Fast suite (slow/GPU gates deselected) — expect 54 passed, 3 deselected
 PYTHONPATH=. python -m pytest -q
 
 # GPU correctness gates: single-batch overfit, loss must drop >50%

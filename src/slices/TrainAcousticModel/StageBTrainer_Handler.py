@@ -25,9 +25,40 @@ from src.slices.TrainAcousticModel.StageATrainer_Handler import _lr_at, _fmt_hms
 from src.slices.TrainAcousticModel.StageBTrainer_Command import StageBTrainCommand
 
 
+def _assert_phase0_delta(missing: list[str], unexpected: list[str]) -> None:
+    # Plan-3b made the encoder causal, which renamed exactly two families of encoder params:
+    # the frontend convs (nn.Sequential `conv.0/conv.2` -> causal `conv1/conv2`) and ConvModule's
+    # norm (LayerNorm per-channel `weight` -> BiasNorm scalar `log_scale`). A pre-Plan-3b Stage-A
+    # checkpoint is therefore expected to miss the new names and carry the old ones; Phase 0 exists
+    # to retrain those submodules fresh. Anything missing/unexpected *outside* that delta means the
+    # checkpoint no longer matches this encoder -- a real regression that must fail loud rather than
+    # silently warm-start a mostly-random encoder.
+    bad_missing = [
+        k
+        for k in missing
+        if not (
+            k.startswith("frontend.conv1.")
+            or k.startswith("frontend.conv2.")
+            or k.endswith(".conv.norm.log_scale")
+        )
+    ]
+    bad_unexpected = [
+        k
+        for k in unexpected
+        if not (k.startswith("frontend.conv.") or k.endswith(".conv.norm.weight"))
+    ]
+    if bad_missing or bad_unexpected:
+        raise RuntimeError(
+            "warm-start state_dict mismatch beyond the Plan-3b Phase-0 delta — "
+            f"unexpected missing keys: {bad_missing}; unexpected extra keys: {bad_unexpected}"
+        )
+
+
 def _warm_start(model: HybridCtcAttention, path: str, log) -> None:
     # Load the Stage-A encoder + CTC head; leave the fresh decoder untouched. Stage-A saved a full
-    # AcousticModel state_dict ("encoder.*", "ctc_head.*"); those keys map 1:1 onto the hybrid.
+    # AcousticModel state_dict ("encoder.*", "ctc_head.*"). Most keys map 1:1 onto the hybrid, but
+    # the Plan-3b causal rework renamed the frontend convs and swapped ConvModule's norm, so the
+    # encoder loads non-strict and re-inits that known delta (validated by _assert_phase0_delta).
     if not path or not os.path.isfile(path):
         log.warning(f"warm_start '{path}' absent — training encoder from scratch.")
         return
@@ -35,9 +66,13 @@ def _warm_start(model: HybridCtcAttention, path: str, log) -> None:
     sd = state["model"] if "model" in state else state
     enc = {k[len("encoder.") :]: v for k, v in sd.items() if k.startswith("encoder.")}
     ctc = {k[len("ctc_head.") :]: v for k, v in sd.items() if k.startswith("ctc_head.")}
-    model.encoder.load_state_dict(enc, strict=True)
-    model.ctc_head.load_state_dict(ctc, strict=True)
-    log.info(f"warm-started encoder + CTC head from {path}")
+    result = model.encoder.load_state_dict(enc, strict=False)
+    _assert_phase0_delta(list(result.missing_keys), list(result.unexpected_keys))
+    model.ctc_head.load_state_dict(ctc, strict=True)  # CTC head is unchanged by Plan 3b -> strict
+    log.info(
+        f"warm-started encoder + CTC head from {path} "
+        f"({len(result.missing_keys)} Phase-0 encoder params re-init fresh)"
+    )
 
 
 @torch.no_grad()

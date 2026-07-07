@@ -7,6 +7,7 @@ from src.slices.TrainAcousticModel.BiasNorm import BiasNorm
 from src.slices.TrainAcousticModel.SwiGluFfn import SwiGluFfn
 from src.slices.TrainAcousticModel.RotaryAttention import RotaryAttention
 from src.slices.TrainAcousticModel.ConvModule import ConvModule
+from src.slices.TrainAcousticModel.StreamCache import AttnCache, ConvCache
 
 
 class ZipformerBlock(nn.Module):
@@ -35,3 +36,15 @@ class ZipformerBlock(nn.Module):
         x = x + self.conv(self.norm_conv(x), pad_mask)
         x = x + 0.5 * self.ffn2(self.norm_ffn2(x))
         return self.norm_out(x)
+
+    def streaming_forward(
+        self, x: torch.Tensor, attn_cache: AttnCache, conv_cache: ConvCache
+    ) -> tuple[torch.Tensor, AttnCache, ConvCache]:
+        # Macaron layer in streaming mode: accumulate cache in each block.
+        x = x + 0.5 * self.ffn1(self.norm_ffn1(x))
+        h, attn_cache = self.attn.streaming_forward(self.norm_attn(x), attn_cache)
+        x = x + h
+        h, conv_left = self.conv.streaming_forward(self.norm_conv(x), conv_cache.left)
+        x = x + h
+        x = x + 0.5 * self.ffn2(self.norm_ffn2(x))
+        return self.norm_out(x), attn_cache, ConvCache(left=conv_left)

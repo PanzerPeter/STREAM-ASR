@@ -123,11 +123,20 @@ class TrainingConfig(BaseModel):
     stage_b: StageBConfig
 
 
+class DecodeConfig(BaseModel):
+    chunk_size: int
+    left_context: int
+    beam_size: int
+    rescore_lambda: float
+    min_segment_frames: int
+
+
 class StreamConfig(BaseModel):
     audio: AudioConfig
     augment: AugmentConfig
     model: ModelConfig
     training: TrainingConfig
+    decode: DecodeConfig
 
 
 @lru_cache(maxsize=None)
@@ -138,5 +147,6 @@ def get_config(config_dir: str | None = None) -> StreamConfig:
         "augment": yaml.safe_load((root / "augment.yaml").read_text()),
         "model": yaml.safe_load((root / "model.yaml").read_text()),
         "training": yaml.safe_load((root / "training.yaml").read_text()),
+        "decode": yaml.safe_load((root / "decode.yaml").read_text()),
     }
     return StreamConfig(**data)

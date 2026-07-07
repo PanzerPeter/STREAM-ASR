@@ -36,7 +36,7 @@ def test_lists_coerce_to_tuples():
 
 def test_validation_rejects_bad_type(tmp_path):
     src = Path("config")
-    for name in ["audio.yaml", "augment.yaml", "model.yaml", "training.yaml"]:
+    for name in ["audio.yaml", "augment.yaml", "model.yaml", "training.yaml", "decode.yaml"]:
         shutil.copy(src / name, tmp_path / name)
     # n_mels must be int; write a non-coercible value.
     audio = tmp_path / "audio.yaml"
@@ -63,3 +63,10 @@ def test_decoder_and_stage_b_config():
     assert sb.label_smoothing == pytest.approx(0.1)
     assert 0 in sb.chunk_sizes  # 0 encodes the full-context (no chunk) option
     assert sb.warm_start.endswith("stage_a_last.pt")
+
+
+def test_decode_config_loads():
+    d = get_config().decode
+    assert d.beam_size >= 1
+    assert d.chunk_size > 0
+    assert 0.0 <= d.rescore_lambda <= 1.0
