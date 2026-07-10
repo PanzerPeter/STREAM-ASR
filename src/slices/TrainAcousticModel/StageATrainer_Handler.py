@@ -155,7 +155,7 @@ def run_stage_a(cmd: StageATrainCommand) -> str:
         # Inductor's min-cut partitioner rematerializes activations itself, so we do NOT also
         # wrap stacks in torch.utils.checkpoint — that combo breaks the partitioner under bf16.
         # dynamic=True compiles once for variable-length batches; max-autotune is skipped because
-        # per-shape autotune recompiles are impractical for dynamic ASR batch shapes (spec §9).
+        # per-shape autotune recompiles are impractical for dynamic ASR batch shapes.
         forward = torch.compile(model, dynamic=True)
     else:
         if checkpointed:

@@ -36,7 +36,15 @@ def test_lists_coerce_to_tuples():
 
 def test_validation_rejects_bad_type(tmp_path):
     src = Path("config")
-    for name in ["audio.yaml", "augment.yaml", "model.yaml", "training.yaml", "decode.yaml"]:
+    for name in [
+        "audio.yaml",
+        "augment.yaml",
+        "model.yaml",
+        "training.yaml",
+        "decode.yaml",
+        "lm.yaml",
+        "eval.yaml",
+    ]:
         shutil.copy(src / name, tmp_path / name)
     # n_mels must be int; write a non-coercible value.
     audio = tmp_path / "audio.yaml"

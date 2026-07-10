@@ -1,0 +1,27 @@
+# STREAM-LM: deep-narrow causal Transformer for two-pass ASR fusion/rescore.
+# ffn_expansion 4 -> SwiGLU hidden ~= 2.67*d_model (the 2/3 factor lives in SwiGluFfn).
+d_model: 320
+layers: 16
+heads: 8
+kv_groups: 2                 # GQA: 8 query heads share 2 KV heads
+ffn_expansion: 4
+dropout: 0.1
+context_len: 256
+value_residual_lambda: 1.0   # inject layer-0 values into deeper layers; 0.0 = vanilla
+
+# training
+lr_peak: 3.0e-4
+warmup_steps: 2000
+total_steps: 40000
+weight_decay: 0.01
+grad_clip: 1.0
+batch_size: 64               # sequences per step
+eval_interval: 1000
+log_every: 50
+
+# data (PrepareLmData). subset_words caps train words; >= corpus size (LibriSpeech-LM ~803M) packs
+# the WHOLE corpus, and the training DataLoader shuffles the memmap for uniform coverage (no head
+# bias). Lower it only for a quick smoke/dev run (then train.bin is just the corpus head).
+subset_words: 1000000000
+val_words: 200000
+seed: 1234

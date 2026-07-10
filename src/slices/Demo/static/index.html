@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>STREAM ASR — local demo</title>
+<style>
+  :root {
+    --bg: #0f1117; --card: #191c24; --edge: #2a2f3a; --fg: #e7e9ee; --muted: #9aa3b2;
+    --accent: #6ea8fe; --accent-2: #7ee0b8; --rec: #ff5d6c;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 15px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    display: flex; flex-direction: column; align-items: center; padding: 32px 16px 64px;
+  }
+  h1 { font-size: 22px; margin: 0 0 2px; letter-spacing: .3px; }
+  h1 span { color: var(--accent); }
+  .sub { color: var(--muted); margin: 0 0 28px; font-size: 13px; }
+  .wrap { width: 100%; max-width: 720px; display: flex; flex-direction: column; gap: 20px; }
+  .card {
+    background: var(--card); border: 1px solid var(--edge); border-radius: 14px; padding: 20px 22px;
+  }
+  .card h2 { font-size: 15px; margin: 0 0 14px; display: flex; align-items: center; gap: 8px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--accent); }
+  .dot.g { background: var(--accent-2); }
+  button {
+    font: inherit; font-weight: 600; color: #0f1117; background: var(--accent); border: 0;
+    border-radius: 9px; padding: 10px 18px; cursor: pointer; transition: filter .15s, background .15s;
+  }
+  button:hover:not(:disabled) { filter: brightness(1.08); }
+  button:disabled { opacity: .45; cursor: default; }
+  button.rec { background: var(--rec); color: #fff; }
+  button.ghost { background: transparent; color: var(--fg); border: 1px solid var(--edge); }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  input[type=file] { color: var(--muted); font-size: 13px; max-width: 100%; }
+  .out {
+    margin-top: 14px; background: #10131a; border: 1px solid var(--edge); border-radius: 9px;
+    padding: 14px 16px; min-height: 52px; white-space: pre-wrap; word-break: break-word;
+  }
+  .out.empty { color: #5b6472; }
+  .partial { color: var(--muted); }
+  .meta { margin-top: 8px; font-size: 12px; color: var(--muted); }
+  .badge {
+    display: inline-block; font-size: 11px; padding: 1px 8px; border-radius: 999px;
+    border: 1px solid var(--edge); color: var(--muted); margin-left: 6px;
+  }
+  .pulse { animation: pulse 1.1s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+  <h1><span>STREAM</span> ASR — local demo</h1>
+  <p class="sub">Zipformer + CTC/attention, streaming-capable · runs entirely on your machine</p>
+
+  <div class="wrap">
+    <div class="card">
+      <h2><span class="dot g"></span> Transcribe a file</h2>
+      <div class="row">
+        <input id="file" type="file" accept="audio/*,.wav,.flac,.ogg" />
+        <button id="upBtn" disabled>Transcribe</button>
+      </div>
+      <div id="upOut" class="out empty">Pick a WAV / FLAC / OGG file and hit Transcribe.</div>
+      <div id="upMeta" class="meta"></div>
+    </div>
+
+    <div class="card">
+      <h2><span class="dot"></span> Live microphone <span id="micBadge" class="badge">idle</span></h2>
+      <div class="row">
+        <button id="micBtn">● Start speaking</button>
+        <button id="micStop" class="ghost" disabled>Stop</button>
+      </div>
+      <div id="micOut" class="out empty">Press start, allow the mic, and speak. Partials stream in
+        live; the final line is re-decoded with full context when you stop.</div>
+      <div id="micMeta" class="meta"></div>
+    </div>
+  </div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+/* ---------- file upload ---------- */
+const fileInput = $("file"), upBtn = $("upBtn"), upOut = $("upOut"), upMeta = $("upMeta");
+fileInput.onchange = () => { upBtn.disabled = !fileInput.files.length; };
+upBtn.onclick = async () => {
+  const f = fileInput.files[0]; if (!f) return;
+  upBtn.disabled = true; upOut.className = "out"; upOut.textContent = "decoding…"; upMeta.textContent = "";
+  const fd = new FormData(); fd.append("file", f);
+  try {
+    const r = await fetch("/transcribe", { method: "POST", body: fd });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || r.statusText);
+    upOut.textContent = j.text || "(empty)";
+    upMeta.textContent = `${j.seconds.toFixed(1)}s audio · RTF ${j.rtf.toFixed(3)}`;
+  } catch (e) {
+    upOut.textContent = "Error: " + e.message;
+  } finally { upBtn.disabled = false; }
+};
+
+/* ---------- live mic ---------- */
+const micBtn = $("micBtn"), micStop = $("micStop"), micOut = $("micOut"),
+      micMeta = $("micMeta"), micBadge = $("micBadge");
+let ctx, node, source, stream, ws, finalText = "";
+
+function setBadge(t, pulse) { micBadge.textContent = t; micBadge.className = "badge" + (pulse ? " pulse" : ""); }
+
+micBtn.onclick = async () => {
+  // getUserMedia lives on navigator.mediaDevices, which the browser only injects in a *secure
+  // context*: HTTPS, or plain HTTP on localhost / 127.0.0.1 / [::1]. On a LAN IP, the machine
+  // hostname, or 0.0.0.0 it is undefined (not a permission denial) — so guide the user instead
+  // of throwing "reading 'getUserMedia' of undefined".
+  const md = navigator.mediaDevices;
+  if (!md || !md.getUserMedia) {
+    micOut.className = "out";
+    micOut.textContent = window.isSecureContext
+      ? "This browser exposes no microphone API (a privacy shield may be hiding it)."
+      : `Microphone needs a secure origin. Open the demo at http://localhost:${location.port || 80}`
+        + ` or http://127.0.0.1:${location.port || 80} (you're on "${location.hostname}"),`
+        + ` or serve it over HTTPS.`;
+    return;
+  }
+  try {
+    stream = await md.getUserMedia({ audio: {
+      channelCount: 1, echoCancellation: true, noiseSuppression: true } });
+  } catch (e) { micOut.className = "out"; micOut.textContent = "Mic denied: " + e.message; return; }
+
+  ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+  if (ctx.sampleRate !== 16000)
+    micMeta.textContent = `⚠ browser gave ${ctx.sampleRate} Hz, not 16000 — transcription may be off`;
+
+  const wsScheme = location.protocol === "https:" ? "wss" : "ws";  // match page scheme (HTTPS→wss)
+  ws = new WebSocket(`${wsScheme}://${location.host}/stream`);
+  ws.binaryType = "arraybuffer";
+  finalText = ""; micOut.className = "out"; micOut.innerHTML = '<span class="partial">listening…</span>';
+  micBtn.disabled = true; micBtn.classList.add("rec"); micStop.disabled = false; setBadge("recording", true);
+
+  ws.onmessage = (ev) => {
+    const j = JSON.parse(ev.data);
+    if (j.partial !== undefined) {
+      micOut.innerHTML = (finalText ? finalText + " " : "") +
+        `<span class="partial">${j.partial || "…"}</span>`;
+    } else if (j.final !== undefined) {
+      finalText = j.final; micOut.textContent = finalText || "(empty)";
+      micMeta.textContent = `final (full-context) · RTF ${j.rtf.toFixed(3)}`;
+      cleanupMic();
+    }
+  };
+  ws.onclose = () => cleanupMic();
+
+  source = ctx.createMediaStreamSource(stream);
+  node = ctx.createScriptProcessor(4096, 1, 1);  // deprecated but zero-dependency; fine for a local demo
+  node.onaudioprocess = (e) => {
+    if (!ws || ws.readyState !== 1) return;
+    ws.send(e.inputBuffer.getChannelData(0).slice().buffer);  // float32 PCM @16k
+  };
+  source.connect(node); node.connect(ctx.destination);
+};
+
+micStop.onclick = () => {
+  if (ws && ws.readyState === 1) { ws.send("__eof__"); setBadge("finalizing", true); }
+  micStop.disabled = true;
+};
+
+function cleanupMic() {
+  if (node) { node.disconnect(); node.onaudioprocess = null; node = null; }
+  if (source) { source.disconnect(); source = null; }
+  if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  if (ctx && ctx.state !== "closed") { ctx.close(); }
+  if (ws && ws.readyState === 1) ws.close();
+  micBtn.disabled = false; micBtn.classList.remove("rec"); micStop.disabled = true;
+  if (micBadge.textContent !== "recording") setBadge("idle", false); else setBadge("idle", false);
+}
+</script>
+</body>
+</html>

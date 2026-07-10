@@ -3,8 +3,8 @@ import torch
 import torch.nn as nn
 
 from src.shared_kernel.Config_Adapter import get_config
-from src.slices.TrainAcousticModel.BiasNorm import BiasNorm
-from src.slices.TrainAcousticModel.SwiGluFfn import SwiGluFfn
+from src.shared_kernel.BiasNorm import BiasNorm
+from src.shared_kernel.SwiGluFfn import SwiGluFfn
 from src.slices.TrainAcousticModel.RotaryAttention import RotaryAttention
 from src.slices.TrainAcousticModel.ConvModule import ConvModule
 from src.slices.TrainAcousticModel.StreamCache import AttnCache, ConvCache

@@ -12,8 +12,8 @@ from src.slices.TrainAcousticModel.AttentionDecoder import BiTransformerDecoder
 
 
 class HybridCtcAttention(nn.Module):
-    """M1 encoder + CTC head (streaming first pass) + bidirectional attention decoder (rescorer),
-    trained with the U2++ joint loss. Encoder + CTC head are warm-started from Stage A."""
+    """Zipformer encoder + CTC head (streaming first pass) + bidirectional attention decoder
+    (rescorer), trained with the U2++ joint loss. Encoder + CTC head warm-started from Stage A."""
 
     def __init__(self, cmvn_path: str | None = "data/features/cmvn.pt") -> None:
         super().__init__()

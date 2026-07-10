@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.slices.TrainAcousticModel.BiasNorm import BiasNorm
+from src.shared_kernel.BiasNorm import BiasNorm
 
 
 class ConvModule(nn.Module):

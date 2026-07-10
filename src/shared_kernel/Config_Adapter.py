@@ -125,10 +125,37 @@ class TrainingConfig(BaseModel):
 
 class DecodeConfig(BaseModel):
     chunk_size: int
-    left_context: int
     beam_size: int
     rescore_lambda: float
-    min_segment_frames: int
+    lm_weight: float
+    lm_checkpoint: str
+
+
+class LmConfig(BaseModel):
+    d_model: int
+    layers: int
+    heads: int
+    kv_groups: int
+    ffn_expansion: int
+    dropout: float
+    context_len: int
+    value_residual_lambda: float
+    lr_peak: float
+    warmup_steps: int
+    total_steps: int
+    weight_decay: float
+    grad_clip: float
+    batch_size: int
+    eval_interval: int
+    log_every: int
+    subset_words: int
+    val_words: int
+    seed: int
+
+
+class EvalConfig(BaseModel):
+    ablation_stages: tuple[str, ...]
+    report_path: str
 
 
 class StreamConfig(BaseModel):
@@ -137,6 +164,8 @@ class StreamConfig(BaseModel):
     model: ModelConfig
     training: TrainingConfig
     decode: DecodeConfig
+    lm: LmConfig
+    eval: EvalConfig
 
 
 @lru_cache(maxsize=None)
@@ -148,5 +177,7 @@ def get_config(config_dir: str | None = None) -> StreamConfig:
         "model": yaml.safe_load((root / "model.yaml").read_text()),
         "training": yaml.safe_load((root / "training.yaml").read_text()),
         "decode": yaml.safe_load((root / "decode.yaml").read_text()),
+        "lm": yaml.safe_load((root / "lm.yaml").read_text()),
+        "eval": yaml.safe_load((root / "eval.yaml").read_text()),
     }
     return StreamConfig(**data)

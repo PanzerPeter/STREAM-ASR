@@ -1,7 +1,7 @@
 # TrainAcousticModel
 
 ## Purpose
-The M1 Zipformer encoder + M2 CTC head (Plan 2, Stage-A CTC-only training), plus the Plan 3
+The Zipformer encoder + CTC head (Plan 2, Stage-A CTC-only training), plus the Plan 3
 Stage-B hybrid path: a U2++ bidirectional attention decoder joint-trained with CTC under
 dynamic-chunk masking, warm-started from the Stage-A checkpoint.
 
@@ -12,13 +12,13 @@ dynamic-chunk masking, warm-started from the Stage-A checkpoint.
 - Stage-A model: `AcousticModel(features, lengths) -> (logits, out_lengths)`
 - Stage-B model: `HybridCtcAttention(features, lengths, chunk_size=0) -> (ctc_logits, memory, out_lengths)`
 
-## M1 interface (frozen contract)
+## Encoder interface (frozen contract)
 `ZipformerEncoder.forward(features [B,T,80], lengths, chunk_size=0) -> (memory [B,T//4,256], out_lengths)`.
 `chunk_size` selects dynamic-chunk masking in the self-attention (0 = full context, the Stage-A
 default); Stage-B trains with `chunk_size` sampled per-batch from `{0, 16, 32}` base-rate frames
 so the same weights serve both offline and streaming inference. This signature — including the
 `chunk_size` parameter — is the frozen contract Phase 2's `streaming_forward` (stateful, chunked
-inference) must remain equivalent to (spec §6).
+inference) must remain equivalent to.
 
 ## Stage-B hybrid model
 - `HybridCtcAttention` (`HybridModel.py`): wraps `ZipformerEncoder` + a `Linear` CTC head +
@@ -45,12 +45,12 @@ inference) must remain equivalent to (spec §6).
 ## Notes
 CTC blank id = VOCAB_SIZE (500); logits width = 501.
 bf16 autocast on both stages; both Stage-A and Stage-B train **eager** (`compile_model=False`) —
-`torch.compile` is broken on this torch 2.11 + Blackwell build. Activation checkpointing
+`torch.compile` hits inductor bugs on this torch 2.11 + Blackwell build. Activation checkpointing
 (`_Checkpointed` wrapping each stack) is optional and **off by default**, gated by `grad_checkpoint`
-in `config/training.yaml` (see CLAUDE.md pitfall #4).
+in `config/training.yaml`.
 Stage-B config lives under `training.stage_b` in `config/training.yaml`: `max_frames_per_batch
 18000`, `lr_peak 7.5e-4`, `warmup_steps 5000`, `total_steps 80000`, `chunk_sizes [0, 16, 32]`,
 `ctc_weight 0.3`, `reverse_weight 0.3`, `label_smoothing 0.1`, `warm_start
 data/checkpoints/stage_a_last.pt`; escape-check gate mirrors Stage-A's blank-collapse guard.
-Encoder is ~54M params (multi-rate stacks, rotary attention); bump ENCODER_DIMS/LAYERS in
-`config/model.yaml` if WER plateaus.
+Encoder is ~54M params (multi-rate stacks, rotary attention); bump `encoder_dims`/`encoder_layers`
+in `config/model.yaml` if WER plateaus.

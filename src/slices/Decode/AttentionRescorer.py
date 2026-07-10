@@ -1,6 +1,8 @@
 # Second pass: score each first-pass hypothesis with the bidirectional decoder and blend with
 # the CTC score. Teacher-forces the whole hypothesis in one forward per direction (rescoring,
 # not search).
+from typing import Protocol
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,11 +10,18 @@ import torch.nn.functional as F
 from src.shared_kernel.Config_Adapter import get_config
 
 
+class _SeqScorer(Protocol):
+    # Structural type: the rescorer only needs the LM's weighted full-sequence log-prob, not the
+    # concrete LmScorer class (mirrors why `decoder` is typed as nn.Module).
+    def sequence_score(self, ids: list[int]) -> float: ...
+
+
 class AttentionRescorer:
     # Typed as nn.Module (not the concrete BiTransformerDecoder) so the Decode slice does not
     # import a training-internal class just for an annotation; it only needs the callable contract.
-    def __init__(self, decoder: nn.Module) -> None:
+    def __init__(self, decoder: nn.Module, lm_scorer: _SeqScorer | None = None) -> None:
         self.decoder = decoder
+        self.lm = lm_scorer
         m = get_config().model
         self.sos, self.eos = m.sos_id, m.eos_id
         self.lam = get_config().decode.rescore_lambda
@@ -47,6 +56,8 @@ class AttentionRescorer:
                 continue
             l2r = self._seq_logprob(memory, mem_pad, hyp_list, reverse=False)
             r2l = self._seq_logprob(memory, mem_pad, hyp_list, reverse=True)
-            results.append((hyp_list, ctc + (1 - self.lam) * l2r + self.lam * r2l))
+            # LM rescore term: 0 when no scorer, so the blend is unchanged at alpha=0.
+            lm_term = self.lm.sequence_score(hyp_list) if self.lm is not None else 0.0
+            results.append((hyp_list, ctc + (1 - self.lam) * l2r + self.lam * r2l + lm_term))
         results.sort(key=lambda x: x[1], reverse=True)
         return results

@@ -3,8 +3,8 @@ import torch
 import torch.nn as nn
 
 from src.shared_kernel.Config_Adapter import get_config
-from src.slices.TrainAcousticModel.BiasNorm import BiasNorm
-from src.slices.TrainAcousticModel.SwiGluFfn import SwiGluFfn
+from src.shared_kernel.BiasNorm import BiasNorm
+from src.shared_kernel.SwiGluFfn import SwiGluFfn
 
 _MAX_TARGET_LEN = 512  # LibriSpeech-100 BPE-500 targets are well under this; positions are learned
 

@@ -10,10 +10,13 @@ import torch.nn.functional as F
 from src.shared_kernel.AudioIO_Adapter import load_audio
 from src.shared_kernel.LogMel_Transform import compute_log_mel
 from src.shared_kernel.Config_Adapter import get_config
+from src.shared_kernel.Checkpoint_Adapter import load_checkpoint
 from src.slices.TrainAcousticModel.HybridModel import HybridCtcAttention
 from src.slices.TrainAcousticModel.StreamCache import StreamCache
+from src.slices.TrainLanguageModel.StreamLmModel import StreamLmModel
 from src.slices.Decode.CtcPrefixBeam import CtcPrefixBeam
 from src.slices.Decode.AttentionRescorer import AttentionRescorer
+from src.slices.Decode.LmScorer import LmScorer
 from src.slices.Decode.StreamingDecode_Command import StreamingDecode_Command
 from src.slices.Decode.StreamingDecode_Response import StreamingDecode_Response, SegmentResult
 
@@ -25,29 +28,68 @@ class _Tokenizer(Protocol):
 
 
 class StreamingDecoder_Handler:
-    def __init__(self, model: HybridCtcAttention, tokenizer: _Tokenizer) -> None:
+    def __init__(
+        self,
+        model: HybridCtcAttention,
+        tokenizer: _Tokenizer,
+        beam_size: int | None = None,
+        use_rescore: bool = True,
+        fuse_lm_beam: bool = True,
+        fuse_lm_rescore: bool = True,
+        lm_weight: float | None = None,
+    ) -> None:
+        # The four ablation gates default to the full two-pass decoder; the Evaluate slice flips
+        # them per stage (greedy CTC -> prefix beam -> +rescore -> +LM rescore -> +LM fusion)
+        # without mutating global config. lm_weight == 0 forces the LM off regardless of the gates.
         self.model = model
         self.tok = tokenizer
         self.cfg = get_config()
-        self.rescorer = AttentionRescorer(model.decoder)
+        self.beam_size = beam_size if beam_size is not None else self.cfg.decode.beam_size
+        self.use_rescore = use_rescore
+        # lm_weight override lets Evaluate sweep alpha on dev without mutating the authoritative
+        # decode.yaml (whose lm_weight=0.0 is the alpha=0 regression lock); None = configured value.
+        self.lm_weight = lm_weight if lm_weight is not None else self.cfg.decode.lm_weight
+        # Load the LM only when a gate actually consumes it AND lm_weight > 0; lm_weight == 0 (or a
+        # stage that fuses in neither pass) keeps it None, so no checkpoint is read and both passes
+        # reproduce the pre-LM decoder exactly.
+        needs_lm = (fuse_lm_beam or fuse_lm_rescore) and self.lm_weight > 0
+        self.lm_scorer = self._load_lm() if needs_lm else None
+        self.beam_lm = self.lm_scorer if fuse_lm_beam else None
+        self.rescorer = AttentionRescorer(
+            model.decoder, self.lm_scorer if fuse_lm_rescore else None
+        )
+
+    def _load_lm(self) -> LmScorer:
+        device = self.model.ctc_head.weight.device
+        lm = StreamLmModel()
+        load_checkpoint(self.cfg.decode.lm_checkpoint, lm)
+        lm.to(device).eval()
+        return LmScorer(lm, self.lm_weight)
 
     def decode(self, cmd: StreamingDecode_Command) -> StreamingDecode_Response:
-        wave = load_audio(cmd.audio_path)
+        return self.decode_waveform(load_audio(cmd.audio_path), cmd.streaming)
+
+    def decode_waveform(self, wave: torch.Tensor, streaming: bool) -> StreamingDecode_Response:
+        # Waveform-in entry (the demo server decodes uploaded bytes / a live mic buffer that never
+        # touch disk). decode() is just load_audio + this; both share the exact two-pass path.
         # Front end is CPU-only (soundfile + torchaudio mel); move to the model's device so decode
         # runs on the GPU the CLI placed the model on. Everything downstream inherits feats.device.
         device = self.model.ctc_head.weight.device
         feats = compute_log_mel(wave).unsqueeze(0).to(device)  # [1, T, n_mels]
         audio_seconds = wave.shape[0] / self.cfg.audio.sample_rate
         start = time.perf_counter()
-        if cmd.streaming:
+        if streaming:
             memory, beam, first_latency = self._stream_encode(feats, start)
         else:
             memory, beam, first_latency = self._offline_encode(feats)
         mem_pad = torch.zeros(1, memory.shape[1], dtype=torch.bool, device=memory.device)
-        nbest = beam.nbest()[: self.cfg.decode.beam_size]
-        rescored = self.rescorer.rescore(
-            memory, mem_pad, [h for h, _ in nbest], [s for _, s in nbest]
-        )
+        nbest = beam.nbest()[: self.beam_size]
+        if self.use_rescore:
+            rescored = self.rescorer.rescore(
+                memory, mem_pad, [h for h, _ in nbest], [s for _, s in nbest]
+            )
+        else:  # first-pass-only stages (ctc_greedy / prefix_beam) keep the beam's own ranking
+            rescored = [(list(h), s) for h, s in nbest]
         best_ids = rescored[0][0] if rescored else []
         text = self.tok.decode(best_ids)
         seg = SegmentResult(text=text, nbest=[(self.tok.decode(h), sc) for h, sc in rescored])
@@ -74,7 +116,7 @@ class StreamingDecoder_Handler:
         pad = (-feats.shape[1]) % feat_chunk
         if pad:  # trailing partial chunk: pad with edge silence so every step is aligned
             feats = F.pad(feats, (0, 0, 0, pad))
-        beam = CtcPrefixBeam(self.cfg.model.blank_id, self.cfg.decode.beam_size)
+        beam = CtcPrefixBeam(self.cfg.model.blank_id, self.beam_size, self.beam_lm)
         beam.reset()
         cache = StreamCache.init(enc, batch_size=1, device=feats.device)
         mems: list[torch.Tensor] = []
@@ -100,7 +142,7 @@ class StreamingDecoder_Handler:
     def _offline_encode(self, feats: torch.Tensor) -> tuple[torch.Tensor, CtcPrefixBeam, float]:
         lengths = torch.tensor([feats.shape[1]], device=feats.device)
         logits, memory, out_len = self.model(feats, lengths, chunk_size=0)
-        beam = CtcPrefixBeam(self.cfg.model.blank_id, self.cfg.decode.beam_size)
+        beam = CtcPrefixBeam(self.cfg.model.blank_id, self.beam_size, self.beam_lm)
         beam.reset()
         beam.advance(F.log_softmax(logits[0, : int(out_len[0])], dim=-1))
         return memory, beam, 0.0

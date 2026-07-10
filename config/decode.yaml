@@ -1,9 +1,9 @@
 # Streaming/offline two-pass decoder settings. chunk_size is in BASE-rate (50 fps) frames and MUST be
 # a multiple of ZipformerEncoder.chunk_lcm(); the handler feeds the encoder feature chunks of 2*chunk_size.
-# left_context bounds the attention KV cache at deploy (frames at the encoder output rate).
 # rescore_lambda blends L2R/R2L in the second pass (defaults to the training reverse_weight).
 chunk_size: 16
-left_context: 128
 beam_size: 10
 rescore_lambda: 0.3
-min_segment_frames: 8
+# LM fusion/rescore. lm_weight (alpha) = 0.0 reproduces the pre-LM decoder exactly.
+lm_weight: 0.0
+lm_checkpoint: data/checkpoints/lm_best.pt

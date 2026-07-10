@@ -11,14 +11,14 @@ from src.shared_kernel.Config_Adapter import get_config
 from src.slices.TrainAcousticModel.Conv2dSubsampling import Conv2dSubsampling
 from src.slices.TrainAcousticModel.Resample import SimpleDownsample
 from src.slices.TrainAcousticModel.ZipformerStack import ZipformerStack
-from src.slices.TrainAcousticModel.BiasNorm import BiasNorm
+from src.shared_kernel.BiasNorm import BiasNorm
 from src.slices.TrainAcousticModel.StreamCache import FrontendCache, StreamCache
 
 
 class ZipformerEncoder(nn.Module):
-    """M1 acoustic encoder. log-mel -> CMVN -> ×2 conv -> 6 multi-rate stacks -> ×2 downsample
+    """Acoustic encoder. log-mel -> CMVN -> ×2 conv -> 6 multi-rate stacks -> ×2 downsample
     -> BiasNorm. Output ~25 Hz. The (features, lengths) -> (encoded, out_lengths) signature is
-    the frozen contract M2 (CTC/attention) and streaming inference depend on."""
+    the frozen contract the CTC/attention heads and streaming inference depend on."""
 
     cmvn_mean: torch.Tensor
     cmvn_std: torch.Tensor

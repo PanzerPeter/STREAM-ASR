@@ -1,9 +1,10 @@
 import torch
 from src.shared_kernel.MaskUtils import make_pad_mask
 from src.shared_kernel.Config_Adapter import get_config
-from src.slices.TrainAcousticModel.BiasNorm import BiasNorm
-from src.slices.TrainAcousticModel.SwiGluFfn import SwiGluFfn
-from src.slices.TrainAcousticModel.RotaryAttention import RotaryAttention, _rotary_tables
+from src.shared_kernel.BiasNorm import BiasNorm
+from src.shared_kernel.SwiGluFfn import SwiGluFfn
+from src.shared_kernel.RoPE_Transform import rotary_tables
+from src.slices.TrainAcousticModel.RotaryAttention import RotaryAttention
 from src.slices.TrainAcousticModel.ConvModule import ConvModule
 from src.slices.TrainAcousticModel.Conv2dSubsampling import Conv2dSubsampling
 from src.slices.TrainAcousticModel.Resample import SimpleDownsample, SimpleUpsample
@@ -116,7 +117,7 @@ def test_stack_changes_dim_preserves_time():
 
 
 def test_rotary_pos_offset_matches_full_tail():
-    cos_full, sin_full = _rotary_tables(12, 12, torch.device("cpu"), torch.float32)
-    cos_tail, sin_tail = _rotary_tables(4, 12, torch.device("cpu"), torch.float32, pos_offset=8)
+    cos_full, sin_full = rotary_tables(12, 12, torch.device("cpu"), torch.float32)
+    cos_tail, sin_tail = rotary_tables(4, 12, torch.device("cpu"), torch.float32, pos_offset=8)
     assert torch.allclose(cos_full[8:], cos_tail, atol=1e-6)
     assert torch.allclose(sin_full[8:], sin_tail, atol=1e-6)
