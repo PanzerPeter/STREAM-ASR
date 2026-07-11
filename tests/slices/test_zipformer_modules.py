@@ -32,10 +32,28 @@ def test_swiglu_preserves_shape():
 
 def test_rotary_attention_shape_and_backward():
     x = torch.randn(2, 7, 48, requires_grad=True)
-    out = RotaryAttention(48, num_heads=4)(x, _mask())
+    out, v = RotaryAttention(48, num_heads=4)(x, _mask())
     assert out.shape == x.shape
+    assert v.shape == (2, 4, 7, 12)  # [B, heads, T, head_dim] — the value-residual carrier
     out.sum().backward()
     assert x.grad is not None
+
+
+def test_rotary_attention_value_residual_changes_output():
+    # A non-zero lambda + injected layer-0 values must actually move the output (wiring guard),
+    # and lambda 0 must be a no-op regardless of what is injected (vanilla-attention lock).
+    torch.manual_seed(0)
+    attn = RotaryAttention(48, num_heads=4, dropout=0.0).eval()
+    x = torch.randn(1, 7, 48)
+    v0 = torch.randn(1, 4, 7, 12)
+    with torch.no_grad():
+        base, _ = attn(x, make_pad_mask(torch.tensor([7]), 7))
+        attn.res_lambda.fill_(0.0)
+        same, _ = attn(x, make_pad_mask(torch.tensor([7]), 7), value_residual=v0)
+        attn.res_lambda.fill_(1.0)
+        moved, _ = attn(x, make_pad_mask(torch.tensor([7]), 7), value_residual=v0)
+    assert torch.allclose(base, same, atol=1e-6)
+    assert not torch.allclose(base, moved, atol=1e-4)
 
 
 def test_conv_module_shape_and_ignores_padding():
@@ -100,10 +118,24 @@ def test_downsample_then_upsample_restores_length():
 
 def test_zipformer_block_shape_and_backward():
     x = torch.randn(2, 7, 64, requires_grad=True)
-    out = ZipformerBlock(64, num_heads=4)(x, _mask())
+    out, v = ZipformerBlock(64, num_heads=4)(x, _mask())
     assert out.shape == x.shape
+    assert v.shape == (2, 4, 7, 16)  # block exposes its attention values for the stack residual
     out.sum().backward()
     assert x.grad is not None
+
+
+def test_encoder_value_residual_gates_init_zero():
+    # Regression lock for the Stage-A blank-collapse fix: under the shipped config every deeper
+    # block's value-residual gate must start at 0, so a fresh encoder trains identically to the
+    # proven no-value-residual baseline. A non-zero default here re-introduces the collapse.
+    from src.slices.TrainAcousticModel.ZipformerEncoder import ZipformerEncoder
+
+    enc = ZipformerEncoder(cmvn_path=None)
+    for stack in enc.stacks:
+        for block in stack.blocks:
+            # Every gate must start at 0 (blank-collapse guard: fresh encoder == vanilla baseline).
+            assert block.attn.res_lambda.item() == 0.0
 
 
 def test_stack_changes_dim_preserves_time():

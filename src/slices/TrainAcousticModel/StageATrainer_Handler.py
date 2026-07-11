@@ -1,6 +1,7 @@
 # src/slices/TrainAcousticModel/StageATrainer_Handler.py
 import math
 import os
+import random
 import time
 
 import torch
@@ -28,6 +29,17 @@ def _lr_at(step: int, peak: float, warmup: int, total: int) -> float:
         return peak * step / max(1, warmup)
     progress = (step - warmup) / max(1, total - warmup)  # cosine decay to 0
     return peak * 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+
+
+def _seed_all(seed: int) -> None:
+    # Seed model init, worker augmentation, and batch order so the blank-collapse escape (an init-
+    # sensitive knife-edge) is reproducible. torch.manual_seed also fixes the DataLoader workers'
+    # per-worker seeds (PyTorch derives them from the main generator), so SpecAugment/speed-perturb
+    # become deterministic too. use_deterministic_algorithms is deliberately NOT set: cuDNN's CTC
+    # has no deterministic kernel and would raise.
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
 def _fmt_hms(seconds: float) -> str:
@@ -129,9 +141,13 @@ def run_stage_a(cmd: StageATrainCommand) -> str:
     tokenizer = SentencePieceTokenizer(cmd.tokenizer_model)
     writer = SummaryWriter(cmd.log_dir)
     sa = get_config().training.stage_a
+    _seed_all(sa.seed)
+    log.info(f"seed {sa.seed} (reproducible init/augment/batch order)")
 
     train_ds = LibriSpeechDataset(cmd.train_manifest, tokenizer, train=True)
-    train_sampler = FrameBucketSampler(cmd.train_manifest, sa.max_frames_per_batch, shuffle=True)
+    train_sampler = FrameBucketSampler(
+        cmd.train_manifest, sa.max_frames_per_batch, shuffle=True, seed=sa.seed
+    )
     train_loader = DataLoader(
         train_ds,
         batch_sampler=train_sampler,
@@ -258,13 +274,19 @@ def run_stage_a(cmd: StageATrainCommand) -> str:
                 for ref, hyp in samples:
                     log.debug(f"  ref: {ref[:80]!r}")
                     log.debug(f"  hyp: {hyp[:80]!r}")
-                # Fast-fail the blank-collapse trap: if CTC has not left the all-blank saddle by
-                # escape_check_step, alignment never formed and the rest of the run is wasted.
-                if step >= sa.escape_check_step and blank_frac > sa.escape_max_blank_frac:
+                # Fast-fail the blank-collapse trap, but only when BOTH signals agree the run is
+                # dead: blank still collapsed AND dev WER never fell below escape_min_wer_progress.
+                # The escape onset is noisy — blank_frac can read ~1.0 at the check step while WER
+                # has already dipped off 1.0 (alignment forming) — so keying on blank_frac alone
+                # guillotines runs that are escaping the saddle slower than escape_check_step.
+                collapsed = blank_frac > sa.escape_max_blank_frac
+                no_progress = best_wer >= sa.escape_min_wer_progress
+                if step >= sa.escape_check_step and collapsed and no_progress:
                     writer.close()
                     raise RuntimeError(
                         f"CTC blank collapse: blank_frac {blank_frac:.3f} > "
-                        f"{sa.escape_max_blank_frac} at step {step:,} (> escape_check_step "
+                        f"{sa.escape_max_blank_frac} and best dev WER {best_wer:.3f} >= "
+                        f"{sa.escape_min_wer_progress} at step {step:,} (> escape_check_step "
                         f"{sa.escape_check_step:,}). Model never left the all-blank saddle — raise "
                         f"lr_peak / lengthen warmup or add the Zipformer stabilizers, then restart."
                     )

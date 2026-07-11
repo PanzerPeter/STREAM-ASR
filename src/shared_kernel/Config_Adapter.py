@@ -36,6 +36,7 @@ class ModelConfig(BaseModel):
     encoder_dropout: float
     final_downsample: int
     rope_base: float
+    encoder_value_residual_lambda: float
     vocab_size: int
     decoder_dim: int
     decoder_left_layers: int
@@ -43,6 +44,7 @@ class ModelConfig(BaseModel):
     decoder_heads: int
     decoder_ffn_expansion: int
     decoder_dropout: float
+    decoder_value_residual_lambda: float
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -95,6 +97,15 @@ class StageAConfig(BaseModel):
     # mistaken for collapse. Keep it comfortably past warmup_steps.
     escape_check_step: int = 18000
     escape_max_blank_frac: float = 0.95
+    # The escape onset is noisy: blank_frac can still read ~1.0 at the check step while dev WER has
+    # already begun falling off 1.0 (alignment forming). Only abort if BOTH signals say "dead" —
+    # blank still collapsed AND best dev WER never dropped below this floor. Prevents guillotining a
+    # run that is escaping the saddle but slower than escape_check_step.
+    escape_min_wer_progress: float = 0.99
+    # RNG seed for model init + augmentation + batch order. The blank-collapse escape is init-
+    # sensitive (a knife-edge); seeding makes a run reproducible so a winning init can be re-run and
+    # a losing seed swapped. Not full determinism (cuDNN's CTC has no deterministic kernel).
+    seed: int = 42
 
 
 class StageBConfig(BaseModel):
@@ -111,6 +122,8 @@ class StageBConfig(BaseModel):
     grad_checkpoint: bool = False
     escape_check_step: int = 12000
     escape_max_blank_frac: float = 0.95
+    escape_min_wer_progress: float = 0.99
+    seed: int = 42
     ctc_weight: float
     reverse_weight: float
     label_smoothing: float
@@ -127,6 +140,7 @@ class DecodeConfig(BaseModel):
     chunk_size: int
     beam_size: int
     rescore_lambda: float
+    rescore_ctc_weight: float
     lm_weight: float
     lm_checkpoint: str
 

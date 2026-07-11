@@ -26,6 +26,24 @@ def test_decoder_output_shape_both_directions():
     assert right.shape == (2, 7, cfg.decoder_vocab_size)
 
 
+def test_decoder_value_residual_is_active():
+    # The value-residual gate is a learnable scalar (init 0). Opening the deeper layers' gate must
+    # change the output vs. the closed (vanilla self-attn) baseline -- proving the residual is wired
+    # and non-trivial, not silently dropped.
+    torch.manual_seed(0)
+    _cfg, memory, memory_pad, ys_in, ys_pad = _inputs()
+    ys_pad = torch.zeros_like(ys_pad)
+    dec = BiTransformerDecoder().eval()
+    with torch.no_grad():
+        for layer in dec.left.layers:
+            layer.self_attn.res_lambda.zero_()  # closed gate == vanilla
+        base = dec(memory, memory_pad, ys_in, ys_pad, reverse=False)
+        for layer in list(dec.left.layers)[1:]:  # layer-0 has no residual to gate
+            layer.self_attn.res_lambda.fill_(1.0)
+        opened = dec(memory, memory_pad, ys_in, ys_pad, reverse=False)
+    assert not torch.allclose(base, opened, atol=1e-4)
+
+
 def test_decoder_self_attention_is_causal():
     # Changing a future target token must not change earlier-step logits (causal masking).
     cfg, memory, memory_pad, ys_in, ys_pad = _inputs()

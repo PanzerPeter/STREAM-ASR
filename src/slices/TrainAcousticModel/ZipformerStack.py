@@ -4,6 +4,7 @@ from typing import cast
 import torch
 import torch.nn as nn
 
+from src.shared_kernel.Config_Adapter import get_config
 from src.shared_kernel.MaskUtils import make_chunk_mask, make_pad_mask
 from src.slices.TrainAcousticModel.Resample import SimpleDownsample, SimpleUpsample
 from src.slices.TrainAcousticModel.StreamCache import AttnCache, ConvCache
@@ -22,7 +23,16 @@ class ZipformerStack(nn.Module):
         self.in_proj = nn.Linear(dim_in, dim) if dim_in != dim else nn.Identity()
         self.downsample = SimpleDownsample(downsample) if downsample > 1 else None
         self.upsample = SimpleUpsample(downsample) if downsample > 1 else None
-        self.blocks = nn.ModuleList([ZipformerBlock(dim, num_heads) for _ in range(num_layers)])
+        # Value residual is stack-local: block-0 produces the values injected into every deeper
+        # block, so the shortcut runs at this stack's width and frame rate. The gate is a learnable
+        # scalar per deeper block (init from config); block-0 never receives a residual so it is 0.
+        lam = get_config().model.encoder_value_residual_lambda
+        self.blocks = nn.ModuleList(
+            [
+                ZipformerBlock(dim, num_heads, value_residual_init=0.0 if i == 0 else lam)
+                for i in range(num_layers)
+            ]
+        )
         self.bypass = nn.Parameter(torch.tensor(0.5))  # residual↔processed interpolation
 
     def forward(
@@ -48,8 +58,11 @@ class ZipformerStack(nn.Module):
         attn_visible = (
             make_chunk_mask(x.shape[1], local_chunk, x.device) if chunk_size > 0 else None
         )
-        for block in self.blocks:
-            x = block(x, pad_mask, attn_visible)
+        v0: torch.Tensor | None = None
+        for i, block in enumerate(self.blocks):
+            x, v = block(x, pad_mask, attn_visible, value_residual=None if i == 0 else v0)
+            if i == 0:
+                v0 = v
 
         if self.upsample is not None:
             x = self.upsample(x, out_len=base_len)
@@ -75,9 +88,14 @@ class ZipformerStack(nn.Module):
             x, _ = self.downsample(x, lengths)
         new_ac: list[AttnCache] = []
         new_cc: list[ConvCache] = []
+        v0: torch.Tensor | None = None
         for i, (ac, cc) in enumerate(zip(attn_caches, conv_caches)):
             block = cast(ZipformerBlock, self.blocks[i])
-            x, ac_new, cc_new = block.streaming_forward(x, ac, cc)
+            x, v, ac_new, cc_new = block.streaming_forward(
+                x, ac, cc, value_residual=None if i == 0 else v0
+            )
+            if i == 0:
+                v0 = v
             new_ac.append(ac_new)
             new_cc.append(cc_new)
         if self.upsample is not None:

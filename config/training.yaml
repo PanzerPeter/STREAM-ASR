@@ -10,8 +10,10 @@ stage_a:
   val_every: 2000
   ckpt_every: 2000
   grad_checkpoint: false   # true = bound VRAM at ~30% speed cost; off fits 12 GB at 20k frames
-  escape_check_step: 18000       # abort if still blank-collapsed past this (well after 10k warmup)
+  escape_check_step: 18000       # earliest step the collapse guard may fire (well after 10k warmup)
   escape_max_blank_frac: 0.95    # dev blank-argmax fraction that counts as "collapsed"
+  escape_min_wer_progress: 0.99  # only abort if best dev WER also never fell below this (no escape)
+  seed: 42                       # RNG seed: reproducible init/augment/batch order (escape is init-sensitive)
 
 stage_b:
   max_frames_per_batch: 18000    # decoder + longer targets cost VRAM vs Stage A's 20k
@@ -27,6 +29,8 @@ stage_b:
   grad_checkpoint: false
   escape_check_step: 12000
   escape_max_blank_frac: 0.95
+  escape_min_wer_progress: 0.99  # only abort if best dev WER also never fell below this (no escape)
+  seed: 42                       # RNG seed: reproducible init/augment/batch order
   ctc_weight: 0.3                # L = ctc_weight*CTC + (1-ctc_weight)*attn
   reverse_weight: 0.3            # attn = (1-reverse_weight)*CE_L2R + reverse_weight*CE_R2L
   label_smoothing: 0.1

@@ -31,11 +31,11 @@ def test_attn_streaming_matches_chunk_forward():
     chunk = 8
     visible = make_chunk_mask(24, chunk, x.device)  # chunk-causal reference
     with torch.no_grad():
-        ref = attn(x, pad, visible)
+        ref, _ = attn(x, pad, visible)
         cache = AttnCache(torch.zeros(1, 4, 0, 12), torch.zeros(1, 4, 0, 12), 0)
         outs = []
         for start in range(0, 24, chunk):
-            y, cache = attn.streaming_forward(x[:, start : start + chunk], cache)
+            y, _, cache = attn.streaming_forward(x[:, start : start + chunk], cache)
             outs.append(y)
         stream = torch.cat(outs, dim=1)
     assert torch.allclose(ref, stream, atol=1e-5)
@@ -49,12 +49,12 @@ def test_block_streaming_matches_chunk_forward():
     chunk = 8
     visible = make_chunk_mask(24, chunk, x.device)
     with torch.no_grad():
-        ref = block(x, pad, visible)
+        ref, _ = block(x, pad, visible)
         ac = AttnCache(torch.zeros(1, 4, 0, 12), torch.zeros(1, 4, 0, 12), 0)
         cc = ConvCache(torch.zeros(1, block.conv.kernel - 1, 48))
         outs = []
         for start in range(0, 24, chunk):
-            y, ac, cc = block.streaming_forward(x[:, start : start + chunk], ac, cc)
+            y, _, ac, cc = block.streaming_forward(x[:, start : start + chunk], ac, cc)
             outs.append(y)
         stream = torch.cat(outs, dim=1)
     assert torch.allclose(ref, stream, atol=1e-5)

@@ -113,5 +113,14 @@ class CtcPrefixBeam:
         scored.sort(key=lambda x: x[1], reverse=True)
         return scored
 
+    def nbest_acoustic(self) -> list[tuple[tuple[int, ...], float]]:
+        # Same ranking as nbest() (LM shallow-fusion bonus still guides which hypotheses survive),
+        # but the reported score is the acoustic CTC log-prob *without* the LM bonus. The two-pass
+        # rescorer re-applies the LM once on this list, so first-pass fusion no longer gets counted
+        # a second time (the alpha is applied exactly once end to end).
+        scored = [(p, _logsumexp(pb, pnb)) for p, (pb, pnb) in self.beams.items()]
+        scored.sort(key=lambda x: x[1] + self.lm_bonus.get(x[0], 0.0), reverse=True)
+        return scored
+
     def partial(self) -> list[int]:
         return list(self.nbest()[0][0])

@@ -135,9 +135,9 @@ PYTHONPATH=. mypy src         # Type check checking (Strict: expect 0 errors)
 | --- | --- |
 | `config/audio.yaml` | Sample rate, n_mels, FFT/window/hop, CMVN epsilon |
 | `config/augment.yaml` | Speed-perturb factors, SpecAugment masks (full strength for Stage B) |
-| `config/model.yaml` | Encoder dims/layers/heads, conv kernel, dropout, RoPE base, vocab size, attention-decoder dims/layers/heads |
+| `config/model.yaml` | Encoder dims/layers/heads, conv kernel, dropout, RoPE base, `encoder_value_residual_lambda`, vocab size, attention-decoder dims/layers/heads, `decoder_value_residual_lambda` |
 | `config/training.yaml` | `stage_a` + `stage_b` settings (`ctc_weight`, `reverse_weight`, `label_smoothing`, `chunk_sizes`, `warm_start`) |
-| `config/decode.yaml` | `chunk_size`, `beam_size`, `rescore_lambda`, `lm_weight` ($\alpha$), `lm_checkpoint` |
+| `config/decode.yaml` | `chunk_size`, `beam_size`, `rescore_lambda`, `rescore_ctc_weight`, `lm_weight` ($\alpha$), `lm_checkpoint` |
 | `config/lm.yaml` | STREAM-LM: `d_model`/`layers`/`heads`/`kv_groups`, `context_len`, schedule, `subset_words` |
 | `config/eval.yaml` | `ablation_stages`, `report_path` |
 

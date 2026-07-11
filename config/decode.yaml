@@ -4,6 +4,10 @@
 chunk_size: 16
 beam_size: 10
 rescore_lambda: 0.3
+# Second-pass blend weight on the first-pass CTC score vs. the attention-decoder score (WeNet-style):
+# final = rescore_ctc_weight*ctc + (1-rescore_ctc_weight)*attn + lm. Lets the attention rescorer
+# actually move rankings instead of being swamped by the frame-summed CTC score.
+rescore_ctc_weight: 0.3
 # LM fusion/rescore. lm_weight (alpha) = 0.0 reproduces the pre-LM decoder exactly.
 lm_weight: 0.0
 lm_checkpoint: data/checkpoints/lm_best.pt

@@ -25,6 +25,9 @@ class AttentionRescorer:
         m = get_config().model
         self.sos, self.eos = m.sos_id, m.eos_id
         self.lam = get_config().decode.rescore_lambda
+        # Relative weight of the frame-summed CTC score vs. the token-summed attention score, so the
+        # attention rescorer is not swamped by CTC's much larger magnitude (WeNet-style blend).
+        self.ctc_weight = get_config().decode.rescore_ctc_weight
 
     def _seq_logprob(
         self, memory: torch.Tensor, mem_pad: torch.Tensor, hyp: list[int], reverse: bool
@@ -49,15 +52,17 @@ class AttentionRescorer:
         # Rescore each hypothesis with the bidirectional decoder. Empty hypotheses keep their
         # CTC score unchanged. Score blends L2R and R2L log probabilities with rescore_lambda.
         results = []
+        cw = self.ctc_weight
         for hyp, ctc in zip(nbest, ctc_scores):
             hyp_list = list(hyp)
             if not hyp_list:
-                results.append((hyp_list, ctc))
+                results.append((hyp_list, cw * ctc))
                 continue
             l2r = self._seq_logprob(memory, mem_pad, hyp_list, reverse=False)
             r2l = self._seq_logprob(memory, mem_pad, hyp_list, reverse=True)
+            attn = (1 - self.lam) * l2r + self.lam * r2l
             # LM rescore term: 0 when no scorer, so the blend is unchanged at alpha=0.
             lm_term = self.lm.sequence_score(hyp_list) if self.lm is not None else 0.0
-            results.append((hyp_list, ctc + (1 - self.lam) * l2r + self.lam * r2l + lm_term))
+            results.append((hyp_list, cw * ctc + (1 - cw) * attn + lm_term))
         results.sort(key=lambda x: x[1], reverse=True)
         return results

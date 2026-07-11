@@ -9,6 +9,14 @@ encoder_dropout: 0.1
 final_downsample: 2
 rope_base: 10000.0
 vocab_size: 500
+# Value residual (ResFormer/SVFormer): block-0 of each Zipformer stack injects its attention values
+# into the stack's deeper blocks, giving a gradient shortcut through attention so the stack trains
+# stably at depth. This is the INITIAL value of a *learnable per-block gate* — 0.0 means a fresh
+# encoder starts identical to a vanilla (no-value-residual) encoder and the residual is introduced
+# only as far as training wants it. Keep at 0.0: a fixed non-zero gate destabilises the CTC
+# blank-collapse escape in Stage A. Streaming caches post-residual values, so streaming_forward
+# stays exactly equal to the chunked forward (test_streaming_forward_equivalence).
+encoder_value_residual_lambda: 0.0
 
 # Attention decoder (Stage B, U2++ bidirectional). decoder_dim projects the 256-dim encoder
 # memory up for cross-attention capacity; left decoder is L2R, right decoder consumes reversed
@@ -19,3 +27,8 @@ decoder_right_layers: 3
 decoder_heads: 8
 decoder_ffn_expansion: 4
 decoder_dropout: 0.1
+# Value residual for the decoder self-attention (layer-0 values injected into deeper L2R/R2L layers):
+# initial value of a learnable per-layer gate, same as the encoder. 0.0 = starts vanilla. The decoder
+# trains in the calmer Stage-B regime (teacher-forced CE, warm-started encoder), so a small positive
+# init (e.g. 0.1) is also safe if you want to force more residual from the start.
+decoder_value_residual_lambda: 0.0

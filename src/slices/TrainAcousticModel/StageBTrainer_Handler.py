@@ -21,7 +21,12 @@ from src.slices.ExtractFeatures.FeatureCollator import collate_features
 from src.slices.ExtractFeatures.FrameBucketSampler import FrameBucketSampler
 from src.slices.TrainAcousticModel.CtcGreedyDecoder import ctc_greedy_decode
 from src.slices.TrainAcousticModel.HybridModel import HybridCtcAttention
-from src.slices.TrainAcousticModel.StageATrainer_Handler import _lr_at, _fmt_hms, _Checkpointed
+from src.slices.TrainAcousticModel.StageATrainer_Handler import (
+    _lr_at,
+    _fmt_hms,
+    _Checkpointed,
+    _seed_all,
+)
 from src.slices.TrainAcousticModel.StageBTrainer_Command import StageBTrainCommand
 
 
@@ -133,11 +138,15 @@ def run_stage_b(cmd: StageBTrainCommand) -> str:
     tokenizer = SentencePieceTokenizer(cmd.tokenizer_model)
     writer = SummaryWriter(cmd.log_dir)
     sb = get_config().training.stage_b
+    _seed_all(sb.seed)
+    log.info(f"seed {sb.seed} (reproducible init/augment/batch order)")
 
     train_ds = LibriSpeechDataset(cmd.train_manifest, tokenizer, train=True)
     train_loader = DataLoader(
         train_ds,
-        batch_sampler=FrameBucketSampler(cmd.train_manifest, sb.max_frames_per_batch, shuffle=True),
+        batch_sampler=FrameBucketSampler(
+            cmd.train_manifest, sb.max_frames_per_batch, shuffle=True, seed=sb.seed
+        ),
         collate_fn=collate_features,
         num_workers=4,
         pin_memory=True,
@@ -242,10 +251,15 @@ def run_stage_b(cmd: StageBTrainCommand) -> str:
                     f"{'  ← best' if best_a else f'  (best {best_attn:.4f})'} │ "
                     f"blank {blank_frac:.3f} @ step {step:,}",
                 )
-                if step >= sb.escape_check_step and blank_frac > sb.escape_max_blank_frac:
+                # Abort only when both signals agree the run is dead (see Stage-A for rationale):
+                # blank still collapsed AND best dev WER never fell below escape_min_wer_progress.
+                collapsed = blank_frac > sb.escape_max_blank_frac
+                no_progress = best_wer >= sb.escape_min_wer_progress
+                if step >= sb.escape_check_step and collapsed and no_progress:
                     writer.close()
                     raise RuntimeError(
-                        f"CTC blank collapse: blank_frac {blank_frac:.3f} at step {step:,}."
+                        f"CTC blank collapse: blank_frac {blank_frac:.3f} and best dev WER "
+                        f"{best_wer:.3f} at step {step:,}."
                     )
             if step > 0 and step % sb.ckpt_every == 0:
                 save_checkpoint(last_ckpt, model, opt, step)

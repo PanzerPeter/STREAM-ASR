@@ -83,13 +83,15 @@ class StreamingDecoder_Handler:
         else:
             memory, beam, first_latency = self._offline_encode(feats)
         mem_pad = torch.zeros(1, memory.shape[1], dtype=torch.bool, device=memory.device)
-        nbest = beam.nbest()[: self.beam_size]
         if self.use_rescore:
+            # Acoustic-only CTC scores: the rescorer applies the LM once, so first-pass shallow
+            # fusion (which shaped this n-best) is not double-counted in the final score.
+            nbest = beam.nbest_acoustic()[: self.beam_size]
             rescored = self.rescorer.rescore(
                 memory, mem_pad, [h for h, _ in nbest], [s for _, s in nbest]
             )
         else:  # first-pass-only stages (ctc_greedy / prefix_beam) keep the beam's own ranking
-            rescored = [(list(h), s) for h, s in nbest]
+            rescored = [(list(h), s) for h, s in beam.nbest()[: self.beam_size]]
         best_ids = rescored[0][0] if rescored else []
         text = self.tok.decode(best_ids)
         seg = SegmentResult(text=text, nbest=[(self.tok.decode(h), sc) for h, sc in rescored])

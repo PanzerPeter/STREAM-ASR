@@ -20,6 +20,17 @@ A two-pass hybrid CTC/attention system built around a Zipformer acoustic encoder
 A single set of encoder weights runs either offline (full context, best WER) or streaming
 (small chunk, low latency) through dynamic-chunk masking.
 
+**Value residual (ResFormer/SVFormer).** The Zipformer stacks, the attention decoder, and STREAM-LM
+all use value-residual attention: block/layer 0 of each stack injects its attention *values* into the
+deeper blocks, adding a gradient shortcut through attention that trains stably at depth so the same
+accuracy is reachable at a narrower width. In the encoder and decoder the mix is a **learnable
+per-block gate initialised to 0** (`encoder_value_residual_lambda` / `decoder_value_residual_lambda`
+set the init): a fresh model therefore starts *identical* to a no-value-residual baseline and the
+residual grows only as far as training wants it. This matters because Stage-A CTC sits on a
+blank-collapse knife-edge — a fixed non-zero gate destabilises the escape, whereas the zero-init gate
+does not. The encoder's streaming path caches post-residual values, so `streaming_forward` stays
+exactly equal to the chunked `forward` (`test_streaming_forward_equivalence`).
+
 **Target for 100 h from scratch:** offline WER ≈ 6–8 %, streaming ≈ 8–10 %, RTF < 0.3. This
 is not Whisper-scale — the goal is the best result achievable from this data on this GPU.
 
@@ -28,10 +39,16 @@ is not Whisper-scale — the goal is the best result achievable from this data o
 | Plan | Scope | State |
 |---|---|---|
 | 1 | Data foundation: environment, manifests, tokenizer, features, dataloader | **Done** |
-| 2 | Zipformer encoder + CTC head + Stage-A training | **Done** — trained, dev WER **0.111** (greedy CTC) |
-| 3 | Causal encoder (Phase 0) + attention decoder + joint CTC/attn + Stage-B training (Phase 1) + streaming/offline decode (Phase 2) | **Done** — causal Stage-B retrained, dev WER **0.0999**, decode smoke-validated |
-| 4 | Neural LM (STREAM-LM) + two-pass LM fusion/rescore + Evaluate slice | **Done** — LM trained (val ppl **16.4**); `test-clean` eval run: attn-rescore **9.1 %** offline / **12.0 %** streaming. LM-fused WER pending a dev α-tune run (`--tune`) |
+| 2 | Zipformer encoder + CTC head + Stage-A training | Code done; **retrain pending** — value residual added to the encoder |
+| 3 | Causal encoder (Phase 0) + attention decoder + joint CTC/attn + Stage-B training (Phase 1) + streaming/offline decode (Phase 2) | Code done; **retrain pending** — value residual added to encoder + decoder |
+| 4 | Neural LM (STREAM-LM) + two-pass LM fusion/rescore + Evaluate slice | **Done** — LM trained (val ppl **16.4**, unchanged); two-pass decode fixes + parallel eval landed |
 | — | Local demo (web UI): upload a file or speak live | **Done** — `Demo` slice; verified end-to-end |
+
+> **Retrain required.** Adding value residual changed the encoder and attention-decoder
+> computation, so the Stage-A and Stage-B checkpoints were removed and must be regenerated (STREAM-LM
+> is unchanged and kept). Prior WER figures (Stage-A dev 0.111, Stage-B dev 0.0999, test-clean
+> 9.1 %/12.0 %) were measured **before** value residual and are superseded; new numbers land after the
+> retrain below.
 
 ## Layout
 
@@ -97,19 +114,22 @@ PYTHONPATH=. .venv/bin/python scripts/compute_cmvn.py
 
 ## Training
 
+Full retrain order after the value-residual change (Stage A → Stage B; STREAM-LM is unchanged, so
+skip it unless you deleted its checkpoint):
+
 ```bash
-# Stage A — Zipformer + CTC (done: 120k steps, dev WER 0.111 → data/checkpoints/stage_a_last.pt)
+# Stage A — Zipformer + CTC, now with value residual (~120k steps) → data/checkpoints/stage_a_last.pt
 .venv/bin/python -m src.slices.TrainAcousticModel.train_stage_a
 
 # Stage B — hybrid CTC/attention (U2++ bidirectional decoder + joint loss + dynamic-chunk).
-# Warm-starts the encoder + CTC head from stage_a_last.pt → data/checkpoints/stage_b_last.pt
+# Warm-starts the encoder + CTC head from stage_a_last.pt → data/checkpoints/stage_b_best.pt
 .venv/bin/python -m src.slices.TrainAcousticModel.train_stage_b
 
 # Monitor either run (separate terminal): loss / lr / dev WER / dev blank_frac
 .venv/bin/tensorboard --logdir runs/stage_b
 
-# STREAM-LM — text-only causal Transformer for two-pass fusion/rescore. Download the LibriSpeech-LM
-# corpus, pack it to uint16 bins (streamed to disk, bounded RAM), then train → data/checkpoints/lm_best.pt
+# STREAM-LM (already trained, lm_best.pt kept — only rerun if you removed it). Download the
+# LibriSpeech-LM corpus, pack it to uint16 bins (streamed to disk, bounded RAM), then train.
 .venv/bin/python scripts/download_lm_text.py    # then gunzip; pack via PrepareLmData (see COMMANDS.md Step 6)
 .venv/bin/python -m src.slices.TrainLanguageModel.train_lm
 ```
@@ -137,16 +157,17 @@ left-context trim, language-model weight) live in `config/decode.yaml`. Setting 
 turns on STREAM-LM shallow fusion in the first-pass beam plus n-best LM rescore in the second pass;
 `lm_weight: 0.0` (the default) is byte-identical to the pre-LM decoder.
 
-> The causal Stage-B retrain is done (dev WER **0.0999**, streaming-capable `stage_b_best.pt`) and
-> the STREAM-LM is trained (val ppl **16.4**). Measured `test-clean` two-pass hits the targets —
-> **9.1 %** offline / **12.0 %** streaming (see [Evaluation](#evaluation)). The only step left to
-> record the LM-fused WER is the dev α-tune eval run below.
+> The two-pass decoder is code-complete and streaming/offline equivalent, but the value-residual
+> encoder + decoder need the Stage-A→Stage-B retrain above before `stage_b_best.pt` exists again.
+> STREAM-LM (`lm_best.pt`, val ppl **16.4**) is unchanged and ready.
 
 ## Evaluation
 
 The `Evaluate` slice reports corpus WER/CER plus mean RTF and first-partial latency across an
 ablation of the two-pass decoder (`ctc_greedy → prefix_beam → attn_rescore → lm_rescore →
-lm_fusion`, each × offline/streaming), writing `runs/eval/report.json`.
+lm_fusion`, each × offline/streaming), writing `runs/eval/report.json`. Runs execute **two at a
+time** on the GPU (offline + streaming of a stage in parallel, and the α-grid two-at-a-time under
+`--tune`), so the ablation table and the sweep finish roughly twice as fast.
 
 ```bash
 # Acoustic-only (LM off): the two-pass ablation on test-clean.
@@ -159,9 +180,11 @@ PYTHONPATH=. .venv/bin/python -m src.slices.Evaluate.evaluate \
 ```
 
 The LM only contributes at α (`lm_weight`) `> 0`; at α = 0 the `lm_*` stages equal `attn_rescore`
-exactly and the run warns that they are inactive, so the report never silently misleads. Measured
-`test-clean` (α = 0): `attn_rescore` **WER 9.1 % offline / 12.0 % streaming** (CER 3.3 % / 4.5 %).
-The LM-fused figure is produced by the `--tune` run above and recorded here once available.
+exactly and the run warns that they are inactive, so the report never silently misleads. The LM
+prior is applied **exactly once** end to end: first-pass shallow fusion only *guides* the beam, and
+the acoustic-only CTC score (not the fused score) is what the second pass rescores, so `lm_fusion`
+no longer double-counts α. The second pass blends CTC against the attention score with
+`rescore_ctc_weight`. Fresh `test-clean` numbers land after the retrain.
 
 ## Local demo (web UI)
 
@@ -181,7 +204,7 @@ Binds `127.0.0.1` only (local, no auth); runs on GPU if available, else CPU. The
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest -q          # expect 85 passed, 4 deselected (slow gates)
+.venv/bin/python -m pytest -q          # expect 87 passed, 4 deselected (slow gates)
 ```
 
 ## Notes
