@@ -1,0 +1,21 @@
+# config/pretrain.yaml — BEST-RQ self-supervised pretrain (SP4). stack_frames 0 = derive from the
+# encoder net subsampling so quantizer targets land on the encoder's output grid. Optimizer LRs come
+# from optim.yaml; this file owns only the BEST-RQ knobs and schedule length.
+codebook_size: 8192
+codebook_dim: 16
+mask_prob: 0.01
+mask_span: 10
+noise_std: 0.1
+stack_frames: 0
+warmup_steps: 10000
+# 180k (was 40k): the 40k run plateaued only in the LOSS curve (random-projection targets have an
+# irreducible entropy floor that understates progress) — it was nowhere near a representation floor.
+# BEST-RQ pretrains normally run 100k-400k steps; 180k keeps the LR near peak far longer (peak hit at
+# the 10k warmup end, then cosine-annealed over the remaining 170k) for a materially stronger Stage-A
+# warm-start. total_steps IS the cosine anchor: it makes the LR decay to 0 exactly at step 180k, so an
+# early stop still lands on a partially-annealed encoder rather than one frozen near peak LR.
+total_steps: 180000
+seed: 42
+grad_clip: 5.0
+log_every: 50
+save_every: 2000

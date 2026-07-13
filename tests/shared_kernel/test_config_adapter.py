@@ -12,13 +12,12 @@ def test_loads_representative_values():
     assert isinstance(cfg, StreamConfig)
     assert cfg.audio.sample_rate == 16000
     assert cfg.audio.n_mels == 80
-    assert cfg.augment.speed_perturb_factors == (0.9, 1.0, 1.1)
     assert cfg.model.encoder_dims == (192, 256, 384, 512, 384, 256)
     assert cfg.model.vocab_size == 500
     assert cfg.training.stage_a.total_steps == 120000
-    # Raised from 5e-4 to escape the CTC blank-collapse saddle on full data (see augment.yaml /
-    # training.yaml notes); warmup was lengthened 3k->10k in the same change.
-    assert cfg.training.stage_a.lr_peak == pytest.approx(1.5e-3)
+    # Warmup was lengthened 3k->10k to escape the CTC blank-collapse saddle on full data (see
+    # augment.yaml / training.yaml notes); lr_peak now lives solely in optim.yaml
+    # (adamw_lr/muon_lr), not per-stage.
     assert cfg.training.stage_a.warmup_steps == 10000
 
 
@@ -31,7 +30,6 @@ def test_derived_values():
 def test_lists_coerce_to_tuples():
     cfg = get_config()
     assert isinstance(cfg.model.encoder_dims, tuple)
-    assert isinstance(cfg.augment.speed_perturb_factors, tuple)
 
 
 def test_validation_rejects_bad_type(tmp_path):
@@ -39,11 +37,14 @@ def test_validation_rejects_bad_type(tmp_path):
     for name in [
         "audio.yaml",
         "augment.yaml",
+        "features.yaml",
         "model.yaml",
         "training.yaml",
         "decode.yaml",
         "lm.yaml",
         "eval.yaml",
+        "optim.yaml",
+        "pretrain.yaml",
     ]:
         shutil.copy(src / name, tmp_path / name)
     # n_mels must be int; write a non-coercible value.
@@ -78,3 +79,9 @@ def test_decode_config_loads():
     assert d.beam_size >= 1
     assert d.chunk_size > 0
     assert 0.0 <= d.rescore_lambda <= 1.0
+
+
+def test_features_config_present():
+    cfg = get_config()
+    assert cfg.features.cache_dir == "data/features/mel"
+    assert cfg.features.enabled is True

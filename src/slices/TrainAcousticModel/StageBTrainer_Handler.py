@@ -11,9 +11,11 @@ import jiwer
 from rich.console import Console
 from rich.panel import Panel
 
-from src.shared_kernel.Checkpoint_Adapter import save_checkpoint
+from src.shared_kernel.Checkpoint_Adapter import resume_if_available, save_checkpoint
 from src.shared_kernel.Config_Adapter import get_config
 from src.shared_kernel.Logging_Adapter import configure_logging
+from src.shared_kernel.Optimizer_Adapter import build_optimizer
+from src.shared_kernel.SignalGuard import SignalGuard
 from src.shared_kernel.Tokenizer_Adapter import SentencePieceTokenizer
 from src.slices.ExtractFeatures.LibriSpeechDataset import LibriSpeechDataset
 from src.slices.ExtractFeatures.FeatureBatch_Response import FeatureBatch
@@ -142,11 +144,14 @@ def run_stage_b(cmd: StageBTrainCommand) -> str:
     log.info(f"seed {sb.seed} (reproducible init/augment/batch order)")
 
     train_ds = LibriSpeechDataset(cmd.train_manifest, tokenizer, train=True)
+    # Named (not inline) so it can be reseeded post-construction after a resume (see below) --
+    # FrameBucketSampler reads self._seed lazily in __iter__, so this takes effect pre-loop.
+    train_sampler = FrameBucketSampler(
+        cmd.train_manifest, sb.max_frames_per_batch, shuffle=True, seed=sb.seed
+    )
     train_loader = DataLoader(
         train_ds,
-        batch_sampler=FrameBucketSampler(
-            cmd.train_manifest, sb.max_frames_per_batch, shuffle=True, seed=sb.seed
-        ),
+        batch_sampler=train_sampler,
         collate_fn=collate_features,
         num_workers=4,
         pin_memory=True,
@@ -168,13 +173,13 @@ def run_stage_b(cmd: StageBTrainCommand) -> str:
     if sb.grad_checkpoint:
         model.encoder.stacks = torch.nn.ModuleList([_Checkpointed(s) for s in model.encoder.stacks])
 
-    opt = torch.optim.AdamW(
-        model.parameters(),
-        lr=sb.lr_peak,
-        weight_decay=sb.weight_decay,
-        betas=(0.9, 0.98),
-        fused=(device == "cuda"),
-    )
+    optimizers = build_optimizer(model, get_config().optim)
+    # build_optimizer sets each group's lr to its calibrated PEAK (Muon >> AdamW per
+    # config/optim.yaml, incl. any muP per-group scaling). Snapshot the peaks so the warmup+cosine
+    # schedule is applied as a 0->1->0 SHAPE multiplier per group. A single absolute overwrite would
+    # clobber Muon's much larger base LR and any muP ratios, defeating SP3. Optimizer peak LRs come
+    # solely from optim.yaml (adamw_lr / muon_lr) — there is no separate per-stage lr_peak.
+    peak_lrs = [[g["lr"] for g in opt.param_groups] for opt in optimizers]
 
     n_params = sum(p.numel() for p in model.parameters())
     console.print(
@@ -191,84 +196,149 @@ def run_stage_b(cmd: StageBTrainCommand) -> str:
     last_ckpt = os.path.join(cmd.ckpt_dir, "stage_b_last.pt")
     best_ckpt = os.path.join(cmd.ckpt_dir, "stage_b_best.pt")
     best_attn_ckpt = os.path.join(cmd.ckpt_dir, "stage_b_best_attn.pt")
-    best_wer, best_attn, step = math.inf, math.inf, 0
+    resumed = resume_if_available(last_ckpt, model, optimizers, cmd.resume)
+    step = int(resumed["step"])
+    best_wer = resumed["best_wer"]
+    resume_count = int(resumed["resume_count"])
+    # best_attn is a secondary gate (attention-CE health) not persisted in checkpoint meta, so it
+    # legitimately restarts fresh on resume rather than being restored like best_wer.
+    best_attn = math.inf
+    if step > 0:
+        log.info(f"resumed from {last_ckpt} @ step {step:,} (resume #{resume_count})")
+    # Reseed the sampler for a fresh, non-repeating epoch after a resume (read at iteration time
+    # by FrameBucketSampler.__iter__, so setting it here before the loop starts takes effect).
+    train_sampler._seed = sb.seed + resume_count
     run_start = time.perf_counter()
     win_start, win_step = run_start, 0
     model.train()
-    while step < cmd.total_steps:
-        for batch in train_loader:
-            lr = _lr_at(step, sb.lr_peak, sb.warmup_steps, cmd.total_steps)
-            for g in opt.param_groups:
-                g["lr"] = lr
-            chunk = random.choice(sb.chunk_sizes)  # dynamic-chunk regularization per batch
+    with SignalGuard() as guard:
+        while step < cmd.total_steps:
+            for batch in train_loader:
+                lr_shape = _lr_at(step, 1.0, sb.warmup_steps, cmd.total_steps)  # 0->1->0 shape
+                for opt, peaks in zip(optimizers, peak_lrs):
+                    for g, peak in zip(opt.param_groups, peaks):
+                        g["lr"] = peak * lr_shape
+                # Representative LR for logging/tensorboard: build_optimizer returns AdamW last
+                # ([muon, adamw] or [adamw]), so optimizers[-1] is always the AdamW.
+                lr = optimizers[-1].param_groups[0]["lr"]
+                chunk = random.choice(sb.chunk_sizes)  # dynamic-chunk regularization per batch
 
-            with torch.autocast(
-                device_type="cuda", dtype=torch.bfloat16, enabled=(device == "cuda")
-            ):
-                total, ctc, attn = model.joint_loss(batch, chunk)
-                loss = total / sb.grad_accum
-            loss.backward()
+                with torch.autocast(
+                    device_type="cuda", dtype=torch.bfloat16, enabled=(device == "cuda")
+                ):
+                    total, ctc, attn = model.joint_loss(batch, chunk)
+                    loss = total / sb.grad_accum
+                loss.backward()
 
-            if (step + 1) % sb.grad_accum == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), sb.grad_clip)
-                opt.step()
-                opt.zero_grad(set_to_none=True)
+                if (step + 1) % sb.grad_accum == 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), sb.grad_clip)
+                    for opt in optimizers:
+                        opt.step()
+                        opt.zero_grad(set_to_none=True)
 
-            if step % sb.log_every == 0:
-                now = time.perf_counter()
-                its = (step - win_step) / max(now - win_start, 1e-9)
-                eta = _fmt_hms((cmd.total_steps - step) / its) if its > 0 else "—"
-                log.info(
-                    f"step {step:>7,}/{cmd.total_steps:,} │ loss {total.item():6.3f} "
-                    f"(ctc {ctc.item():5.2f} attn {attn.item():5.2f}) │ chunk {chunk} │ "
-                    f"lr {lr:.2e} │ {its:5.2f} it/s │ eta {eta}"
-                )
-                writer.add_scalar("train/loss", total.item(), step)
-                writer.add_scalar("train/ctc", ctc.item(), step)
-                writer.add_scalar("train/attn", attn.item(), step)
-                writer.add_scalar("train/lr", lr, step)
-                win_start, win_step = now, step
-            if step > 0 and step % sb.val_every == 0:
-                wer, blank_frac, attn_ce = _dev_wer(model, dev_loader, tokenizer, device)
-                writer.add_scalar("dev/wer", wer, step)
-                writer.add_scalar("dev/blank_frac", blank_frac, step)
-                writer.add_scalar("dev/attn_ce", attn_ce, step)
-                best = wer < best_wer
-                best_wer = min(best_wer, wer)
-                best_a = attn_ce < best_attn
-                best_attn = min(best_attn, attn_ce)
-                # Two independent gates: greedy-CTC WER guards the first pass / encoder; attention
-                # CE guards the rescorer (Stage B's real deliverable, which greedy-CTC can't see).
-                # Save both bests so Phase-2 two-pass eval has the right candidate to pick from.
-                if best:
-                    save_checkpoint(best_ckpt, model, opt, step)
-                if best_a:
-                    save_checkpoint(best_attn_ckpt, model, opt, step)
-                log.log(
-                    "SUCCESS" if (best or best_a) else "INFO",
-                    f"dev WER {wer:.4f}{'  ← best' if best else f'  (best {best_wer:.4f})'} │ "
-                    f"attn_ce {attn_ce:.4f}"
-                    f"{'  ← best' if best_a else f'  (best {best_attn:.4f})'} │ "
-                    f"blank {blank_frac:.3f} @ step {step:,}",
-                )
-                # Abort only when both signals agree the run is dead (see Stage-A for rationale):
-                # blank still collapsed AND best dev WER never fell below escape_min_wer_progress.
-                collapsed = blank_frac > sb.escape_max_blank_frac
-                no_progress = best_wer >= sb.escape_min_wer_progress
-                if step >= sb.escape_check_step and collapsed and no_progress:
-                    writer.close()
-                    raise RuntimeError(
-                        f"CTC blank collapse: blank_frac {blank_frac:.3f} and best dev WER "
-                        f"{best_wer:.3f} at step {step:,}."
+                if step % sb.log_every == 0:
+                    now = time.perf_counter()
+                    its = (step - win_step) / max(now - win_start, 1e-9)
+                    eta = _fmt_hms((cmd.total_steps - step) / its) if its > 0 else "—"
+                    log.info(
+                        f"step {step:>7,}/{cmd.total_steps:,} │ loss {total.item():6.3f} "
+                        f"(ctc {ctc.item():5.2f} attn {attn.item():5.2f}) │ chunk {chunk} │ "
+                        f"lr {lr:.2e} │ {its:5.2f} it/s │ eta {eta}"
                     )
-            if step > 0 and step % sb.ckpt_every == 0:
-                save_checkpoint(last_ckpt, model, opt, step)
+                    writer.add_scalar("train/loss", total.item(), step)
+                    writer.add_scalar("train/ctc", ctc.item(), step)
+                    writer.add_scalar("train/attn", attn.item(), step)
+                    writer.add_scalar("train/lr", lr, step)
+                    win_start, win_step = now, step
+                if step > 0 and step % sb.val_every == 0:
+                    wer, blank_frac, attn_ce = _dev_wer(model, dev_loader, tokenizer, device)
+                    writer.add_scalar("dev/wer", wer, step)
+                    writer.add_scalar("dev/blank_frac", blank_frac, step)
+                    writer.add_scalar("dev/attn_ce", attn_ce, step)
+                    best = wer < best_wer
+                    best_wer = min(best_wer, wer)
+                    best_a = attn_ce < best_attn
+                    best_attn = min(best_attn, attn_ce)
+                    # Two independent gates: greedy-CTC WER guards the first pass / encoder;
+                    # attention CE guards the rescorer (Stage B's real deliverable, which
+                    # greedy-CTC can't see). Save both bests so Phase-2 two-pass eval has the
+                    # right candidate to pick from.
+                    if best:
+                        save_checkpoint(
+                            best_ckpt,
+                            model,
+                            optimizers,
+                            step,
+                            best_wer=best_wer,
+                            resume_count=resume_count,
+                            kind="stage_b",
+                        )
+                    if best_a:
+                        save_checkpoint(
+                            best_attn_ckpt,
+                            model,
+                            optimizers,
+                            step,
+                            best_wer=best_wer,
+                            resume_count=resume_count,
+                            kind="stage_b",
+                        )
+                    log.log(
+                        "SUCCESS" if (best or best_a) else "INFO",
+                        f"dev WER {wer:.4f}"
+                        f"{'  ← best' if best else f'  (best {best_wer:.4f})'} │ "
+                        f"attn_ce {attn_ce:.4f}"
+                        f"{'  ← best' if best_a else f'  (best {best_attn:.4f})'} │ "
+                        f"blank {blank_frac:.3f} @ step {step:,}",
+                    )
+                    # Abort only when both signals agree the run is dead (see Stage-A for
+                    # rationale): blank still collapsed AND best dev WER never fell below
+                    # escape_min_wer_progress.
+                    collapsed = blank_frac > sb.escape_max_blank_frac
+                    no_progress = best_wer >= sb.escape_min_wer_progress
+                    if step >= sb.escape_check_step and collapsed and no_progress:
+                        writer.close()
+                        raise RuntimeError(
+                            f"CTC blank collapse: blank_frac {blank_frac:.3f} and best dev WER "
+                            f"{best_wer:.3f} at step {step:,}."
+                        )
+                if step > 0 and step % sb.ckpt_every == 0:
+                    save_checkpoint(
+                        last_ckpt,
+                        model,
+                        optimizers,
+                        step,
+                        best_wer=best_wer,
+                        resume_count=resume_count,
+                        kind="stage_b",
+                    )
 
-            step += 1
-            if step >= cmd.total_steps:
-                break
+                step += 1
+                if guard.stop_requested:
+                    save_checkpoint(
+                        last_ckpt,
+                        model,
+                        optimizers,
+                        step,
+                        best_wer=best_wer,
+                        resume_count=resume_count,
+                        kind="stage_b",
+                    )
+                    log.warning(f"interrupt received — checkpointed @ step {step:,}; exiting.")
+                    writer.close()
+                    return last_ckpt
+                if step >= cmd.total_steps:
+                    break
 
-    save_checkpoint(last_ckpt, model, opt, step)
+    save_checkpoint(
+        last_ckpt,
+        model,
+        optimizers,
+        step,
+        best_wer=best_wer,
+        resume_count=resume_count,
+        kind="stage_b",
+    )
     writer.close()
     console.print(
         Panel(

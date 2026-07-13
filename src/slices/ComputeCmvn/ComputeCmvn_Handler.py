@@ -1,6 +1,7 @@
 # src/slices/ComputeCmvn/ComputeCmvn_Handler.py
 import json
 import os
+import random
 
 import torch
 
@@ -16,6 +17,9 @@ def compute_cmvn(cmd: ComputeCmvnCommand) -> dict:
 
     audio = get_config().audio
     rows = [json.loads(line) for line in open(cmd.manifest, encoding="utf-8")]
+    if cmd.sample_frac is not None:
+        k = max(1, int(len(rows) * cmd.sample_frac))
+        rows = random.Random(cmd.seed).sample(rows, k)
     if cmd.max_utts is not None:
         rows = rows[: cmd.max_utts]
 

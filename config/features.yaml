@@ -1,0 +1,4 @@
+# On-disk log-mel feature cache (fp16 memmap). Precomputed once; streamed via mmap so the
+# training epoch loop is GPU-bound, not CPU-bound (no per-epoch FLAC decode / FFT).
+cache_dir: data/features/mel
+enabled: true

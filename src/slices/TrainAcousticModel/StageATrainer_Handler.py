@@ -12,9 +12,11 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from src.shared_kernel.Checkpoint_Adapter import save_checkpoint
+from src.shared_kernel.Checkpoint_Adapter import save_checkpoint, resume_if_available
 from src.shared_kernel.Config_Adapter import get_config
 from src.shared_kernel.Logging_Adapter import configure_logging
+from src.shared_kernel.Optimizer_Adapter import build_optimizer
+from src.shared_kernel.SignalGuard import SignalGuard
 from src.shared_kernel.Tokenizer_Adapter import SentencePieceTokenizer
 from src.slices.ExtractFeatures.LibriSpeechDataset import LibriSpeechDataset
 from src.slices.ExtractFeatures.FeatureCollator import collate_features
@@ -22,6 +24,14 @@ from src.slices.ExtractFeatures.FrameBucketSampler import FrameBucketSampler
 from src.slices.TrainAcousticModel.AcousticModel import AcousticModel
 from src.slices.TrainAcousticModel.CtcGreedyDecoder import ctc_greedy_decode
 from src.slices.TrainAcousticModel.StageATrainer_Command import StageATrainCommand
+
+
+def load_pretrained_encoder(model: AcousticModel, path: str) -> None:
+    # Warm-start the acoustic encoder from a BEST-RQ pretrain checkpoint (SP4). The checkpoint
+    # holds exactly encoder.* weights; loading with strict=True guarantees a shape/name match and
+    # fails loud on drift. The CTC head stays randomly initialized.
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    model.encoder.load_state_dict(ckpt["model"], strict=True)
 
 
 def _lr_at(step: int, peak: float, warmup: int, total: int) -> float:
@@ -58,6 +68,7 @@ def _startup_table(
     checkpointed: bool,
 ) -> Table:
     sa = get_config().training.stage_a
+    optim = get_config().optim
     t = Table(show_header=False, box=None, padding=(0, 2))
     t.add_column("k", style="cyan", justify="right")
     t.add_column("v", style="white")
@@ -73,7 +84,8 @@ def _startup_table(
         ("total steps", f"{cmd.total_steps:,}"),
         ("max frames / batch", f"{sa.max_frames_per_batch:,}"),
         ("grad accum", str(sa.grad_accum)),
-        ("lr peak / warmup", f"{sa.lr_peak:g} / {sa.warmup_steps:,}"),
+        ("lr peak muon/adamw", f"{optim.muon_lr:g} / {optim.adamw_lr:g}"),
+        ("warmup steps", f"{sa.warmup_steps:,}"),
         ("precision", precision),
         ("execution", accel),
         ("checkpoints → ", cmd.ckpt_dir),
@@ -163,6 +175,12 @@ def run_stage_a(cmd: StageATrainCommand) -> str:
     cmvn = cmd.cmvn_path if os.path.isfile(cmd.cmvn_path) else None
     model = AcousticModel(cmvn_path=cmvn).to(device)
 
+    if cmd.encoder_init is not None and os.path.isfile(cmd.encoder_init):
+        load_pretrained_encoder(model, cmd.encoder_init)
+        log.info(f"warm-started encoder from {cmd.encoder_init}")
+    elif cmd.encoder_init is not None:
+        log.warning(f"encoder_init {cmd.encoder_init} not found — training from random init")
+
     # torch.compile rematerializes activations via its own partitioner, so checkpointing only
     # applies to the eager path, and is skipped unless config asks for it (VRAM has ~7 GB of
     # headroom at 20k frames, and checkpointing costs ~30% step time — see grad_checkpoint).
@@ -180,13 +198,13 @@ def run_stage_a(cmd: StageATrainCommand) -> str:
                 [_Checkpointed(s) for s in model.encoder.stacks]
             )
         forward = model
-    opt = torch.optim.AdamW(
-        model.parameters(),
-        lr=sa.lr_peak,
-        weight_decay=sa.weight_decay,
-        betas=(0.9, 0.98),
-        fused=(device == "cuda"),  # fused CUDA kernel — faster optimizer step, identical math
-    )
+    optimizers = build_optimizer(model, get_config().optim)
+    # build_optimizer sets each group's lr to its calibrated PEAK (Muon >> AdamW per
+    # config/optim.yaml, incl. any muP per-group scaling). Snapshot the peaks so the warmup+cosine
+    # schedule is applied as a 0->1->0 SHAPE multiplier per group. A single absolute overwrite would
+    # clobber Muon's much larger base LR and any muP ratios, defeating SP3. NB: optimizer peak LRs
+    # now come from optim.yaml (adamw_lr / muon_lr), so the AdamW peak = adamw_lr.
+    peak_lrs = [[g["lr"] for g in opt.param_groups] for opt in optimizers]
 
     n_params = sum(p.numel() for p in model.parameters())
     console.print(
@@ -200,105 +218,157 @@ def run_stage_a(cmd: StageATrainCommand) -> str:
 
     last_ckpt = os.path.join(cmd.ckpt_dir, "stage_a_last.pt")
     best_ckpt = os.path.join(cmd.ckpt_dir, "stage_a_best.pt")
-    best_wer = math.inf
-    step = 0
+    resumed = resume_if_available(last_ckpt, model, optimizers, cmd.resume)
+    step = int(resumed["step"])
+    best_wer = resumed["best_wer"]
+    resume_count = int(resumed["resume_count"])
+    if step > 0:
+        log.info(f"resumed from {last_ckpt} @ step {step:,} (resume #{resume_count})")
+    # Reseed the sampler for a fresh, non-repeating epoch after a resume (read at iteration time
+    # by FrameBucketSampler.__iter__, so setting it here before the loop starts takes effect).
+    train_sampler._seed = sa.seed + resume_count
     run_start = time.perf_counter()
     win_start, win_step = run_start, 0  # throughput/ETA window
     win_loss = torch.zeros((), device=device)  # accumulate on-device; sync only at log_every
     model.train()
     log.info(f"Training loop started — target {cmd.total_steps:,} steps.")
-    while step < cmd.total_steps:
-        for batch in train_loader:
-            lr = _lr_at(step, sa.lr_peak, sa.warmup_steps, cmd.total_steps)
-            for g in opt.param_groups:
-                g["lr"] = lr
+    with SignalGuard() as guard:
+        while step < cmd.total_steps:
+            for batch in train_loader:
+                lr_shape = _lr_at(step, 1.0, sa.warmup_steps, cmd.total_steps)  # 0->1->0 shape
+                for opt, peaks in zip(optimizers, peak_lrs):
+                    for g, peak in zip(opt.param_groups, peaks):
+                        g["lr"] = peak * lr_shape
+                # Representative LR for logging/tensorboard: build_optimizer returns AdamW last
+                # ([muon, adamw] or [adamw]), so optimizers[-1] is always the AdamW.
+                lr = optimizers[-1].param_groups[0]["lr"]
 
-            with torch.autocast(
-                device_type="cuda", dtype=torch.bfloat16, enabled=(device == "cuda")
-            ):
-                logits, out_len = forward(
-                    batch.features.to(device, non_blocking=True),
-                    batch.feature_lengths.to(device, non_blocking=True),
-                )
-                loss = (
-                    model.ctc_loss(
-                        logits,
-                        out_len,
-                        batch.tokens.to(device, non_blocking=True),
-                        batch.token_lengths.to(device, non_blocking=True),
+                with torch.autocast(
+                    device_type="cuda", dtype=torch.bfloat16, enabled=(device == "cuda")
+                ):
+                    logits, out_len = forward(
+                        batch.features.to(device, non_blocking=True),
+                        batch.feature_lengths.to(device, non_blocking=True),
                     )
-                    / sa.grad_accum
-                )
-            loss.backward()
+                    loss = (
+                        model.ctc_loss(
+                            logits,
+                            out_len,
+                            batch.tokens.to(device, non_blocking=True),
+                            batch.token_lengths.to(device, non_blocking=True),
+                        )
+                        / sa.grad_accum
+                    )
+                loss.backward()
 
-            if (step + 1) % sa.grad_accum == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), sa.grad_clip)
-                opt.step()
-                opt.zero_grad(set_to_none=True)
+                if (step + 1) % sa.grad_accum == 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), sa.grad_clip)
+                    for opt in optimizers:
+                        opt.step()
+                        opt.zero_grad(set_to_none=True)
 
-            win_loss += loss.detach() * sa.grad_accum  # kept on-device; no per-step sync
+                win_loss += loss.detach() * sa.grad_accum  # kept on-device; no per-step sync
 
-            if step % sa.log_every == 0:
-                now = time.perf_counter()
-                its = (step - win_step) / max(now - win_start, 1e-9)
-                avg_loss = (win_loss / max(step - win_step, 1)).item()  # single sync per window
-                # its is 0 on the first log (no window elapsed yet) — show a placeholder ETA
-                # rather than the step/0 → 33333333333:20:00 artifact.
-                eta = _fmt_hms((cmd.total_steps - step) / its) if its > 0 else "—"
-                pct = 100.0 * step / cmd.total_steps
-                log.info(
-                    f"step {step:>7,}/{cmd.total_steps:,} ({pct:4.1f}%) │ "
-                    f"loss {avg_loss:7.3f} │ lr {lr:.2e} │ {its:5.2f} it/s │ eta {eta}"
-                )
-                writer.add_scalar("train/loss", avg_loss, step)
-                writer.add_scalar("train/lr", lr, step)
-                writer.add_scalar("train/it_per_s", its, step)
-                win_start, win_step = now, step
-                win_loss.zero_()
-            if step > 0 and step % sa.val_every == 0:
-                wer, blank_frac, samples = _dev_wer(model, dev_loader, tokenizer, device)
-                writer.add_scalar("dev/wer", wer, step)
-                writer.add_scalar("dev/blank_frac", blank_frac, step)
-                best = wer < best_wer
-                best_wer = min(best_wer, wer)
-                marker = "  ← best" if best else f"  (best {best_wer:.4f})"
-                log.log(
-                    "SUCCESS" if best else "INFO",
-                    f"dev WER {wer:.4f}{marker} │ blank {blank_frac:.3f}  @ step {step:,}",
-                )
-                # Persist the best-WER weights separately: `..._last.pt` can drift/overfit past the
-                # optimum over a long run, so the shippable checkpoint is this one.
-                if best:
-                    save_checkpoint(best_ckpt, model, opt, step)
-                # Sample decodes surface the phase transition before WER numerically moves.
-                for ref, hyp in samples:
-                    log.debug(f"  ref: {ref[:80]!r}")
-                    log.debug(f"  hyp: {hyp[:80]!r}")
-                # Fast-fail the blank-collapse trap, but only when BOTH signals agree the run is
-                # dead: blank still collapsed AND dev WER never fell below escape_min_wer_progress.
-                # The escape onset is noisy — blank_frac can read ~1.0 at the check step while WER
-                # has already dipped off 1.0 (alignment forming) — so keying on blank_frac alone
-                # guillotines runs that are escaping the saddle slower than escape_check_step.
-                collapsed = blank_frac > sa.escape_max_blank_frac
-                no_progress = best_wer >= sa.escape_min_wer_progress
-                if step >= sa.escape_check_step and collapsed and no_progress:
+                if step % sa.log_every == 0:
+                    now = time.perf_counter()
+                    its = (step - win_step) / max(now - win_start, 1e-9)
+                    avg_loss = (win_loss / max(step - win_step, 1)).item()  # single sync per window
+                    # its is 0 on the first log (no window elapsed yet) — show a placeholder ETA
+                    # rather than the step/0 → 33333333333:20:00 artifact.
+                    eta = _fmt_hms((cmd.total_steps - step) / its) if its > 0 else "—"
+                    pct = 100.0 * step / cmd.total_steps
+                    log.info(
+                        f"step {step:>7,}/{cmd.total_steps:,} ({pct:4.1f}%) │ "
+                        f"loss {avg_loss:7.3f} │ lr {lr:.2e} │ {its:5.2f} it/s │ eta {eta}"
+                    )
+                    writer.add_scalar("train/loss", avg_loss, step)
+                    writer.add_scalar("train/lr", lr, step)
+                    writer.add_scalar("train/it_per_s", its, step)
+                    win_start, win_step = now, step
+                    win_loss.zero_()
+                if step > 0 and step % sa.val_every == 0:
+                    wer, blank_frac, samples = _dev_wer(model, dev_loader, tokenizer, device)
+                    writer.add_scalar("dev/wer", wer, step)
+                    writer.add_scalar("dev/blank_frac", blank_frac, step)
+                    best = wer < best_wer
+                    best_wer = min(best_wer, wer)
+                    marker = "  ← best" if best else f"  (best {best_wer:.4f})"
+                    log.log(
+                        "SUCCESS" if best else "INFO",
+                        f"dev WER {wer:.4f}{marker} │ blank {blank_frac:.3f}  @ step {step:,}",
+                    )
+                    # Persist the best-WER weights separately: `..._last.pt` can drift/overfit
+                    # past the optimum over a long run, so the shippable checkpoint is this one.
+                    if best:
+                        save_checkpoint(
+                            best_ckpt,
+                            model,
+                            optimizers,
+                            step,
+                            best_wer=best_wer,
+                            resume_count=resume_count,
+                            kind="stage_a",
+                        )
+                    # Sample decodes surface the phase transition before WER numerically moves.
+                    for ref, hyp in samples:
+                        log.debug(f"  ref: {ref[:80]!r}")
+                        log.debug(f"  hyp: {hyp[:80]!r}")
+                    # Fast-fail the blank-collapse trap, but only when BOTH signals agree the run
+                    # is dead: blank still collapsed AND dev WER never fell below
+                    # escape_min_wer_progress. The escape onset is noisy — blank_frac can read
+                    # ~1.0 at the check step while WER has already dipped off 1.0 (alignment
+                    # forming) — so keying on blank_frac alone guillotines runs that are escaping
+                    # the saddle slower than escape_check_step.
+                    collapsed = blank_frac > sa.escape_max_blank_frac
+                    no_progress = best_wer >= sa.escape_min_wer_progress
+                    if step >= sa.escape_check_step and collapsed and no_progress:
+                        writer.close()
+                        raise RuntimeError(
+                            f"CTC blank collapse: blank_frac {blank_frac:.3f} > "
+                            f"{sa.escape_max_blank_frac} and best dev WER {best_wer:.3f} >= "
+                            f"{sa.escape_min_wer_progress} at step {step:,} (> "
+                            f"escape_check_step {sa.escape_check_step:,}). Model never left "
+                            f"the all-blank saddle — raise optim.yaml adamw_lr/muon_lr / lengthen "
+                            f"warmup or add the Zipformer stabilizers, then restart."
+                        )
+                if step > 0 and step % sa.ckpt_every == 0:
+                    save_checkpoint(
+                        last_ckpt,
+                        model,
+                        optimizers,
+                        step,
+                        best_wer=best_wer,
+                        resume_count=resume_count,
+                        kind="stage_a",
+                    )
+                    log.debug(f"checkpoint saved → {last_ckpt}  @ step {step:,}")
+
+                step += 1
+                if guard.stop_requested:
+                    save_checkpoint(
+                        last_ckpt,
+                        model,
+                        optimizers,
+                        step,
+                        best_wer=best_wer,
+                        resume_count=resume_count,
+                        kind="stage_a",
+                    )
+                    log.warning(f"interrupt received — checkpointed @ step {step:,}; exiting.")
                     writer.close()
-                    raise RuntimeError(
-                        f"CTC blank collapse: blank_frac {blank_frac:.3f} > "
-                        f"{sa.escape_max_blank_frac} and best dev WER {best_wer:.3f} >= "
-                        f"{sa.escape_min_wer_progress} at step {step:,} (> escape_check_step "
-                        f"{sa.escape_check_step:,}). Model never left the all-blank saddle — raise "
-                        f"lr_peak / lengthen warmup or add the Zipformer stabilizers, then restart."
-                    )
-            if step > 0 and step % sa.ckpt_every == 0:
-                save_checkpoint(last_ckpt, model, opt, step)
-                log.debug(f"checkpoint saved → {last_ckpt}  @ step {step:,}")
+                    return last_ckpt
+                if step >= cmd.total_steps:
+                    break
 
-            step += 1
-            if step >= cmd.total_steps:
-                break
-
-    save_checkpoint(last_ckpt, model, opt, step)
+    save_checkpoint(
+        last_ckpt,
+        model,
+        optimizers,
+        step,
+        best_wer=best_wer,
+        resume_count=resume_count,
+        kind="stage_a",
+    )
     writer.close()
     elapsed = _fmt_hms(time.perf_counter() - run_start)
     console.print(

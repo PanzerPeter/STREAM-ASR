@@ -16,5 +16,6 @@ Turn manifest rows into padded log-mel/token training batches.
 - Config_Adapter.get_config() — feature/augmentation tunables (`cfg.audio.*`, `cfg.augment.*`)
 
 ## Notes
-Speed-perturb + SpecAugment apply only when `train=True`.
+SpecAugment runs as a GPU batch op in the trainer; speed-perturb was dropped (SP1). The dataset
+yields clean log-mel.
 Bucketing is by pre-subsampling frame count (num_samples // cfg.audio.hop_length).

@@ -18,3 +18,5 @@ class StageATrainCommand:
     # torch 2.11 + Blackwell build (partitioner crash with checkpointing, tiling assertion
     # with dynamic shapes). Opt in to compile once a torch update fixes those.
     compile_model: bool = False
+    resume: bool = True  # continue from ckpt_dir/stage_a_last.pt if present; False forces fresh
+    encoder_init: str | None = None  # BEST-RQ bestrq_encoder.pt to warm-start the encoder from

@@ -15,3 +15,4 @@ class StageBTrainCommand:
     total_steps: int = field(default_factory=lambda: get_config().training.stage_b.total_steps)
     warm_start: str = field(default_factory=lambda: get_config().training.stage_b.warm_start)
     device: str = "cuda"
+    resume: bool = True

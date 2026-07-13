@@ -1,7 +1,6 @@
 stage_a:
   max_frames_per_batch: 20000
   grad_accum: 4
-  lr_peak: 1.5e-3          # was 5e-4: too weak to break the CTC blank saddle on full data
   warmup_steps: 10000      # was 3000: model dove into the blank basin during the short warmup
   total_steps: 120000
   weight_decay: 1.0e-2
@@ -18,7 +17,6 @@ stage_a:
 stage_b:
   max_frames_per_batch: 18000    # decoder + longer targets cost VRAM vs Stage A's 20k
   grad_accum: 4
-  lr_peak: 7.5e-4                # below Stage-A peak: warm-started encoder needs gentler updates
   warmup_steps: 5000             # shorter: encoder is already out of the blank saddle
   total_steps: 80000
   weight_decay: 1.0e-2

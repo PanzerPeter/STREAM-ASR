@@ -2,10 +2,10 @@
 
 **S**peech **T**ranscription via **R**egularized **E**ncoder–**A**ttention **M**odeling.
 
-A from-scratch, streaming-capable automatic speech recognition (ASR) system trained on
-LibriSpeech `train-clean-100`. It targets a single RTX 5070 (12 GB, Blackwell sm_120) and is
-built to stay hardware-efficient: state-of-the-art building blocks reimplemented in pure
-PyTorch, with no k2/icefall dependency and no pretrained weights.
+A from-scratch, streaming-capable automatic speech recognition (ASR) system trained on the full
+LibriSpeech **960 h** set (`train-clean-100 + train-clean-360 + train-other-500`). It targets a single
+RTX 5070 (12 GB, Blackwell sm_120) and is built to stay hardware-efficient: state-of-the-art building
+blocks reimplemented in pure PyTorch, with no k2/icefall dependency and no pretrained weights.
 
 ## Approach
 
@@ -31,8 +31,8 @@ blank-collapse knife-edge — a fixed non-zero gate destabilises the escape, whe
 does not. The encoder's streaming path caches post-residual values, so `streaming_forward` stays
 exactly equal to the chunked `forward` (`test_streaming_forward_equivalence`).
 
-**Target for 100 h from scratch:** offline WER ≈ 6–8 %, streaming ≈ 8–10 %, RTF < 0.3. This
-is not Whisper-scale — the goal is the best result achievable from this data on this GPU.
+**Target from scratch:** offline WER ≈ 6–8 %, streaming ≈ 8–10 %, RTF < 0.3. This is not
+Whisper-scale — the goal is the best result achievable from this data on this GPU.
 
 ## Status
 
@@ -41,14 +41,25 @@ is not Whisper-scale — the goal is the best result achievable from this data o
 | 1 | Data foundation: environment, manifests, tokenizer, features, dataloader | **Done** |
 | 2 | Zipformer encoder + CTC head + Stage-A training | Code done; **retrain pending** — value residual added to the encoder |
 | 3 | Causal encoder (Phase 0) + attention decoder + joint CTC/attn + Stage-B training (Phase 1) + streaming/offline decode (Phase 2) | Code done; **retrain pending** — value residual added to encoder + decoder |
-| 4 | Neural LM (STREAM-LM) + two-pass LM fusion/rescore + Evaluate slice | **Done** — LM trained (val ppl **16.4**, unchanged); two-pass decode fixes + parallel eval landed |
+| 4 | Neural LM (STREAM-LM) + two-pass LM fusion/rescore + Evaluate slice | **Done** — LM trained (val ppl **16.4**); needs LM retrain on the 960 h tokenizer |
 | — | Local demo (web UI): upload a file or speak live | **Done** — `Demo` slice; verified end-to-end |
 
-> **Retrain required.** Adding value residual changed the encoder and attention-decoder
-> computation, so the Stage-A and Stage-B checkpoints were removed and must be regenerated (STREAM-LM
-> is unchanged and kept). Prior WER figures (Stage-A dev 0.111, Stage-B dev 0.0999, test-clean
-> 9.1 %/12.0 %) were measured **before** value residual and are superseded; new numbers land after the
-> retrain below.
+**Efficiency program (SP1–SP5).** A parallel track to reach 100 M-class WER from a ~45 M single-pass
+streaming model, training *faster per run* on the one GPU:
+
+| SP | Scope | State |
+|---|---|---|
+| 1 | 960 h data foundation: 5-split manifests, 960 h BPE retrain, fp16 log-mel mmap cache (~55 GB) | **Code-complete + reviewed** (branch `experimental`); user ran the build |
+| 2 | Atomic SIGINT-safe **resumable** training harness (checkpoint + resume + `SignalGuard`) | **Code-complete + reviewed** |
+| 3 | **Muon + AdamW + muP** optimizer stack (`config/optim.yaml`) — 2D hidden weights → Muon, rest → AdamW | **Code-complete + reviewed** |
+| 4 | **BEST-RQ** self-supervised encoder pretrain → `bestrq_encoder.pt`, warm-starts Stage-A (`encoder_init`) | **Code-complete + reviewed** |
+| 5 | Stateless RNN-T (transducer) head replacing the attention rescorer + InterCTC aux losses | Planned |
+
+> **Retrain required.** The 960 h tokenizer retrain (SP1) plus the value-residual encoder/decoder
+> change mean the Stage-A/B **and** LM checkpoints were removed and must be regenerated. The SP2
+> checkpoint schema also stores an `"optimizers"` list, so any pre-SP2 `*.pt` fails to load. Prior WER
+> figures (Stage-A dev 0.111, Stage-B dev 0.0999, test-clean 9.1 %/12.0 %) predate these changes and
+> are superseded; new numbers land after the retrain below.
 
 ## Layout
 
@@ -57,7 +68,7 @@ Slices communicate only through artifact files (manifests, tokenizer, checkpoint
 dataclass DTOs, never by importing each other's internals.
 
 ```
-config/                   # audio/augment/model/training/decode/lm/eval tunables as YAML (pydantic-validated)
+config/                   # audio/augment/model/training/decode/lm/eval/optim/pretrain tunables as YAML (pydantic-validated)
 src/
   shared_kernel/          # pure transforms/adapters shared across slices
     Config_Adapter.py       # loads + validates config/*.yaml -> get_config()
@@ -65,17 +76,23 @@ src/
     LogMel_Transform.py     # 80-bin log-mel frontend
     Tokenizer_Adapter.py    # SentencePiece BPE-500 wrapper
     BiasNorm.py, SwiGluFfn.py, RoPE_Transform.py   # SOTA blocks shared by encoder + LM
-    Checkpoint_Adapter.py, MaskUtils.py, Logging_Adapter.py
+    Checkpoint_Adapter.py   # atomic stateful save/load + resume_if_available (SP2)
+    SignalGuard.py          # cooperative SIGINT/SIGTERM stop for training loops (SP2)
+    Muon_Optimizer.py, Optimizer_Adapter.py, mup.py   # Muon+AdamW+muP optimizer stack (SP3)
+    RandomProjectionQuantizer.py   # frozen BEST-RQ target quantizer (SP4)
+    MaskUtils.py, Logging_Adapter.py
   slices/
     BuildManifest/          # LibriSpeech split → manifest.jsonl; train BPE tokenizer
     ComputeCmvn/            # global mean/var over train → data/features/cmvn.pt
-    ExtractFeatures/        # SpecAugment + speed-perturb dataset/collator/sampler
+    ExtractFeatures/        # fp16 log-mel mmap cache + dataset/collator/sampler + GPU SpecAugment (SP1)
+    PretrainEncoder/        # BEST-RQ self-supervised encoder pretrain → data/checkpoints/bestrq_encoder.pt (SP4)
     TrainAcousticModel/     # Zipformer encoder + CTC head + attention decoder + Stage-A/B trainers
     TrainLanguageModel/     # STREAM-LM: causal GQA Transformer + corpus prep + LM trainer
     Decode/                 # streaming/offline two-pass CTC→attention rescore + LM fusion/rescore; StreamingSession (live)
     Evaluate/               # corpus WER/CER/RTF/latency + ablation table (jiwer) + dev α-tune
     Demo/                   # local FastAPI web UI: file upload + live-mic streaming transcription
 scripts/verify_env.py     # asserts Blackwell + working torch
+scripts/build_manifests.py, scripts/train_tokenizer.py, scripts/precompute_features.py  # 960h build (SP1)
 scripts/download_lm_text.py  # fetch the LibriSpeech-LM corpus for STREAM-LM
 tests/                    # shape / round-trip / equivalence / count sanity tests
 data/                     # LibriSpeech splits, manifests, tokenizer, cmvn, checkpoints, lm_data (gitignored)
@@ -94,48 +111,51 @@ uv pip install -r requirements.txt
 
 ## Building the data foundation
 
+The 960 h build is four ordered scripts (see [COMMANDS.md](COMMANDS.md) Step 2 for details). The fp16
+log-mel cache is the big one-time cost (~55 GB) and lets the training epoch loop run GPU-bound.
+
 ```bash
-# 1. Manifests (28539 / 2703 / 2620 utterances)
-.venv/bin/python -c "from src.slices.BuildManifest.BuildManifest_Handler import build_manifest as b; \
-from src.slices.BuildManifest.BuildManifest_Command import BuildManifestCommand as C; \
-[print(b(C(s, o))) for s, o in [ \
-  ('data/Train/train-clean-100','data/manifests/train.jsonl'), \
-  ('data/Val/dev-clean','data/manifests/dev.jsonl'), \
-  ('data/Test/test-clean','data/manifests/test.jsonl')]]"
-
-# 2. BPE-500 tokenizer
-.venv/bin/python -c "from src.slices.BuildManifest.TrainTokenizer_Handler import train_tokenizer as t; \
-from src.slices.BuildManifest.TrainTokenizer_Command import TrainTokenizerCommand as C; \
-print(t(C('data/manifests/train.jsonl','data/tokenizer/bpe500',500)))"
-
-# 3. Global CMVN (80-bin mean/std over train) → data/features/cmvn.pt
-PYTHONPATH=. .venv/bin/python scripts/compute_cmvn.py
+PYTHONPATH=. .venv/bin/python scripts/build_manifests.py      # 5-split manifests (train 281,241 utts)
+PYTHONPATH=. .venv/bin/python scripts/train_tokenizer.py      # retrain BPE-500 on 960h (invalidates old LM)
+PYTHONPATH=. .venv/bin/python scripts/compute_cmvn.py         # global CMVN over a 15% sample → data/features/cmvn.pt
+PYTHONPATH=. .venv/bin/python scripts/precompute_features.py  # fp16 log-mel mmap cache → data/features/mel/
 ```
 
 ## Training
 
-Full retrain order after the value-residual change (Stage A → Stage B; STREAM-LM is unchanged, so
-skip it unless you deleted its checkpoint):
+Full retrain order (Stage A → Stage B → STREAM-LM — all three checkpoints must be regenerated on the
+960 h tokenizer):
 
 ```bash
-# Stage A — Zipformer + CTC, now with value residual (~120k steps) → data/checkpoints/stage_a_last.pt
+# (Optional, SP4) BEST-RQ self-supervised encoder pretrain → data/checkpoints/bestrq_encoder.pt
+.venv/bin/python -m src.slices.PretrainEncoder.pretrain_bestrq
+
+# Stage A — Zipformer + CTC, with value residual (~120k steps) → data/checkpoints/stage_a_last.pt
 .venv/bin/python -m src.slices.TrainAcousticModel.train_stage_a
+# …or warm-start the encoder from the BEST-RQ pretrain above (encoder_init on the command):
+.venv/bin/python -c "from src.slices.TrainAcousticModel.StageATrainer_Handler import run_stage_a; from src.slices.TrainAcousticModel.StageATrainer_Command import StageATrainCommand; import dataclasses as d; run_stage_a(d.replace(StageATrainCommand(), encoder_init='data/checkpoints/bestrq_encoder.pt'))"
 
 # Stage B — hybrid CTC/attention (U2++ bidirectional decoder + joint loss + dynamic-chunk).
 # Warm-starts the encoder + CTC head from stage_a_last.pt → data/checkpoints/stage_b_best.pt
 .venv/bin/python -m src.slices.TrainAcousticModel.train_stage_b
 
-# Monitor either run (separate terminal): loss / lr / dev WER / dev blank_frac
+# Monitor any run (separate terminal): loss / lr / dev WER / dev blank_frac
 .venv/bin/tensorboard --logdir runs/stage_b
 
-# STREAM-LM (already trained, lm_best.pt kept — only rerun if you removed it). Download the
+# STREAM-LM — must retrain (the 960h tokenizer invalidated the old lm_best.pt). Download the
 # LibriSpeech-LM corpus, pack it to uint16 bins (streamed to disk, bounded RAM), then train.
 .venv/bin/python scripts/download_lm_text.py    # then gunzip; pack via PrepareLmData (see COMMANDS.md Step 6)
 .venv/bin/python -m src.slices.TrainLanguageModel.train_lm
 ```
 
+**Resumable & SIGINT-safe (SP2).** Every trainer (pretrain, Stage-A, Stage-B) atomically checkpoints
+`*_last.pt` (model + all optimizers + RNG + step) and **auto-resumes** from it — just re-launch the
+same command after an interrupt or crash. Ctrl-C is caught cooperatively (finishes the step,
+checkpoints, exits clean). Force a fresh run with `resume=False` on the command.
+
 All tunables are read from `config/*.yaml` via `get_config()` — edit the YAML, no code change
-required.
+required. The optimizer stack (Muon+AdamW+muP) lives in `config/optim.yaml`, BEST-RQ pretrain in
+`config/pretrain.yaml`.
 
 ## Streaming / Offline Decode
 
@@ -159,7 +179,7 @@ turns on STREAM-LM shallow fusion in the first-pass beam plus n-best LM rescore 
 
 > The two-pass decoder is code-complete and streaming/offline equivalent, but the value-residual
 > encoder + decoder need the Stage-A→Stage-B retrain above before `stage_b_best.pt` exists again.
-> STREAM-LM (`lm_best.pt`, val ppl **16.4**) is unchanged and ready.
+> STREAM-LM must also be retrained on the 960 h tokenizer (the old `lm_best.pt` is now incompatible).
 
 ## Evaluation
 
@@ -204,7 +224,7 @@ Binds `127.0.0.1` only (local, no auth); runs on GPU if available, else CPU. The
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest -q          # expect 87 passed, 4 deselected (slow gates)
+.venv/bin/python -m pytest -q          # expect 129 passed, 4 deselected (slow gates)
 ```
 
 ## Notes
@@ -212,8 +232,9 @@ Binds `127.0.0.1` only (local, no auth); runs on GPU if available, else CPU. The
 - Audio decode uses `soundfile`, not `torchaudio.load`: torchaudio 2.11 removed its native
   decode/metadata backends and now routes through TorchCodec, which requires FFmpeg. torchaudio
   is kept only for pure-tensor ops (resample, mel spectrogram).
-- Speed perturbation follows the Kaldi 3-way convention: a factor of 0.9 slows and lengthens
-  the audio, while 1.1 speeds it up and shortens it.
+- Features are precomputed once into an fp16 log-mel mmap cache (SP1); SpecAugment is a GPU batch op
+  (`SpecAugmentBatch.py`, built in SP1 but not yet wired into the trainers — that's an SP5 task).
+  Speed perturbation was dropped (its coprime-resample cost starved the GPU).
 
 ## License
 

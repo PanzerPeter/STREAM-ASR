@@ -9,16 +9,27 @@ uv venv .venv --python 3.12
 uv pip install -r requirements.txt
 python scripts/verify_env.py
 
-# Step 2: Data Foundation (Manifests, Tokenizer, CMVN)
-python -c "from src.slices.BuildManifest.BuildManifest_Handler import build_manifest as b; from src.slices.BuildManifest.BuildManifest_Command import BuildManifestCommand as C; [print(b(C(s, o))) for s, o in [('data/Train/train-clean-100','data/manifests/train.jsonl'), ('data/Val/dev-clean','data/manifests/dev.jsonl'), ('data/Test/test-clean','data/manifests/test.jsonl')]]"
-python -c "from src.slices.BuildManifest.TrainTokenizer_Handler import train_tokenizer as t; from src.slices.BuildManifest.TrainTokenizer_Command import TrainTokenizerCommand as C; print(t(C('data/manifests/train.jsonl','data/tokenizer/bpe500',500)))"
-PYTHONPATH=. python scripts/compute_cmvn.py
+# Step 2: Data Foundation — 960h build
+PYTHONPATH=. python scripts/build_manifests.py       # all 5 splits, parallel probe
+PYTHONPATH=. python scripts/train_tokenizer.py        # retrain BPE-500 on 960h train
+PYTHONPATH=. python scripts/compute_cmvn.py           # CMVN over a 15% sample
+PYTHONPATH=. python scripts/precompute_features.py    # fp16 log-mel cache (~55 GB, one-time)
+
+# Step 2b (optional): BEST-RQ self-supervised encoder pretrain (SP4) → data/checkpoints/bestrq_encoder.pt
+PYTHONPATH=. python -m src.slices.PretrainEncoder.pretrain_bestrq
+#   Continue an interrupted pretrain: re-run the SAME command — it auto-resumes from
+#   data/checkpoints/bestrq_last.pt (full state: model + optimizers + step + RNG) to total_steps (180k).
 
 # Step 3: Train Stage-A (Zipformer + CTC)
 python -m src.slices.TrainAcousticModel.train_stage_a
+#   …or warm-start the encoder from the optional BEST-RQ pretrain above (SP4):
+python -c "from src.slices.TrainAcousticModel.StageATrainer_Handler import run_stage_a; from src.slices.TrainAcousticModel.StageATrainer_Command import StageATrainCommand; import dataclasses as d; run_stage_a(d.replace(StageATrainCommand(), encoder_init='data/checkpoints/bestrq_encoder.pt'))"
 
 # Step 4: Train Stage-B (Hybrid CTC/Attention, U2++)
 python -m src.slices.TrainAcousticModel.train_stage_b
+
+# Resume after an interrupt/crash (SP2): re-run the SAME train command — every trainer auto-resumes
+python -c "from src.slices.TrainAcousticModel.StageATrainer_Handler import run_stage_a; from src.slices.TrainAcousticModel.StageATrainer_Command import StageATrainCommand; import dataclasses as d; run_stage_a(d.replace(StageATrainCommand(), resume=False))"
 
 # Step 5: Streaming Decode (Phase 2 Verification)
 PYTHONPATH=. python -m src.slices.Decode.streaming_decode data/Val/dev-clean/1272/128104/1272-128104-0000.flac --offline
@@ -48,9 +59,60 @@ PYTHONPATH=. python -m src.slices.Demo.serve_demo --lm-weight 0.3
 
 ### Step 2: Data Foundation
 
-* Builds train/dev/test jsonl manifests (28,539 / 2,703 / 2,620 utterances).
+* Builds 5-split jsonl manifests for the 960h set: train **281,241** / dev-clean 2,703 / dev-other
+  2,864 / test-clean 2,620 / test-other 2,939 utterances.
 * Trains a **BPE-500** SentencePiece tokenizer to `data/tokenizer/bpe500.{model,vocab}`.
 * Computes global 80-bin mean/std CMVN over train features into `data/features/cmvn.pt`.
+
+#### 960h data build (SP1)
+
+Scale-out over the full `train-clean-100 + train-clean-360 + train-other-500` (960h) set plus
+`dev-{clean,other}` / `test-{clean,other}`. Heavy passes are **user-run** (GPU/CPU-bound). Run in order:
+
+```bash
+# 1. Manifests for all 5 splits (parallel soundfile probe; seconds)
+PYTHONPATH=. python scripts/build_manifests.py
+
+# 2. Retrain BPE-500 on 960h transcripts (overwrites data/tokenizer/bpe500.model; invalidates old LM)
+PYTHONPATH=. python scripts/train_tokenizer.py
+
+# 3. CMVN over a 15% random sample of 960h (stats converge well before the full set)
+PYTHONPATH=. python scripts/compute_cmvn.py
+
+# 4. Precompute the fp16 log-mel cache for every split (~55 GB, one-time, CPU-heavy)
+PYTHONPATH=. python scripts/precompute_features.py
+```
+
+* The cache (`data/features/mel/<split>.{f16,index.npy,header.json}`) is streamed via mmap so the
+  training epoch loop is GPU-bound (no per-epoch FLAC decode / FFT).
+* Retraining the tokenizer on 960h invalidates the old LM data + checkpoint — regenerate the LM
+  (Step 6) after this build.
+* SpecAugment is now a GPU batch op (`ExtractFeatures/SpecAugmentBatch.py`, SP1) — built but not yet
+  wired into the trainers (that wiring is an SP5 task); speed-perturb was dropped.
+
+### Step 2b: (Optional) BEST-RQ Encoder Pretrain (SP4)
+
+Self-supervised masked-prediction pretrain of the Zipformer encoder on the 960h mel cache (labels
+ignored), before any supervised Stage-A run. A frozen random-projection quantizer turns clean mel into
+discrete targets; the encoder predicts them from span-masked input. Runs on the SP2 resumable harness
+and the SP3 Muon+muP optimizer. **User-run** (long GPU job).
+
+```bash
+# Pretrain → data/checkpoints/bestrq_encoder.pt (encoder-only warm-start artifact)
+#          + data/checkpoints/bestrq_last.pt   (full-state resume point)
+PYTHONPATH=. python -m src.slices.PretrainEncoder.pretrain_bestrq
+tensorboard --logdir runs/bestrq
+
+# Then warm-start supervised Stage-A from the pretrained encoder (encoder_init field on the command):
+python -c "from src.slices.TrainAcousticModel.StageATrainer_Handler import run_stage_a; from src.slices.TrainAcousticModel.StageATrainer_Command import StageATrainCommand; import dataclasses as d; run_stage_a(d.replace(StageATrainCommand(), encoder_init='data/checkpoints/bestrq_encoder.pt'))"
+```
+
+* **Resumable & SIGINT-safe (SP2):** like every trainer — see [Resuming & Interrupting Training](#resuming--interrupting-training-sp2) below.
+* **Optimizer (SP3):** `config/optim.yaml` selects `muon+adamw` (2D hidden weights → Muon spectrally
+  normalized updates; embeddings/biases/norms/heads → AdamW), with optional muP width-invariant LR
+  scaling (`mup_enabled`, default off). Peak LRs (`muon_lr`, `adamw_lr`) are authoritative there.
+* Pretrain knobs (codebook, mask, schedule, `grad_clip`/`log_every`/`save_every`) live in
+  `config/pretrain.yaml`.
 
 ### Step 3: Train Stage-A (Zipformer + CTC)
 
@@ -71,6 +133,29 @@ tensorboard --logdir runs/stage_a
 tensorboard --logdir runs/stage_b
 
 ```
+
+### Resuming & Interrupting Training (SP2)
+
+All three trainers (BEST-RQ pretrain, Stage-A, Stage-B) share the SP2 resumable harness: after every
+`save_every` steps they atomically write `<name>_last.pt` (model + **all** optimizers + RNG + step +
+`resume_count`) via a temp-file + `os.replace`, so an interrupted write never corrupts the live
+checkpoint.
+
+* **Resume** — just re-launch the **same** command. `resume=True` is the default, so training continues
+  from `data/checkpoints/{bestrq,stage_a,stage_b}_last.pt` (fresh, non-repeating epoch seeded
+  `base_seed + resume_count`).
+* **Ctrl-C is safe** — SIGINT/SIGTERM are caught cooperatively: the loop finishes its current step,
+  checkpoints, and exits cleanly (no mid-step corruption).
+* **Force a fresh run** — pass `resume=False` to ignore any existing `_last.pt`:
+
+```bash
+# Fresh Stage-A (ignore stage_a_last.pt); swap the handler/command names for Stage-B or pretrain
+python -c "from src.slices.TrainAcousticModel.StageATrainer_Handler import run_stage_a; from src.slices.TrainAcousticModel.StageATrainer_Command import StageATrainCommand; import dataclasses as d; run_stage_a(d.replace(StageATrainCommand(), resume=False))"
+```
+
+> ⚠️ **Old checkpoints are incompatible.** The SP2 schema stores an `"optimizers"` **list**; pre-SP2
+> `*.pt` files (singular `"optimizer"`) raise `KeyError` on load — this hits decode/demo/eval and the LM
+> too. Delete/regenerate `stage_a/b_*.pt` and `lm_*.pt` before loading them.
 
 ### Step 5: Streaming Decode Options
 
@@ -134,12 +219,14 @@ PYTHONPATH=. mypy src         # Type check checking (Strict: expect 0 errors)
 | File | Parameters Controlled |
 | --- | --- |
 | `config/audio.yaml` | Sample rate, n_mels, FFT/window/hop, CMVN epsilon |
-| `config/augment.yaml` | Speed-perturb factors, SpecAugment masks (full strength for Stage B) |
+| `config/augment.yaml` | SpecAugment masks (GPU batch op; full strength for Stage B). Speed-perturb dropped (SP1) |
 | `config/model.yaml` | Encoder dims/layers/heads, conv kernel, dropout, RoPE base, `encoder_value_residual_lambda`, vocab size, attention-decoder dims/layers/heads, `decoder_value_residual_lambda` |
 | `config/training.yaml` | `stage_a` + `stage_b` settings (`ctc_weight`, `reverse_weight`, `label_smoothing`, `chunk_sizes`, `warm_start`) |
 | `config/decode.yaml` | `chunk_size`, `beam_size`, `rescore_lambda`, `rescore_ctc_weight`, `lm_weight` ($\alpha$), `lm_checkpoint` |
 | `config/lm.yaml` | STREAM-LM: `d_model`/`layers`/`heads`/`kv_groups`, `context_len`, schedule, `subset_words` |
 | `config/eval.yaml` | `ablation_stages`, `report_path` |
+| `config/optim.yaml` | Optimizer stack (SP3): `optimizer` (`adamw`\|`muon+adamw`), `muon_lr`/`adamw_lr`, `muon_momentum`, `ns_steps`, `weight_decay`, `mup_enabled`/`mup_base_dims` |
+| `config/pretrain.yaml` | BEST-RQ pretrain (SP4): `codebook_size`/`codebook_dim`, `mask_prob`/`mask_span`/`noise_std`, `stack_frames`, `warmup_steps`/`total_steps`, `grad_clip`/`log_every`/`save_every`, `seed` |
 
 ### Configuration Verification
 

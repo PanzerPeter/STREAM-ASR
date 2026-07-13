@@ -1,0 +1,10 @@
+# config/optim.yaml — optimizer + muP settings (SP3). muon+adamw routes 2D hidden weights to Muon and
+# everything else to AdamW; mup_enabled turns on width-invariant LR scaling (default off = baseline).
+optimizer: muon+adamw     # adamw | muon+adamw
+muon_lr: 2.0e-2
+adamw_lr: 1.5e-3
+muon_momentum: 0.95
+ns_steps: 5
+weight_decay: 1.0e-2
+mup_enabled: false
+mup_base_dims: [192, 256, 384, 512, 384, 256]

@@ -18,11 +18,15 @@ class AudioConfig(BaseModel):
 
 
 class AugmentConfig(BaseModel):
-    speed_perturb_factors: tuple[float, ...]
     specaug_num_freq_masks: int
     specaug_freq_width: int
     specaug_time_ratio: float
     specaug_max_time_masks: int
+
+
+class FeaturesConfig(BaseModel):
+    cache_dir: str
+    enabled: bool
 
 
 class ModelConfig(BaseModel):
@@ -77,7 +81,6 @@ class ModelConfig(BaseModel):
 class StageAConfig(BaseModel):
     max_frames_per_batch: int
     grad_accum: int
-    lr_peak: float
     warmup_steps: int
     total_steps: int
     weight_decay: float
@@ -111,7 +114,6 @@ class StageAConfig(BaseModel):
 class StageBConfig(BaseModel):
     max_frames_per_batch: int
     grad_accum: int
-    lr_peak: float
     warmup_steps: int
     total_steps: int
     weight_decay: float
@@ -172,14 +174,43 @@ class EvalConfig(BaseModel):
     report_path: str
 
 
+class OptimConfig(BaseModel):
+    optimizer: str
+    muon_lr: float
+    adamw_lr: float
+    muon_momentum: float
+    ns_steps: int
+    weight_decay: float
+    mup_enabled: bool
+    mup_base_dims: tuple[int, ...]
+
+
+class PretrainConfig(BaseModel):
+    codebook_size: int
+    codebook_dim: int
+    mask_prob: float
+    mask_span: int
+    noise_std: float
+    stack_frames: int
+    warmup_steps: int
+    total_steps: int
+    seed: int
+    grad_clip: float
+    log_every: int
+    save_every: int
+
+
 class StreamConfig(BaseModel):
     audio: AudioConfig
     augment: AugmentConfig
+    features: FeaturesConfig
     model: ModelConfig
     training: TrainingConfig
     decode: DecodeConfig
     lm: LmConfig
     eval: EvalConfig
+    optim: OptimConfig
+    pretrain: PretrainConfig
 
 
 @lru_cache(maxsize=None)
@@ -188,10 +219,13 @@ def get_config(config_dir: str | None = None) -> StreamConfig:
     data = {
         "audio": yaml.safe_load((root / "audio.yaml").read_text()),
         "augment": yaml.safe_load((root / "augment.yaml").read_text()),
+        "features": yaml.safe_load((root / "features.yaml").read_text()),
         "model": yaml.safe_load((root / "model.yaml").read_text()),
         "training": yaml.safe_load((root / "training.yaml").read_text()),
         "decode": yaml.safe_load((root / "decode.yaml").read_text()),
         "lm": yaml.safe_load((root / "lm.yaml").read_text()),
         "eval": yaml.safe_load((root / "eval.yaml").read_text()),
+        "optim": yaml.safe_load((root / "optim.yaml").read_text()),
+        "pretrain": yaml.safe_load((root / "pretrain.yaml").read_text()),
     }
     return StreamConfig(**data)

@@ -9,6 +9,9 @@ dynamic-chunk masking, warm-started from the Stage-A checkpoint.
 - Stage-A training: `StageATrainCommand` -> `run_stage_a` -> checkpoint path (`stage_a_last.pt`)
 - Stage-B training: `StageBTrainCommand` -> `run_stage_b` (`train_stage_b.py`) -> checkpoint path
   (`stage_b_last.pt`)
+- Both trainers resume from their `*_last.pt` on restart (SP2, via `resume_if_available`) and are
+  SIGINT/SIGTERM-safe — `SignalGuard` catches the signal, finishes the in-flight step, and
+  checkpoints before exiting rather than losing partial progress.
 - Stage-A model: `AcousticModel(features, lengths) -> (logits, out_lengths)`
 - Stage-B model: `HybridCtcAttention(features, lengths, chunk_size=0) -> (ctc_logits, memory, out_lengths)`
 
@@ -49,8 +52,10 @@ bf16 autocast on both stages; both Stage-A and Stage-B train **eager** (`compile
 (`_Checkpointed` wrapping each stack) is optional and **off by default**, gated by `grad_checkpoint`
 in `config/training.yaml`.
 Stage-B config lives under `training.stage_b` in `config/training.yaml`: `max_frames_per_batch
-18000`, `lr_peak 7.5e-4`, `warmup_steps 5000`, `total_steps 80000`, `chunk_sizes [0, 16, 32]`,
+18000`, `warmup_steps 5000`, `total_steps 80000`, `chunk_sizes [0, 16, 32]`,
 `ctc_weight 0.3`, `reverse_weight 0.3`, `label_smoothing 0.1`, `warm_start
 data/checkpoints/stage_a_last.pt`; escape-check gate mirrors Stage-A's blank-collapse guard.
+LR peaks (`adamw_lr`/`muon_lr`) live in `config/optim.yaml`, not per-stage — there is no
+`stage_a.lr_peak`/`stage_b.lr_peak` field.
 Encoder is ~54M params (multi-rate stacks, rotary attention); bump `encoder_dims`/`encoder_layers`
 in `config/model.yaml` if WER plateaus.

@@ -120,9 +120,9 @@ class TrainLm_Handler:
                     f"val ppl {ppl:8.3f}{marker}  @ step {step:,}",
                 )
                 if improved:
-                    save_checkpoint(best_ckpt, model, opt, step, {"val_ppl": ppl})
+                    save_checkpoint(best_ckpt, model, opt, step, extra={"val_ppl": ppl})
 
-        save_checkpoint(last_ckpt, model, opt, steps, {"val_ppl": best})
+        save_checkpoint(last_ckpt, model, opt, steps, extra={"val_ppl": best})
         writer.close()
         console.print(
             Panel(

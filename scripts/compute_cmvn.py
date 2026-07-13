@@ -8,7 +8,8 @@ def main() -> None:
         ComputeCmvnCommand(
             manifest="data/manifests/train.jsonl",
             cmvn_out="data/features/cmvn.pt",
-            max_utts=None,
+            sample_frac=0.15,
+            seed=0,
         )
     )
     print(f"CMVN over train: mean[0]={stats['mean'][0]:.3f} std[0]={stats['std'][0]:.3f}")
