@@ -3,6 +3,11 @@
 ## 1. End-to-End Pipeline (Quick Run)
 Run these commands in sequence to execute the full pipeline from environment setup to local demo.
 
+> **Conventions:** all commands assume you are `cd`'d at the repo root with the venv **activated**
+> (`source .venv/bin/activate`), so `python` is the 3.12 venv interpreter. `python -m …` and
+> `python -c …` already have the repo root on `sys.path`; only `scripts/*.py` that import `src`,
+> `pytest`, and `mypy` need the `PYTHONPATH=.` prefix.
+
 ```bash
 # Step 1: Environment Setup
 uv venv .venv --python 3.12
@@ -16,35 +21,36 @@ PYTHONPATH=. python scripts/compute_cmvn.py           # CMVN over a 15% sample
 PYTHONPATH=. python scripts/precompute_features.py    # fp16 log-mel cache (~55 GB, one-time)
 
 # Step 2b (optional): BEST-RQ self-supervised encoder pretrain (SP4) → data/checkpoints/bestrq_encoder.pt
-PYTHONPATH=. python -m src.slices.PretrainEncoder.pretrain_bestrq
+python -m src.slices.PretrainEncoder.pretrain_bestrq
 #   Continue an interrupted pretrain: re-run the SAME command — it auto-resumes from
 #   data/checkpoints/bestrq_last.pt (full state: model + optimizers + step + RNG) to total_steps (180k).
 
-# Step 3: Train Stage-A (Zipformer + CTC)
-python -m src.slices.TrainAcousticModel.train_stage_a
-#   …or warm-start the encoder from the optional BEST-RQ pretrain above (SP4):
-python -c "from src.slices.TrainAcousticModel.StageATrainer_Handler import run_stage_a; from src.slices.TrainAcousticModel.StageATrainer_Command import StageATrainCommand; import dataclasses as d; run_stage_a(d.replace(StageATrainCommand(), encoder_init='data/checkpoints/bestrq_encoder.pt'))"
+# Step 3: Train the transducer (single joint stage; encoder + StatelessPredictor + TransducerJoiner,
+# warm-started from data/checkpoints/bestrq_encoder.pt by default — training.transducer.warm_start)
+python -m src.slices.TrainAcousticModel.train_transducer
 
-# Step 4: Train Stage-B (Hybrid CTC/Attention, U2++)
-python -m src.slices.TrainAcousticModel.train_stage_b
+# Resume after an interrupt/crash (SP2): re-run the SAME train command — the trainer auto-resumes
+python -c "from src.slices.TrainAcousticModel.TransducerTrainer_Handler import run_transducer; from src.slices.TrainAcousticModel.TransducerTrainer_Command import TransducerTrainCommand; import dataclasses as d; run_transducer(d.replace(TransducerTrainCommand(), resume=False))"
 
-# Resume after an interrupt/crash (SP2): re-run the SAME train command — every trainer auto-resumes
-python -c "from src.slices.TrainAcousticModel.StageATrainer_Handler import run_stage_a; from src.slices.TrainAcousticModel.StageATrainer_Command import StageATrainCommand; import dataclasses as d; run_stage_a(d.replace(StageATrainCommand(), resume=False))"
-
-# Step 5: Streaming Decode (Phase 2 Verification)
-PYTHONPATH=. python -m src.slices.Decode.streaming_decode data/Val/dev-clean/1272/128104/1272-128104-0000.flac --offline
-PYTHONPATH=. python -m src.slices.Decode.streaming_decode data/Val/dev-clean/1272/128104/1272-128104-0000.flac
+# Step 5: Streaming Decode (single-pass RNN-T beam search)
+python -m src.slices.Decode.streaming_decode data/Val/dev-clean/1272/128104/1272-128104-0000.flac --offline
+python -m src.slices.Decode.streaming_decode data/Val/dev-clean/1272/128104/1272-128104-0000.flac
 
 # Step 6: Train Neural Language Model (STREAM-LM)
 python scripts/download_lm_text.py && gunzip -k data/lm_text/librispeech-lm-norm.txt.gz
 python -c "from src.slices.TrainLanguageModel.PrepareLmData_Handler import PrepareLmData_Handler as H; from src.slices.TrainLanguageModel.PrepareLmData_Command import PrepareLmData_Command as C; from src.shared_kernel.Tokenizer_Adapter import SentencePieceTokenizer as T; from src.shared_kernel.Config_Adapter import get_config as g; lm=g().lm; H(T('data/tokenizer/bpe500.model')).run(C('data/lm_text/librispeech-lm-norm.txt', 'data/lm_data', lm.subset_words, lm.val_words))"
 python -m src.slices.TrainLanguageModel.train_lm
 
-# Step 7: Evaluation (Acoustic + LM Grid Sweep)
+# Step 7: Evaluation (Acoustic beam + LM n-best rescoring)
+# --tune decodes dev ONCE acoustic-only, sweeps lm_weight (alpha) over the cached (acoustic, LM-
+# sequence) scores for free, freezes the best, then runs the test table (greedy/beam/beam_lm x
+# offline/streaming) with it. Batched beam search keeps the full run within a few GPU-hours.
 python -m src.slices.Evaluate.evaluate data/manifests/test.jsonl --tune data/manifests/dev.jsonl
+# Quick liveness smoke (finishes in ~1-2 min): a tiny dev subset + coarse grid + capped test table.
+python -m src.slices.Evaluate.evaluate data/manifests/test.jsonl --tune data/manifests/dev.jsonl --tune-limit 30 --lm-grid 0.0,0.2,0.4 --limit 30
 
-# Step 8: Launch Local Web UI Demo
-PYTHONPATH=. python -m src.slices.Demo.serve_demo --lm-weight 0.3
+# Step 8: Launch Local Web UI Demo (--lm-weight 0.5 = tuned optimum; omit it for acoustic-only)
+python -m src.slices.Demo.serve_demo --lm-weight 0.5
 
 ```
 
@@ -87,24 +93,26 @@ PYTHONPATH=. python scripts/precompute_features.py
   training epoch loop is GPU-bound (no per-epoch FLAC decode / FFT).
 * Retraining the tokenizer on 960h invalidates the old LM data + checkpoint — regenerate the LM
   (Step 6) after this build.
-* SpecAugment is now a GPU batch op (`ExtractFeatures/SpecAugmentBatch.py`, SP1) — built but not yet
-  wired into the trainers (that wiring is an SP5 task); speed-perturb was dropped.
+* SpecAugment runs as a GPU batch op (`ExtractFeatures/SpecAugmentBatch.py`, SP1), applied inside
+  `TransducerModel.joint_loss` on the train path only — gated by `training.spec_augment` (default
+  `true`). Speed-perturb was dropped.
 
 ### Step 2b: (Optional) BEST-RQ Encoder Pretrain (SP4)
 
 Self-supervised masked-prediction pretrain of the Zipformer encoder on the 960h mel cache (labels
-ignored), before any supervised Stage-A run. A frozen random-projection quantizer turns clean mel into
+ignored), before the joint transducer run. A frozen random-projection quantizer turns clean mel into
 discrete targets; the encoder predicts them from span-masked input. Runs on the SP2 resumable harness
 and the SP3 Muon+muP optimizer. **User-run** (long GPU job).
 
 ```bash
 # Pretrain → data/checkpoints/bestrq_encoder.pt (encoder-only warm-start artifact)
 #          + data/checkpoints/bestrq_last.pt   (full-state resume point)
-PYTHONPATH=. python -m src.slices.PretrainEncoder.pretrain_bestrq
+python -m src.slices.PretrainEncoder.pretrain_bestrq
 tensorboard --logdir runs/bestrq
 
-# Then warm-start supervised Stage-A from the pretrained encoder (encoder_init field on the command):
-python -c "from src.slices.TrainAcousticModel.StageATrainer_Handler import run_stage_a; from src.slices.TrainAcousticModel.StageATrainer_Command import StageATrainCommand; import dataclasses as d; run_stage_a(d.replace(StageATrainCommand(), encoder_init='data/checkpoints/bestrq_encoder.pt'))"
+# The transducer trainer warm-starts from this checkpoint by default
+# (training.transducer.warm_start = data/checkpoints/bestrq_encoder.pt) — no extra flag needed:
+python -m src.slices.TrainAcousticModel.train_transducer
 ```
 
 * **Resumable & SIGINT-safe (SP2):** like every trainer — see [Resuming & Interrupting Training](#resuming--interrupting-training-sp2) below.
@@ -114,58 +122,65 @@ python -c "from src.slices.TrainAcousticModel.StageATrainer_Handler import run_s
 * Pretrain knobs (codebook, mask, schedule, `grad_clip`/`log_every`/`save_every`) live in
   `config/pretrain.yaml`.
 
-### Step 3: Train Stage-A (Zipformer + CTC)
+### Step 3: Train the transducer (single joint stage)
 
-* **Target:** ~120k steps, target dev WER 10-14%. Checkpoints save to `data/checkpoints/`.
-* **Telemetry:** Watch `blank_frac` fall from ~1.000 via TensorBoard before WER begins moving.
+* Single-pass streaming RNN-T: the unchanged ~53.8M-param Zipformer encoder + a `StatelessPredictor`
+  (icefall-style, no recurrence) + an additive `TransducerJoiner`, trained jointly with
+  `rnnt_loss + ctc_aux_weight * ctc_loss + interctc_loss` (aux CTC + InterCTC taps at stacks 3–4 are
+  regularizers/health probes, not separate stages). Model is ~55.3M params total.
+* Warm-starts the encoder from `data/checkpoints/bestrq_encoder.pt` by default
+  (`training.transducer.warm_start`); predictor/joiner/heads always train from scratch.
+* **Target:** ~120k steps (`training.transducer.total_steps`). Checkpoints:
+  `data/checkpoints/transducer_last.pt` (periodic) / `transducer_best.pt` (best dev
+  greedy-transducer WER). Reference: the 2026-07-17 run took ~4 h and hit best dev
+  transducer-WER **0.0890**.
+* **Telemetry:** Watch `dev/blank_frac` fall from ~1.000 and `dev/transducer_wer` via TensorBoard.
+* **OOM resolution:** lower `training.transducer.max_frames_per_batch` (18000) or
+  `max_tokens_per_batch` (4000 — bounds the `B*T*(U+1)` RNN-T joiner lattice), or set
+  `training.transducer.grad_checkpoint: true` (~30% slower, bounds VRAM).
 
 ```bash
-tensorboard --logdir runs/stage_a
-
-```
-
-### Step 4: Train Stage-B (Hybrid CTC/Attention, U2++)
-
-* Warm-starts from `stage_a_last.pt`. Uses joint loss ($0.3 \cdot \text{CTC} + 0.7 \cdot \text{attn}$) and dynamic-chunk masking $\{0, 16, 32\}$.
-* **OOM Resolution:** Lower `stage_b.max_frames_per_batch` in `config/training.yaml`, or set `stage_b.grad_checkpoint: true` (~30% slower, bounds VRAM).
-
-```bash
-tensorboard --logdir runs/stage_b
+tensorboard --logdir runs/transducer
 
 ```
 
 ### Resuming & Interrupting Training (SP2)
 
-All three trainers (BEST-RQ pretrain, Stage-A, Stage-B) share the SP2 resumable harness: after every
-`save_every` steps they atomically write `<name>_last.pt` (model + **all** optimizers + RNG + step +
-`resume_count`) via a temp-file + `os.replace`, so an interrupted write never corrupts the live
-checkpoint.
+Every trainer (BEST-RQ pretrain, transducer) shares the SP2 resumable harness: after every
+`save_every`/`ckpt_every` steps it atomically writes `<name>_last.pt` (model + **all** optimizers +
+RNG + step + `resume_count`) via a temp-file + `os.replace`, so an interrupted write never corrupts
+the live checkpoint.
 
 * **Resume** — just re-launch the **same** command. `resume=True` is the default, so training continues
-  from `data/checkpoints/{bestrq,stage_a,stage_b}_last.pt` (fresh, non-repeating epoch seeded
+  from `data/checkpoints/{bestrq,transducer}_last.pt` (fresh, non-repeating epoch seeded
   `base_seed + resume_count`).
 * **Ctrl-C is safe** — SIGINT/SIGTERM are caught cooperatively: the loop finishes its current step,
   checkpoints, and exits cleanly (no mid-step corruption).
 * **Force a fresh run** — pass `resume=False` to ignore any existing `_last.pt`:
 
 ```bash
-# Fresh Stage-A (ignore stage_a_last.pt); swap the handler/command names for Stage-B or pretrain
-python -c "from src.slices.TrainAcousticModel.StageATrainer_Handler import run_stage_a; from src.slices.TrainAcousticModel.StageATrainer_Command import StageATrainCommand; import dataclasses as d; run_stage_a(d.replace(StageATrainCommand(), resume=False))"
+# Fresh transducer run (ignore transducer_last.pt); swap the handler/command names for pretrain
+python -c "from src.slices.TrainAcousticModel.TransducerTrainer_Handler import run_transducer; from src.slices.TrainAcousticModel.TransducerTrainer_Command import TransducerTrainCommand; import dataclasses as d; run_transducer(d.replace(TransducerTrainCommand(), resume=False))"
 ```
 
 > ⚠️ **Old checkpoints are incompatible.** The SP2 schema stores an `"optimizers"` **list**; pre-SP2
 > `*.pt` files (singular `"optimizer"`) raise `KeyError` on load — this hits decode/demo/eval and the LM
-> too. Delete/regenerate `stage_a/b_*.pt` and `lm_*.pt` before loading them.
+> too. Delete/regenerate `transducer_*.pt` and `lm_*.pt` before loading them.
 
 ### Step 5: Streaming Decode Options
 
-* **Offline (Two-pass):** Full context, target WER ~8-10%.
-* **Streaming (Two-pass):** Chunked, cached, latency-optimized, target WER ~10-12%. LM fusion is disabled (`lm_weight: 0.0`) by default until Step 6.
+* **Offline:** Full-context single encoder pass, then one RNN-T beam search over the whole memory —
+  test-clean WER 7.3–7.8% (beam+LM / beam).
+* **Streaming:** Chunked/cached encoder (`StreamCache`) feeding the same beam search as frames
+  arrive — test-clean WER 9.7–10.4%, ~19 ms first-partial latency. LM off (`lm_weight: 0.0`) by
+  default until Step 6.
+* `--offline` selects offline mode; omitting it runs streaming (the `streaming_decode.py` default).
 
 ### Step 6: Train Neural LM (STREAM-LM)
 
 * Trains a deep-narrow causal Transformer (GQA + QK-norm + value-residual, tied embeddings; AdamW warmup $\rightarrow$ cosine, bf16).
-* `total_steps=40000` $\approx$ 0.3-0.5 epoch over the ~803M-word corpus.
+* `total_steps=40000` $\approx$ 0.3-0.5 epoch over the ~803M-word corpus. The 2026-07-17 run reached
+  **val ppl 17.2**; at the tuned α=0.5 it buys −0.5/−0.7 abs WER offline/streaming over acoustic-only.
 
 ### Step 7: Evaluation Alternates
 
@@ -173,12 +188,22 @@ python -c "from src.slices.TrainAcousticModel.StageATrainer_Handler import run_s
 # Acoustic-only evaluation (LM off, α=0)
 python -m src.slices.Evaluate.evaluate data/manifests/test.jsonl
 
-# Evaluation with a fixed α (skip dev sweep, explicit reproducibility)
-python -m src.slices.Evaluate.evaluate data/manifests/test.jsonl --lm-weight 0.3
+# Evaluation with a fixed α (skip dev sweep, explicit reproducibility; 0.5 = tuned optimum)
+python -m src.slices.Evaluate.evaluate data/manifests/test.jsonl --lm-weight 0.5
 
 ```
 
 > ⚠️ **Note:** Tuning via `--tune` is executed exclusively on the dev set to keep the test headline WER an honest held-out metric.
+
+**Reference results (test-clean, n=2,620, 2026-07-17 run, tuned α=0.5) → `runs/eval/report.json`:**
+
+| Stage | Offline WER / CER | Streaming WER / CER |
+| --- | --- | --- |
+| `greedy_transducer` | 7.95% / 2.97% | 10.89% / 4.23% |
+| `beam` | 7.81% / 2.83% | 10.41% / 3.89% |
+| **`beam_lm`** | **7.27% / 2.65%** | **9.72% / 3.67%** |
+
+RTF stays ≪ 1 across the board (offline ~0.07, streaming ~0.10 with LM).
 
 ---
 
@@ -189,10 +214,8 @@ python -m src.slices.Evaluate.evaluate data/manifests/test.jsonl --lm-weight 0.3
 PYTHONPATH=. python -m pytest -q
 
 # Component Overfitting & Smoke Gates (Slow)
-PYTHONPATH=. python -m pytest tests/slices/test_overfit_one_batch.py -m slow -s  # Stage-A drop >50%
-PYTHONPATH=. python -m pytest tests/slices/test_overfit_hybrid.py -m slow -s     # Stage-B drop >50%
-PYTHONPATH=. python -m pytest tests/slices/test_stage_b_smoke.py -m slow -s      # 5 steps on dev
-PYTHONPATH=. python -m pytest tests/slices/test_train_lm.py -m slow -s           # LM tiny overfit
+PYTHONPATH=. python -m pytest tests/slices/test_overfit_transducer.py -m slow -s  # transducer loss drop >50% on one batch
+PYTHONPATH=. python -m pytest tests/slices/test_train_lm.py -m slow -s            # LM tiny overfit
 
 # Run all slow gates
 PYTHONPATH=. python -m pytest -m slow -s
@@ -219,12 +242,13 @@ PYTHONPATH=. mypy src         # Type check checking (Strict: expect 0 errors)
 | File | Parameters Controlled |
 | --- | --- |
 | `config/audio.yaml` | Sample rate, n_mels, FFT/window/hop, CMVN epsilon |
-| `config/augment.yaml` | SpecAugment masks (GPU batch op; full strength for Stage B). Speed-perturb dropped (SP1) |
-| `config/model.yaml` | Encoder dims/layers/heads, conv kernel, dropout, RoPE base, `encoder_value_residual_lambda`, vocab size, attention-decoder dims/layers/heads, `decoder_value_residual_lambda` |
-| `config/training.yaml` | `stage_a` + `stage_b` settings (`ctc_weight`, `reverse_weight`, `label_smoothing`, `chunk_sizes`, `warm_start`) |
-| `config/decode.yaml` | `chunk_size`, `beam_size`, `rescore_lambda`, `rescore_ctc_weight`, `lm_weight` ($\alpha$), `lm_checkpoint` |
+| `config/augment.yaml` | SpecAugment masks (GPU batch op, applied in `TransducerModel.joint_loss`, gated by `training.spec_augment`). Speed-perturb dropped (SP1) |
+| `config/model.yaml` | Encoder dims/layers/heads, conv kernel, dropout, RoPE base, `encoder_value_residual_lambda`, vocab size |
+| `config/training.yaml` | `transducer` settings (SP5): `max_frames_per_batch`, `max_tokens_per_batch`, `grad_accum`, `warmup_steps`/`total_steps`, `chunk_sizes`, `warm_start`, `grad_checkpoint`, `dev_wer_utts` |
+| `config/transducer.yaml` | Transducer architecture (SP5): `predictor_dim`, `predictor_context`, `joiner_dim`, `ctc_aux_weight`, `interctc_layers`/`interctc_weights` |
+| `config/decode.yaml` | `chunk_size`, `beam_size`, `max_symbols`, `lm_weight` ($\alpha$), `lm_checkpoint` |
 | `config/lm.yaml` | STREAM-LM: `d_model`/`layers`/`heads`/`kv_groups`, `context_len`, schedule, `subset_words` |
-| `config/eval.yaml` | `ablation_stages`, `report_path` |
+| `config/eval.yaml` | `ablation_stages` (`greedy_transducer`/`beam`/`beam_lm`), `report_path` |
 | `config/optim.yaml` | Optimizer stack (SP3): `optimizer` (`adamw`\|`muon+adamw`), `muon_lr`/`adamw_lr`, `muon_momentum`, `ns_steps`, `weight_decay`, `mup_enabled`/`mup_base_dims` |
 | `config/pretrain.yaml` | BEST-RQ pretrain (SP4): `codebook_size`/`codebook_dim`, `mask_prob`/`mask_span`/`noise_std`, `stack_frames`, `warmup_steps`/`total_steps`, `grad_clip`/`log_every`/`save_every`, `seed` |
 
@@ -232,7 +256,7 @@ PYTHONPATH=. mypy src         # Type check checking (Strict: expect 0 errors)
 
 ```bash
 # Validate Pydantic runtime loading & type checking without starting a full training run
-python -c "from src.shared_kernel.Config_Adapter import get_config; print(get_config().training.stage_a)"
+python -c "from src.shared_kernel.Config_Adapter import get_config; print(get_config().training.transducer)"
 
 ```
 
@@ -245,8 +269,5 @@ python -c "from src.shared_kernel.Config_Adapter import get_config; print(get_co
 *Fast wiring checks for runtime validation. Intended for short runs only, not genuine training.*
 
 ```bash
-# 3-step Stage-A Smoke Run on Dev
-python -c "from src.slices.TrainAcousticModel.StageATrainer_Handler import run_stage_a; from src.slices.TrainAcousticModel.StageATrainer_Command import StageATrainCommand; import dataclasses as d; print(run_stage_a(d.replace(StageATrainCommand(), train_manifest='data/manifests/dev.jsonl', total_steps=3, log_dir='runs/_smoke', ckpt_dir='data/_smoke_ckpt')))"
-
-# 5-step Stage-B Smoke Run on Dev (Random Init Initialization)
-python -c "from src.slices.TrainAcousticModel.StageBTrainer_Handler import run_stage_b; from src.slices.TrainAcousticModel.StageBTrainer_Command import StageBTrainCommand; import dataclasses as d; print(run_stage_b(d.replace(StageBTrainCommand(), train_manifest='data/manifests/dev.jsonl', dev_manifest='data/manifests/dev.jsonl', total_steps=5, warm_start='', log_dir='runs/_smoke_b', ckpt_dir='data/_smoke_ckpt')))"
+# 3-step transducer Smoke Run on Dev (random init, no BEST-RQ warm-start)
+python -c "from src.slices.TrainAcousticModel.TransducerTrainer_Handler import run_transducer; from src.slices.TrainAcousticModel.TransducerTrainer_Command import TransducerTrainCommand; import dataclasses as d; print(run_transducer(d.replace(TransducerTrainCommand(), train_manifest='data/manifests/dev.jsonl', dev_manifest='data/manifests/dev.jsonl', total_steps=3, warm_start='', log_dir='runs/_smoke', ckpt_dir='data/_smoke_ckpt')))"

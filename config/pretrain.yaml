@@ -19,3 +19,8 @@ seed: 42
 grad_clip: 5.0
 log_every: 50
 save_every: 2000
+# BEST-RQ forward is encoder + pred_head only (no predictor/joiner), so it has no RNN-T joiner
+# lattice (B*T*(U+1)) to bound -- unlike transducer.max_frames_per_batch (18k), which IS capped by
+# that lattice. This keeps the original Stage-A-derived 20k VRAM budget instead of borrowing the
+# transducer's tighter figure.
+max_frames_per_batch: 20000

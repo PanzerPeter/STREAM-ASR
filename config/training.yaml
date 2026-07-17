@@ -1,36 +1,17 @@
-stage_a:
-  max_frames_per_batch: 20000
+transducer:
+  max_frames_per_batch: 18000    # frame budget (base of the frame×token bucket)
+  max_tokens_per_batch: 4000     # transcript-char budget: caps the RNN-T joiner lattice B*T*(U+1)
   grad_accum: 4
-  warmup_steps: 10000      # was 3000: model dove into the blank basin during the short warmup
+  warmup_steps: 10000
   total_steps: 120000
   weight_decay: 1.0e-2
   grad_clip: 5.0
   log_every: 50
   val_every: 2000
   ckpt_every: 2000
-  grad_checkpoint: false   # true = bound VRAM at ~30% speed cost; off fits 12 GB at 20k frames
-  escape_check_step: 18000       # earliest step the collapse guard may fire (well after 10k warmup)
-  escape_max_blank_frac: 0.95    # dev blank-argmax fraction that counts as "collapsed"
-  escape_min_wer_progress: 0.99  # only abort if best dev WER also never fell below this (no escape)
-  seed: 42                       # RNG seed: reproducible init/augment/batch order (escape is init-sensitive)
-
-stage_b:
-  max_frames_per_batch: 18000    # decoder + longer targets cost VRAM vs Stage A's 20k
-  grad_accum: 4
-  warmup_steps: 5000             # shorter: encoder is already out of the blank saddle
-  total_steps: 80000
-  weight_decay: 1.0e-2
-  grad_clip: 5.0
-  log_every: 50
-  val_every: 2000
-  ckpt_every: 2000
   grad_checkpoint: false
-  escape_check_step: 12000
-  escape_max_blank_frac: 0.95
-  escape_min_wer_progress: 0.99  # only abort if best dev WER also never fell below this (no escape)
-  seed: 42                       # RNG seed: reproducible init/augment/batch order
-  ctc_weight: 0.3                # L = ctc_weight*CTC + (1-ctc_weight)*attn
-  reverse_weight: 0.3            # attn = (1-reverse_weight)*CE_L2R + reverse_weight*CE_R2L
-  label_smoothing: 0.1
+  seed: 42
   chunk_sizes: [0, 16, 32]       # 0 = full context; 16/32 = base-rate frames sampled per batch
-  warm_start: data/checkpoints/stage_a_last.pt
+  warm_start: data/checkpoints/bestrq_encoder.pt
+  dev_wer_utts: 200              # #dev utterances for the periodic greedy-transducer WER probe
+  spec_augment: true             # SpecAugment on the log-mel input during training (regularisation)

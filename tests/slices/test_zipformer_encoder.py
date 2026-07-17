@@ -43,7 +43,7 @@ def test_encoder_grad_checkpoint_path_runs_full_and_chunked():
     # The activation-checkpointing wrapper must accept the chunk_size arg the encoder now passes,
     # at both the default full-context and a chunked setting (regression guard).
     import torch.nn as nn
-    from src.slices.TrainAcousticModel.StageATrainer_Handler import _Checkpointed
+    from src.slices.TrainAcousticModel._train_utils import _Checkpointed
 
     cfg = get_config()
     enc = ZipformerEncoder(cmvn_path=None).eval()

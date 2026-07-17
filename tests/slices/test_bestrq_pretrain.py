@@ -4,7 +4,7 @@ import torch
 from src.slices.ExtractFeatures.FeatureCache import write_feature_cache
 from src.slices.PretrainEncoder.BestRqPretrain_Command import BestRqPretrainCommand
 from src.slices.PretrainEncoder.BestRqPretrainer_Handler import run_pretrain
-from src.slices.TrainAcousticModel.AcousticModel import AcousticModel
+from src.slices.TrainAcousticModel.TransducerModel import TransducerModel
 
 
 def _tiny_cache_and_manifest(tmp_path):
@@ -38,8 +38,8 @@ def test_pretrain_smoke_emits_warmstartable_encoder(tmp_path):
     )
     out = run_pretrain(cmd)
     ckpt = torch.load(out, map_location="cpu", weights_only=False)
-    # Warm-start: the emitted encoder state_dict loads cleanly into a fresh AcousticModel encoder.
-    model = AcousticModel(cmvn_path=None)
+    # Warm-start: the emitted encoder state_dict loads cleanly into a fresh TransducerModel encoder.
+    model = TransducerModel(cmvn_path=None)
     missing, unexpected = model.encoder.load_state_dict(ckpt["model"], strict=False)
     assert unexpected == []  # no stray keys — it is exactly the encoder
 

@@ -1,5 +1,5 @@
 # src/slices/Demo/serve_demo.py — entry point for the local demo server.
-# Loads the Stage-B hybrid checkpoint once, builds the Decode handler (offline for uploads, the
+# Loads the trained transducer checkpoint once, builds the Decode handler (offline for uploads, the
 # same config drives live StreamingSessions), and serves the browser UI on 127.0.0.1. Heavy/GPU
 # runs are the user's; this only holds one model resident and answers local requests.
 #
@@ -13,14 +13,14 @@ import uvicorn
 
 from src.shared_kernel.Checkpoint_Adapter import load_checkpoint
 from src.shared_kernel.Tokenizer_Adapter import SentencePieceTokenizer
-from src.slices.TrainAcousticModel.HybridModel import HybridCtcAttention
+from src.slices.TrainAcousticModel.TransducerModel import TransducerModel
 from src.slices.Decode.StreamingDecoder_Handler import StreamingDecoder_Handler
 from src.slices.Demo.DemoServer_Handler import build_app
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--checkpoint", default="data/checkpoints/stage_b_best.pt")
+    ap.add_argument("--checkpoint", default="data/checkpoints/transducer_best.pt")
     ap.add_argument("--tokenizer", default="data/tokenizer/bpe500.model")
     ap.add_argument("--host", default="127.0.0.1")  # local-only; no auth on this server
     ap.add_argument("--port", type=int, default=8000)
@@ -30,7 +30,7 @@ def main() -> None:
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = HybridCtcAttention()
+    model = TransducerModel()
     load_checkpoint(args.checkpoint, model)
     model = model.to(device).eval()
     handler = StreamingDecoder_Handler(

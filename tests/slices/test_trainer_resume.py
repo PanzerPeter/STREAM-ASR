@@ -33,9 +33,3 @@ def test_resume_false_ignores_checkpoint(tmp_path):
     m2, o2 = _model_opt()
     meta = resume_if_available(path, m2, [o2], resume=False)
     assert meta["step"] == 0
-
-
-def test_stage_b_command_has_resume_flag():
-    from src.slices.TrainAcousticModel.StageBTrainer_Command import StageBTrainCommand
-
-    assert StageBTrainCommand().resume is True

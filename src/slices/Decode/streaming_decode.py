@@ -1,11 +1,11 @@
-# CLI entry: decode one FLAC with the Stage-B hybrid checkpoint. Heavy/GPU runs are the user's.
+# CLI entry: decode one FLAC with the trained transducer checkpoint. Heavy/GPU runs are the user's.
 import argparse
 
 import torch
 
 from src.shared_kernel.Checkpoint_Adapter import load_checkpoint
 from src.shared_kernel.Tokenizer_Adapter import SentencePieceTokenizer
-from src.slices.TrainAcousticModel.HybridModel import HybridCtcAttention
+from src.slices.TrainAcousticModel.TransducerModel import TransducerModel
 from src.slices.Decode.StreamingDecoder_Handler import StreamingDecoder_Handler
 from src.slices.Decode.StreamingDecode_Command import StreamingDecode_Command
 
@@ -13,13 +13,13 @@ from src.slices.Decode.StreamingDecode_Command import StreamingDecode_Command
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("audio_path")
-    ap.add_argument("--checkpoint", default="data/checkpoints/stage_b_best.pt")
+    ap.add_argument("--checkpoint", default="data/checkpoints/transducer_best.pt")
     ap.add_argument("--tokenizer", default="data/tokenizer/bpe500.model")
     ap.add_argument("--offline", action="store_true")
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = HybridCtcAttention()
+    model = TransducerModel()
     load_checkpoint(args.checkpoint, model)  # maps to CPU, loads the "model" key
     model = model.to(device).eval()
     handler = StreamingDecoder_Handler(model, SentencePieceTokenizer(args.tokenizer))

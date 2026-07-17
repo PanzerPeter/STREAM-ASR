@@ -1,7 +1,22 @@
 # Decode Slice
 
-This slice implements streaming and offline two-pass decode for the trained acoustic model. It consumes three artifacts from prior slices: `data/checkpoints/stage_b_best.pt` (Stage-B trained weights), `data/tokenizer/bpe500.model` (SentencePiece BPE tokenizer), and `data/features/cmvn.pt` (CMVN statistics, loaded inside the encoder). Its tie to `TrainAcousticModel` is limited to the model classes it must run: it instantiates `HybridCtcAttention` (reaching `model.encoder`, `model.ctc_head`, `model.decoder`) and imports `StreamCache`, the companion type of the encoder's public `streaming_forward` API. The model definitions are the artifact contract — the slice imports no trainer handlers, collators, or training-specific utilities.
+This slice implements streaming and offline single-pass RNN-T decode for the trained transducer.
+It consumes three artifacts from prior slices: `data/checkpoints/transducer_best.pt` (trained
+weights), `data/tokenizer/bpe500.model` (SentencePiece BPE tokenizer), and `data/features/cmvn.pt`
+(CMVN statistics, loaded inside the encoder). Its tie to `TrainAcousticModel` is limited to the
+model classes it must run: it instantiates `TransducerModel` (reaching `model.encoder`,
+`model.predictor`, `model.joiner`) and imports `StreamCache`, the companion type of the encoder's
+public `streaming_forward` API. The model definitions are the artifact contract — the slice
+imports no trainer handlers, collators, or training-specific utilities.
 
-First pass is CTC prefix-beam search (`CtcPrefixBeam`) over the encoder's CTC head; second pass rescores the n-best with the bidirectional attention decoder (`AttentionRescorer`). Streaming feeds the encoder feature-rate chunks of `2·decode.chunk_size` through `streaming_forward` with a carried `StreamCache`; offline runs one full-context `forward`. Both reuse the same two passes.
+Decode is a single pass: `TransducerBeamSearch` runs **pure-acoustic** time-synchronous beam search
+over the encoder memory (predictor + joiner), evaluating the whole live beam in one batched
+predictor+joiner call per symbol step (batch dim = beam width) so a frame costs a few GPU launches +
+one host sync, not one per hypothesis. When an LM is attached (`fuse_lm`, `decode.lm_weight > 0`)
+`StreamingDecoder_Handler._search_rescore` re-ranks the n-best by `acoustic + alpha·lm_seq` — one
+STREAM-LM full-sequence forward per hypothesis (n-best rescoring, **not** per-emission shallow
+fusion; that was dropped to keep corpus decode within its GPU budget). Streaming feeds the encoder
+feature-rate chunks of `2·decode.chunk_size` through `streaming_forward` with a carried
+`StreamCache`; offline runs one full-context `forward`. Both funnel into the same beam search.
 
 **Known tail approximation.** The streaming path pads the final feature chunk to an aligned size and trims the padding-derived output frames. The encoder is bit-exact vs `forward(chunk_size=B)` for every aligned frame (see `test_streaming_forward_equivalence`), but for utterances whose post-frontend length is odd, the **last 1–2 output frames** differ from the offline reference: the padded frames leak into the boundary chunk through same-chunk attention, and the ×8 downsampling stack cannot separate fewer than 8 real base frames from padding at its rate. The effect is confined to the utterance tail with negligible WER impact; an exact fix would require threading a valid-length mask through every streaming module (attention/conv/downsample) and is deferred.

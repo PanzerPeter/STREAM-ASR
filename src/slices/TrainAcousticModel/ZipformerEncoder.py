@@ -60,17 +60,33 @@ class ZipformerEncoder(nn.Module):
     def output_dim(self) -> int:
         return get_config().model.encoder_dims[-1]
 
-    def forward(self, features: torch.Tensor, lengths: torch.Tensor, chunk_size: int = 0):
+    def forward(
+        self,
+        features: torch.Tensor,
+        lengths: torch.Tensor,
+        chunk_size: int = 0,
+        return_intermediates: list[int] | None = None,
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor]
+        | tuple[torch.Tensor, torch.Tensor, list[torch.Tensor], torch.Tensor]
+    ):
         x = (features - self.cmvn_mean) / self.cmvn_std
 
         x, lengths = self.frontend(x, lengths)  # ×2, base rate
         pad_mask = make_pad_mask(lengths, x.shape[1])
-        for stack in self.stacks:
+        intermediates: list[torch.Tensor] = []
+        for idx, stack in enumerate(self.stacks):
             x = stack(x, lengths, pad_mask, chunk_size)  # base rate + length preserved
+            if return_intermediates is not None and idx in return_intermediates:
+                intermediates.append(x)
 
+        base_lengths = lengths
         x, out_lengths = self.final_downsample(x, lengths)  # ×2 -> ~25 Hz
         x = self.out_norm(x)
-        return x, out_lengths
+        if return_intermediates is None:
+            return x, out_lengths
+        # Aux InterCTC heads consume base-rate taps; base_lengths are their CTC input lengths.
+        return x, out_lengths, intermediates, base_lengths
 
     def chunk_lcm(self) -> int:
         # Base-rate chunk boundaries must land cleanly at every stack's rate and the final

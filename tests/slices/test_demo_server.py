@@ -7,7 +7,7 @@ import torch
 from src.shared_kernel.AudioIO_Adapter import load_audio_bytes
 from src.slices.Decode.StreamingDecoder_Handler import StreamingDecoder_Handler
 from src.slices.Demo.DemoServer_Handler import build_app
-from src.slices.TrainAcousticModel.HybridModel import HybridCtcAttention
+from src.slices.TrainAcousticModel.TransducerModel import TransducerModel
 
 
 class _StubTok:
@@ -27,7 +27,7 @@ def test_load_audio_bytes_decodes_and_resamples():
 
 def test_build_app_registers_routes():
     torch.manual_seed(0)
-    model = HybridCtcAttention(cmvn_path=None).eval()
+    model = TransducerModel(cmvn_path=None).eval()
     app = build_app(StreamingDecoder_Handler(model, _StubTok()))
     paths = {getattr(r, "path", None) for r in app.routes}
     assert {"/", "/transcribe", "/stream"} <= paths

@@ -42,18 +42,57 @@ def test_optim_config_loads():
     assert cfg.adamw_lr > 0
 
 
-def test_partition_excludes_real_decoder_and_ctc_heads():
-    # Regression lock for the head-routing bug: on the REAL model both output heads must go to
-    # AdamW, while hidden attention projections (incl. cross-attn out_proj) must go to Muon.
-    from src.slices.TrainAcousticModel.HybridModel import HybridCtcAttention
+def test_partition_routes_transducer_modules():
+    # Regression lock for SP5 Task 7: transducer readouts/embeddings -> AdamW, joiner's hidden
+    # 2D projections -> Muon, matching the routing already locked for the hybrid model.
+    from src.slices.TrainAcousticModel.TransducerModel import TransducerModel
 
-    m = HybridCtcAttention(cmvn_path=None)
-    muon, _ = partition_params(m)
+    m = TransducerModel(cmvn_path=None)
+    muon, adamw = partition_params(m)
     muon_ids = {id(p) for p in muon}
-    assert id(m.ctc_head.weight) not in muon_ids
-    assert id(m.decoder.out_proj.weight) not in muon_ids
-    assert id(m.decoder.left.layers[0].cross_attn.out_proj.weight) in muon_ids
+    adamw_ids = {id(p) for p in adamw}
+    # Joiner readout + InterCTC + CTC heads + predictor embedding -> AdamW.
+    assert id(m.joiner.out.weight) in adamw_ids
+    assert id(m.ctc_head.weight) in adamw_ids
+    assert id(m.interctc_heads[0].weight) in adamw_ids
+    assert id(m.predictor.embed.weight) in adamw_ids
+    # Joiner hidden projections -> Muon (2D hidden Linears).
+    assert id(m.joiner.enc_proj.weight) in muon_ids
+    assert id(m.joiner.pred_proj.weight) in muon_ids
+    # Encoder attention out projection stays on Muon (regression lock).
     assert id(m.encoder.stacks[0].blocks[0].attn.out.weight) in muon_ids
+
+
+def test_encoder_lr_scale_downscales_encoder_groups():
+    # Warm-start discriminative fine-tuning: params under `encoder.*` get base_lr * encoder_lr_scale
+    # on BOTH Muon and AdamW, while fresh heads keep the full LR.
+    from src.shared_kernel.Config_Adapter import OptimConfig
+
+    class _Enc(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = nn.Sequential(nn.Linear(8, 8))  # encoder.* -> scaled
+            self.ctc_head = nn.Linear(8, 6)  # fresh head -> full LR
+
+    net = _Enc()
+    cfg = OptimConfig(
+        optimizer="muon+adamw",
+        muon_lr=0.02,
+        adamw_lr=0.01,
+        muon_momentum=0.95,
+        ns_steps=5,
+        weight_decay=0.01,
+        mup_enabled=False,
+        mup_base_dims=(8,),
+        encoder_lr_scale=0.25,
+    )
+    muon, adamw = build_optimizer(net, cfg)
+    enc_w = id(net.encoder[0].weight)  # 2D hidden -> Muon, encoder -> scaled
+    head_w = id(net.ctc_head.weight)  # head -> AdamW, full LR
+    muon_lr = {id(p): g["lr"] for g in muon.param_groups for p in g["params"]}
+    adamw_lr = {id(p): g["lr"] for g in adamw.param_groups for p in g["params"]}
+    assert muon_lr[enc_w] == 0.02 * 0.25  # encoder Muon group scaled
+    assert adamw_lr[head_w] == 0.01  # fresh head at full AdamW LR
 
 
 def test_mup_enabled_scales_adamw_group_lr():

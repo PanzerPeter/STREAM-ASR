@@ -2,7 +2,7 @@
 # BEST-RQ pretrain loop (SP4): span-mask -> encoder -> masked-prediction CE, on the SP2 resumable
 # harness and the SP3 Muon+muP optimizer. Reads the SP1 fp16 mel cache (labels ignored). Emits a
 # full-state checkpoint (bestrq_last.pt, for crash/interrupt resume) plus an encoder-only checkpoint
-# (bestrq_encoder.pt) that warm-starts supervised Stage-A.
+# (bestrq_encoder.pt) that warm-starts the transducer trainer's encoder.
 import math
 import os
 
@@ -42,7 +42,10 @@ def run_pretrain(cmd: BestRqPretrainCommand) -> str:
     ds = MelOnlyDataset(cmd.train_manifest, cache)
     sampler = FrameBucketSampler(
         cmd.train_manifest,
-        get_config().training.stage_a.max_frames_per_batch,
+        # BEST-RQ's own budget (config/pretrain.yaml): encoder + pred_head only, no
+        # predictor/joiner, so there's no RNN-T joiner lattice (B*T*(U+1)) to cap -- unlike
+        # transducer.max_frames_per_batch (18k), which exists solely to bound that lattice.
+        p.max_frames_per_batch,
         shuffle=True,
         seed=p.seed,
     )

@@ -1,65 +1,84 @@
 # STREAM
 
-**S**peech **T**ranscription via **R**egularized **E**ncoder–**A**ttention **M**odeling.
+**S**peech **T**ranscription via **R**egularized **E**ncoder–**A**coustic **M**odeling.
 
 A from-scratch, streaming-capable automatic speech recognition (ASR) system trained on the full
 LibriSpeech **960 h** set (`train-clean-100 + train-clean-360 + train-other-500`). It targets a single
 RTX 5070 (12 GB, Blackwell sm_120) and is built to stay hardware-efficient: state-of-the-art building
 blocks reimplemented in pure PyTorch, with no k2/icefall dependency and no pretrained weights.
 
+**Result (test-clean, 2,620 utts):** offline **7.27 % WER** (CER 2.65 %) / streaming **9.72 % WER**
+(CER 3.67 %) with the RNN-T beam + LM rescoring — real-time factor ≪ 1 on the one GPU. Both beat the
+design targets. See [Evaluation](#evaluation).
+
 ## Approach
 
-A two-pass hybrid CTC/attention system built around a Zipformer acoustic encoder:
+A single-pass streaming RNN-T (transducer) system built around an unchanged Zipformer acoustic
+encoder (SP5 — replaced the earlier two-pass CTC→attention-rescoring design):
 
 | Module | Component | Role |
 |---|---|---|
-| Acoustic encoder | Zipformer | log-mel → conv subsample → multi-rate Zipformer stacks with dynamic-chunk masking (~25 Hz output) |
-| Decoder | CTC head + attention decoder | CTC drives the streaming first pass; a bidirectional attention decoder rescores the second pass |
-| Language model | Causal Transformer LM | shallow fusion in the first-pass beam, plus n-best rescoring in the second |
+| Acoustic encoder | Zipformer (~53.8 M params) | log-mel → conv subsample → multi-rate Zipformer stacks with dynamic-chunk masking (~25 Hz output); unchanged by the transducer switch |
+| Prediction network | `StatelessPredictor` | icefall-style: embeds the previous non-blank token + a small causal depthwise-conv context — no recurrence, so streaming state is just the last `context-1` token ids |
+| Joint network | `TransducerJoiner` | additive joiner (project encoder + predictor, sum, tanh, readout to vocab+blank); trains against the full `[B,T,U+1,V]` lattice, decodes one `(t,u)` cell at a time |
+| Auxiliary heads | CTC head + InterCTC taps | `ctc_aux_weight * CTC` on the final encoder output plus weighted CTC losses tapped after two intermediate stacks — regularizers and a cheap greedy-WER health probe, not a separate decoding pass |
+| Language model | Causal Transformer LM (STREAM-LM) | optional **n-best rescoring** of the acoustic beam: re-rank each hypothesis by `acoustic + α·lm_seq`, one full-sequence LM forward per hypothesis (`decode.lm_weight`, α) |
 
-A single set of encoder weights runs either offline (full context, best WER) or streaming
-(small chunk, low latency) through dynamic-chunk masking.
+The model is ~55.3 M params total. A single set of encoder weights runs either offline (full
+context, best WER) or streaming (small chunk, low latency) through dynamic-chunk masking, and one
+joint training stage (warm-started from `bestrq_encoder.pt`) produces the checkpoint both modes
+decode from. The acoustic decode is a single RNN-T beam pass; the LM (when attached) only re-ranks
+that beam's n-best — there is no second acoustic model, unlike the old attention rescorer it
+replaced.
 
-**Value residual (ResFormer/SVFormer).** The Zipformer stacks, the attention decoder, and STREAM-LM
-all use value-residual attention: block/layer 0 of each stack injects its attention *values* into the
+**Value residual (ResFormer/SVFormer).** The Zipformer encoder stacks and STREAM-LM use
+value-residual attention: block/layer 0 of each stack injects its attention *values* into the
 deeper blocks, adding a gradient shortcut through attention that trains stably at depth so the same
-accuracy is reachable at a narrower width. In the encoder and decoder the mix is a **learnable
-per-block gate initialised to 0** (`encoder_value_residual_lambda` / `decoder_value_residual_lambda`
-set the init): a fresh model therefore starts *identical* to a no-value-residual baseline and the
-residual grows only as far as training wants it. This matters because Stage-A CTC sits on a
-blank-collapse knife-edge — a fixed non-zero gate destabilises the escape, whereas the zero-init gate
-does not. The encoder's streaming path caches post-residual values, so `streaming_forward` stays
-exactly equal to the chunked `forward` (`test_streaming_forward_equivalence`).
+accuracy is reachable at a narrower width. The mix is a **learnable per-block gate initialised to
+0** (`encoder_value_residual_lambda` in `config/model.yaml`, `value_residual_lambda` in
+`config/lm.yaml`): a fresh model therefore starts *identical* to a no-value-residual baseline and
+the residual grows only as far as training wants it. This matters because the CTC branch (main +
+InterCTC) sits on a blank-collapse knife-edge — a fixed non-zero gate destabilises the escape,
+whereas the zero-init gate does not. The encoder's streaming path caches post-residual values, so
+`streaming_forward` stays exactly equal to the chunked `forward`
+(`test_streaming_forward_equivalence`). The transducer's own `StatelessPredictor`/`TransducerJoiner`
+are conv/linear-based (no attention), so value residual does not apply to them.
 
-**Target from scratch:** offline WER ≈ 6–8 %, streaming ≈ 8–10 %, RTF < 0.3. This is not
-Whisper-scale — the goal is the best result achievable from this data on this GPU.
+**Target vs achieved (test-clean).** The from-scratch goal was offline ≈ 6–8 % / streaming ≈ 8–10 %
+WER at RTF < 0.3; the 2026-07-17 run landed **offline 7.27 % / streaming 9.72 %** at RTF ≈ 0.07 /
+0.10 — inside both targets. This is not Whisper-scale; the goal is the best result achievable from
+this data on this GPU.
 
 ## Status
 
 | Plan | Scope | State |
 |---|---|---|
 | 1 | Data foundation: environment, manifests, tokenizer, features, dataloader | **Done** |
-| 2 | Zipformer encoder + CTC head + Stage-A training | Code done; **retrain pending** — value residual added to the encoder |
-| 3 | Causal encoder (Phase 0) + attention decoder + joint CTC/attn + Stage-B training (Phase 1) + streaming/offline decode (Phase 2) | Code done; **retrain pending** — value residual added to encoder + decoder |
-| 4 | Neural LM (STREAM-LM) + two-pass LM fusion/rescore + Evaluate slice | **Done** — LM trained (val ppl **16.4**); needs LM retrain on the 960 h tokenizer |
+| 2 | Zipformer encoder + CTC head | Code done; superseded as a standalone training stage by the SP5 transducer (below) — the encoder + CTC head live on inside `TransducerModel` |
+| 3 | Causal encoder (Phase 0) + streaming/offline decode (Phase 2) | Code done; the Phase 1 hybrid CTC/attention decoder was replaced by the SP5 transducer — see below |
+| 4 | Neural LM (STREAM-LM) + LM n-best rescoring + Evaluate slice | **Done** — retrained on the 960 h tokenizer (val ppl **17.2**); rescoring buys −0.5/−0.7 abs WER offline/streaming at the tuned α=0.5 |
 | — | Local demo (web UI): upload a file or speak live | **Done** — `Demo` slice; verified end-to-end |
 
-**Efficiency program (SP1–SP5).** A parallel track to reach 100 M-class WER from a ~45 M single-pass
-streaming model, training *faster per run* on the one GPU:
+**Efficiency program (SP1–SP5).** A parallel track to reach 100 M-class WER from a ~55 M single-pass
+streaming model, training *faster per run* on the one GPU. All five are **done and GPU-validated**
+end-to-end by the 2026-07-17 run (branch `experimental`):
 
 | SP | Scope | State |
 |---|---|---|
-| 1 | 960 h data foundation: 5-split manifests, 960 h BPE retrain, fp16 log-mel mmap cache (~55 GB) | **Code-complete + reviewed** (branch `experimental`); user ran the build |
-| 2 | Atomic SIGINT-safe **resumable** training harness (checkpoint + resume + `SignalGuard`) | **Code-complete + reviewed** |
-| 3 | **Muon + AdamW + muP** optimizer stack (`config/optim.yaml`) — 2D hidden weights → Muon, rest → AdamW | **Code-complete + reviewed** |
-| 4 | **BEST-RQ** self-supervised encoder pretrain → `bestrq_encoder.pt`, warm-starts Stage-A (`encoder_init`) | **Code-complete + reviewed** |
-| 5 | Stateless RNN-T (transducer) head replacing the attention rescorer + InterCTC aux losses | Planned |
+| 1 | 960 h data foundation: 5-split manifests, 960 h BPE retrain, fp16 log-mel mmap cache (~55 GB) | **Done** — build ran, feeds every run |
+| 2 | Atomic SIGINT-safe **resumable** training harness (checkpoint + resume + `SignalGuard`) | **Done** — exercised across the pretrain + transducer runs |
+| 3 | **Muon + AdamW + muP** optimizer stack (`config/optim.yaml`) — 2D hidden weights → Muon, rest → AdamW | **Done** |
+| 4 | **BEST-RQ** self-supervised encoder pretrain → `bestrq_encoder.pt`, warm-starts the transducer (`training.transducer.warm_start`) | **Done** — warm-started the transducer run |
+| 5 | **Single-pass streaming RNN-T**: `StatelessPredictor` + `TransducerJoiner` replace the two-pass hybrid CTC/attention decoder; joint `rnnt + ctc_aux + interctc` loss, one training stage | **Done — GPU-validated** — `TrainAcousticModel.train_transducer` + `Decode`'s `TransducerBeamSearch`; suite green (138 passed, 2 deselected); WER above |
 
-> **Retrain required.** The 960 h tokenizer retrain (SP1) plus the value-residual encoder/decoder
-> change mean the Stage-A/B **and** LM checkpoints were removed and must be regenerated. The SP2
-> checkpoint schema also stores an `"optimizers"` list, so any pre-SP2 `*.pt` fails to load. Prior WER
-> figures (Stage-A dev 0.111, Stage-B dev 0.0999, test-clean 9.1 %/12.0 %) predate these changes and
-> are superseded; new numbers land after the retrain below.
+> **GPU runs complete (2026-07-17) — first valid WER.** The full chain ran end-to-end: BEST-RQ
+> pretrain → transducer training (120 k steps, ~4 h, best dev transducer-WER **0.0890**) → STREAM-LM
+> retrain (val ppl **17.2** on the 960 h tokenizer) → `test-clean` eval (tuned α=0.5 on dev).
+> Checkpoints `transducer_{last,best}.pt` + `lm_{last,best}.pt` (SP2 `"optimizers"`-list schema).
+> Test-clean WER/CER (best = beam+LM): **offline 7.27 % / 2.65 %**, **streaming 9.72 % / 3.67 %** —
+> full ablation below. Prior figures (Stage-A dev 0.111, Stage-B dev 0.0999, test-clean 9.1 %/12.0 %)
+> predate the 960 h data, tokenizer, value-residual encoder, and single-stage transducer, and are
+> **dead**.
 
 ## Layout
 
@@ -86,9 +105,9 @@ src/
     ComputeCmvn/            # global mean/var over train → data/features/cmvn.pt
     ExtractFeatures/        # fp16 log-mel mmap cache + dataset/collator/sampler + GPU SpecAugment (SP1)
     PretrainEncoder/        # BEST-RQ self-supervised encoder pretrain → data/checkpoints/bestrq_encoder.pt (SP4)
-    TrainAcousticModel/     # Zipformer encoder + CTC head + attention decoder + Stage-A/B trainers
+    TrainAcousticModel/     # Zipformer encoder + CTC/InterCTC heads + StatelessPredictor + TransducerJoiner + transducer trainer (SP5)
     TrainLanguageModel/     # STREAM-LM: causal GQA Transformer + corpus prep + LM trainer
-    Decode/                 # streaming/offline two-pass CTC→attention rescore + LM fusion/rescore; StreamingSession (live)
+    Decode/                 # streaming/offline single-pass RNN-T beam search + LM n-best rescoring; StreamingSession (live)
     Evaluate/               # corpus WER/CER/RTF/latency + ablation table (jiwer) + dev α-tune
     Demo/                   # local FastAPI web UI: file upload + live-mic streaming transcription
 scripts/verify_env.py     # asserts Blackwell + working torch
@@ -123,35 +142,32 @@ PYTHONPATH=. .venv/bin/python scripts/precompute_features.py  # fp16 log-mel mma
 
 ## Training
 
-Full retrain order (Stage A → Stage B → STREAM-LM — all three checkpoints must be regenerated on the
-960 h tokenizer):
+Reproduce order (BEST-RQ pretrain → single joint transducer stage → STREAM-LM — both checkpoints
+are trained against the 960 h tokenizer; this is the exact chain the 2026-07-17 run followed):
 
 ```bash
 # (Optional, SP4) BEST-RQ self-supervised encoder pretrain → data/checkpoints/bestrq_encoder.pt
 .venv/bin/python -m src.slices.PretrainEncoder.pretrain_bestrq
 
-# Stage A — Zipformer + CTC, with value residual (~120k steps) → data/checkpoints/stage_a_last.pt
-.venv/bin/python -m src.slices.TrainAcousticModel.train_stage_a
-# …or warm-start the encoder from the BEST-RQ pretrain above (encoder_init on the command):
-.venv/bin/python -c "from src.slices.TrainAcousticModel.StageATrainer_Handler import run_stage_a; from src.slices.TrainAcousticModel.StageATrainer_Command import StageATrainCommand; import dataclasses as d; run_stage_a(d.replace(StageATrainCommand(), encoder_init='data/checkpoints/bestrq_encoder.pt'))"
+# Transducer — single joint training stage (SP5): unchanged Zipformer encoder + StatelessPredictor +
+# TransducerJoiner, trained with rnnt + ctc_aux_weight*ctc + interctc losses (~120k steps).
+# Warm-starts the encoder from data/checkpoints/bestrq_encoder.pt by default
+# (training.transducer.warm_start) → data/checkpoints/transducer_last.pt / transducer_best.pt
+.venv/bin/python -m src.slices.TrainAcousticModel.train_transducer
 
-# Stage B — hybrid CTC/attention (U2++ bidirectional decoder + joint loss + dynamic-chunk).
-# Warm-starts the encoder + CTC head from stage_a_last.pt → data/checkpoints/stage_b_best.pt
-.venv/bin/python -m src.slices.TrainAcousticModel.train_stage_b
+# Monitor any run (separate terminal): loss / lr / dev transducer-WER / dev blank_frac
+.venv/bin/tensorboard --logdir runs/transducer
 
-# Monitor any run (separate terminal): loss / lr / dev WER / dev blank_frac
-.venv/bin/tensorboard --logdir runs/stage_b
-
-# STREAM-LM — must retrain (the 960h tokenizer invalidated the old lm_best.pt). Download the
-# LibriSpeech-LM corpus, pack it to uint16 bins (streamed to disk, bounded RAM), then train.
+# STREAM-LM — trained on the 960h tokenizer (val ppl 17.2). Download the LibriSpeech-LM corpus,
+# pack it to uint16 bins (streamed to disk, bounded RAM), then train.
 .venv/bin/python scripts/download_lm_text.py    # then gunzip; pack via PrepareLmData (see COMMANDS.md Step 6)
 .venv/bin/python -m src.slices.TrainLanguageModel.train_lm
 ```
 
-**Resumable & SIGINT-safe (SP2).** Every trainer (pretrain, Stage-A, Stage-B) atomically checkpoints
-`*_last.pt` (model + all optimizers + RNG + step) and **auto-resumes** from it — just re-launch the
-same command after an interrupt or crash. Ctrl-C is caught cooperatively (finishes the step,
-checkpoints, exits clean). Force a fresh run with `resume=False` on the command.
+**Resumable & SIGINT-safe (SP2).** Every trainer (BEST-RQ pretrain, transducer) atomically
+checkpoints `*_last.pt` (model + all optimizers + RNG + step) and **auto-resumes** from it — just
+re-launch the same command after an interrupt or crash. Ctrl-C is caught cooperatively (finishes
+the step, checkpoints, exits clean). Force a fresh run with `resume=False` on the command.
 
 All tunables are read from `config/*.yaml` via `get_config()` — edit the YAML, no code change
 required. The optimizer stack (Muon+AdamW+muP) lives in `config/optim.yaml`, BEST-RQ pretrain in
@@ -164,33 +180,40 @@ The encoder is now causal-in-time (Phase 0): causal `Conv2dSubsampling` frontend
 `ZipformerEncoder.streaming_forward()` with exact equivalence to full-context batched `forward()`.
 
 ```bash
-# Offline two-pass: full context, best WER ~8–10 %
+# Offline (single-pass RNN-T beam over full-context encoder memory): test-clean 7.3–7.8 % WER
 PYTHONPATH=. .venv/bin/python -m src.slices.Decode.streaming_decode data/Val/dev-clean-0001.flac --offline
 
-# Streaming two-pass: chunked inference, low latency ~10–12 %
+# Streaming (single-pass RNN-T beam over chunked, cached encoder memory): test-clean 9.7–10.9 %, low latency
 PYTHONPATH=. .venv/bin/python -m src.slices.Decode.streaming_decode data/Val/dev-clean-0001.flac
 ```
 
-Both modes use `data/checkpoints/stage_b_best.pt` as the default checkpoint and
+Both modes use `data/checkpoints/transducer_best.pt` as the default checkpoint and
 `data/tokenizer/bpe500.model` for tokenization. Decoding parameters (chunk size, beam width,
 left-context trim, language-model weight) live in `config/decode.yaml`. Setting `lm_weight > 0`
-turns on STREAM-LM shallow fusion in the first-pass beam plus n-best LM rescore in the second pass;
-`lm_weight: 0.0` (the default) is byte-identical to the pre-LM decoder.
-
-> The two-pass decoder is code-complete and streaming/offline equivalent, but the value-residual
-> encoder + decoder need the Stage-A→Stage-B retrain above before `stage_b_best.pt` exists again.
-> STREAM-LM must also be retrained on the 960 h tokenizer (the old `lm_best.pt` is now incompatible).
+turns on STREAM-LM **n-best rescoring** of the acoustic beam (the tuned optimum is **α = 0.5**);
+`lm_weight: 0.0` (the shipped default) is byte-identical to the pre-LM decoder.
 
 ## Evaluation
 
 The `Evaluate` slice reports corpus WER/CER plus mean RTF and first-partial latency across an
-ablation of the two-pass decoder (`ctc_greedy → prefix_beam → attn_rescore → lm_rescore →
-lm_fusion`, each × offline/streaming), writing `runs/eval/report.json`. Runs execute **two at a
-time** on the GPU (offline + streaming of a stage in parallel, and the α-grid two-at-a-time under
-`--tune`), so the ablation table and the sweep finish roughly twice as fast.
+ablation of the single-pass transducer decoder (`greedy_transducer → beam → beam_lm`, each ×
+offline/streaming), writing `runs/eval/report.json`. Runs execute **two at a time** on the GPU
+(offline + streaming of a stage in parallel, and the α-grid two-at-a-time under `--tune`), so the
+ablation table and the sweep finish roughly twice as fast.
+
+**test-clean results (n = 2,620, tuned α = 0.5).** Search and the LM both help monotonically:
+
+| Stage | Offline WER / CER | Streaming WER / CER | RTF (off / stream) |
+|---|---|---|---|
+| `greedy_transducer` | 7.95 % / 2.97 % | 10.89 % / 4.23 % | 0.013 / 0.045 |
+| `beam` | 7.81 % / 2.83 % | 10.41 % / 3.89 % | 0.050 / 0.085 |
+| **`beam_lm`** | **7.27 % / 2.65 %** | **9.72 % / 3.67 %** | 0.071 / 0.104 |
+
+Streaming latency ≈ 19 ms (first partial). The streaming↔offline gap (~2.4 abs pts) is the expected
+cost of the chunked causal encoder.
 
 ```bash
-# Acoustic-only (LM off): the two-pass ablation on test-clean.
+# Acoustic-only (LM off): the single-pass transducer ablation on test-clean.
 PYTHONPATH=. .venv/bin/python -m src.slices.Evaluate.evaluate data/manifests/test.jsonl
 
 # With the LM: sweep the fusion weight α on dev, freeze the best, then run the test table — in
@@ -199,23 +222,24 @@ PYTHONPATH=. .venv/bin/python -m src.slices.Evaluate.evaluate \
   data/manifests/test.jsonl --tune data/manifests/dev.jsonl
 ```
 
-The LM only contributes at α (`lm_weight`) `> 0`; at α = 0 the `lm_*` stages equal `attn_rescore`
-exactly and the run warns that they are inactive, so the report never silently misleads. The LM
-prior is applied **exactly once** end to end: first-pass shallow fusion only *guides* the beam, and
-the acoustic-only CTC score (not the fused score) is what the second pass rescores, so `lm_fusion`
-no longer double-counts α. The second pass blends CTC against the attention score with
-`rescore_ctc_weight`. Fresh `test-clean` numbers land after the retrain.
+The LM only contributes at α (`lm_weight`) `> 0`; at α = 0 the `beam_lm` stage equals `beam`
+exactly and the run warns that it is inactive, so the report never silently misleads. The LM prior
+is applied by **n-best rescoring** — the acoustic beam runs once, then each hypothesis is re-ranked
+by `acoustic + α·lm_seq` (one full-sequence LM forward per hypothesis). Tuning decodes dev once
+acoustic-only and sweeps α over the cached scores for free, which is why the whole eval finishes in
+a few GPU-hours rather than a day. The 2026-07-17 run selected **α = 0.5** (dev WER 0.0721).
 
 ## Local demo (web UI)
 
 Try the model by ear on your own machine — upload an audio file, or speak into the microphone and
 watch partial transcripts stream in. The `Demo` slice is pure transport: it loads the model once and
-drives the Decode slice (upload → full-context offline two-pass; live mic → streaming partials, then
-a full-context final that replaces them on endpoint).
+drives the Decode slice (upload → full-context offline single-pass RNN-T beam; live mic → streaming
+partials, then a full-context final that replaces them on endpoint).
 
 ```bash
 PYTHONPATH=. .venv/bin/python -m src.slices.Demo.serve_demo   # then open http://127.0.0.1:8000
-# --lm-weight 0.3 turns on LM shallow fusion; --checkpoint / --tokenizer / --host / --port also available
+# --lm-weight 0.5 turns on LM n-best rescoring (the tuned optimum); --checkpoint / --tokenizer /
+# --host / --port also available. Omit --lm-weight for the faster acoustic-only decoder.
 ```
 
 Binds `127.0.0.1` only (local, no auth); runs on GPU if available, else CPU. The browser captures at
@@ -224,7 +248,7 @@ Binds `127.0.0.1` only (local, no auth); runs on GPU if available, else CPU. The
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest -q          # expect 129 passed, 4 deselected (slow gates)
+.venv/bin/python -m pytest -q          # expect 138 passed, 2 deselected (slow gates)
 ```
 
 ## Notes
@@ -233,8 +257,9 @@ Binds `127.0.0.1` only (local, no auth); runs on GPU if available, else CPU. The
   decode/metadata backends and now routes through TorchCodec, which requires FFmpeg. torchaudio
   is kept only for pure-tensor ops (resample, mel spectrogram).
 - Features are precomputed once into an fp16 log-mel mmap cache (SP1); SpecAugment is a GPU batch op
-  (`SpecAugmentBatch.py`, built in SP1 but not yet wired into the trainers — that's an SP5 task).
-  Speed perturbation was dropped (its coprime-resample cost starved the GPU).
+  (`SpecAugmentBatch.py`) wired into `TransducerModel.joint_loss` on the train path only, gated by
+  `training.spec_augment` (default `true`). Speed perturbation was dropped (its coprime-resample cost
+  starved the GPU).
 
 ## License
 

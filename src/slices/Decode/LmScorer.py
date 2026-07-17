@@ -1,10 +1,10 @@
-# src/slices/Decode/LmScorer.py — Thin decode-time wrapper over STREAM-LM: applies the
-# fusion weight (alpha) to both the incremental next-token log-probs (first-pass shallow fusion)
-# and the full-sequence log-prob (second-pass rescore). weight = 0 makes every score 0 -> decode
-# is unchanged.
+# src/slices/Decode/LmScorer.py — decode-time wrapper over STREAM-LM for n-best rescoring: scores a
+# whole hypothesis in one full-sequence forward. `sequence_score` applies the fusion weight (alpha)
+# for the live decode path; `raw_sequence_logprob` returns the unweighted value so alpha tuning can
+# sweep the weight over a fixed n-best without re-scoring. weight = 0 makes every score 0 -> the
+# rescored ranking is identical to pure acoustic (the alpha=0 regression lock).
 import torch
 
-from src.slices.TrainLanguageModel.CausalGqaAttention import KvCache
 from src.slices.TrainLanguageModel.StreamLmModel import StreamLmModel
 
 
@@ -14,18 +14,15 @@ class LmScorer:
         self.weight = weight
 
     @torch.no_grad()
-    def step_score(
-        self, token: int, state: list[KvCache] | None
-    ) -> tuple[torch.Tensor, list[KvCache]]:
-        # Returns the weighted log-probability tensor and the next LM state. Inference-only: no_grad
-        # keeps decode from building an autograd graph over the LM.
-        logp, state = self.model.step_logprob(token, state)
-        # weight 0 must be an exact no-op even if logp holds -inf (0 * -inf = nan otherwise).
-        if self.weight == 0.0:
-            return torch.zeros_like(logp), state
-        return self.weight * logp, state
+    def sequence_score(self, ids: list[int]) -> float:
+        # Weighted sequence log-probability (sum of log-probs along the path) -- the term added to
+        # the acoustic score when re-ranking the n-best at the configured alpha.
+        return self.weight * self.model.sequence_logprob(ids)
 
     @torch.no_grad()
-    def sequence_score(self, ids: list[int]) -> float:
-        # Returns the weighted sequence log-probability (sum of log-probs along the path).
-        return self.weight * self.model.sequence_logprob(ids)
+    def raw_sequence_logprob(self, ids: list[int]) -> float:
+        # Unweighted full-sequence log-probability -- the fusion weight (alpha) is applied by the
+        # caller. Alpha tuning decodes dev once acoustic-only, then ranks a fixed n-best by
+        # acoustic + alpha*this at every alpha with no further decoding, so the weight must not be
+        # baked in here.
+        return self.model.sequence_logprob(ids)

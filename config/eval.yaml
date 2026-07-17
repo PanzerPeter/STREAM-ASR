@@ -1,4 +1,5 @@
-# Corpus evaluation + ablation. Stages run cumulatively from greedy CTC to full LM fusion so the
-# report shows each component's WER/CER/RTF/latency contribution.
-ablation_stages: ["ctc_greedy", "prefix_beam", "attn_rescore", "lm_rescore", "lm_fusion"]
+# Corpus evaluation + ablation. Stages run cumulatively over the single-pass transducer: greedy
+# (beam_size=1) -> beam (full beam search) -> beam+LM (shallow fusion), so the report shows each
+# component's WER/CER/RTF/latency contribution.
+ablation_stages: ["greedy_transducer", "beam", "beam_lm"]
 report_path: runs/eval/report.json

@@ -14,11 +14,9 @@ def test_loads_representative_values():
     assert cfg.audio.n_mels == 80
     assert cfg.model.encoder_dims == (192, 256, 384, 512, 384, 256)
     assert cfg.model.vocab_size == 500
-    assert cfg.training.stage_a.total_steps == 120000
-    # Warmup was lengthened 3k->10k to escape the CTC blank-collapse saddle on full data (see
-    # augment.yaml / training.yaml notes); lr_peak now lives solely in optim.yaml
-    # (adamw_lr/muon_lr), not per-stage.
-    assert cfg.training.stage_a.warmup_steps == 10000
+    assert cfg.training.transducer.total_steps == 120000
+    # lr_peak lives solely in optim.yaml (adamw_lr/muon_lr), not per-stage.
+    assert cfg.training.transducer.warmup_steps == 10000
 
 
 def test_derived_values():
@@ -45,6 +43,7 @@ def test_validation_rejects_bad_type(tmp_path):
         "eval.yaml",
         "optim.yaml",
         "pretrain.yaml",
+        "transducer.yaml",
     ]:
         shutil.copy(src / name, tmp_path / name)
     # n_mels must be int; write a non-coercible value.
@@ -54,31 +53,20 @@ def test_validation_rejects_bad_type(tmp_path):
         get_config(str(tmp_path))
 
 
-def test_decoder_and_stage_b_config():
-    cfg = get_config()
-    m = cfg.model
-    assert m.decoder_dim == 512
-    assert m.decoder_left_layers == 6
-    assert m.decoder_right_layers == 3
-    assert m.decoder_heads == 8
-    # Decoder label space adds SOS/EOS above the acoustic vocab; blank stays in the CTC head.
+def test_sos_eos_decoder_vocab_ids():
+    # These label-space ids no longer back an acoustic attention decoder (deleted with the
+    # CTC/attention two-stage path), but STREAM-LM (TrainLanguageModel slice) still consumes them
+    # for SOS-conditioned next-token prediction, so they stay live on ModelConfig.
+    m = get_config().model
     assert m.sos_id == m.vocab_size == 500
     assert m.eos_id == m.vocab_size + 1 == 501
     assert m.decoder_vocab_size == m.vocab_size + 2 == 502
-
-    sb = cfg.training.stage_b
-    assert sb.ctc_weight == pytest.approx(0.3)
-    assert sb.reverse_weight == pytest.approx(0.3)
-    assert sb.label_smoothing == pytest.approx(0.1)
-    assert 0 in sb.chunk_sizes  # 0 encodes the full-context (no chunk) option
-    assert sb.warm_start.endswith("stage_a_last.pt")
 
 
 def test_decode_config_loads():
     d = get_config().decode
     assert d.beam_size >= 1
     assert d.chunk_size > 0
-    assert 0.0 <= d.rescore_lambda <= 1.0
 
 
 def test_features_config_present():

@@ -11,17 +11,17 @@ no trainer or decode internals are imported).
 | Route | Method | Flow |
 |---|---|---|
 | `/` | GET | serves `static/index.html` (self-contained UI, inline CSS/JS) |
-| `/transcribe` | POST (multipart) | uploaded WAV/FLAC/OGG → `load_audio_bytes` → `StreamingDecoder_Handler.decode_waveform(streaming=False)` (full-context two-pass, best WER) → `{text, rtf, seconds}` |
+| `/transcribe` | POST (multipart) | uploaded WAV/FLAC/OGG → `load_audio_bytes` → `StreamingDecoder_Handler.decode_waveform(streaming=False)` (full-context single-pass RNN-T beam search, best WER) → `{text, rtf, seconds}` |
 | `/stream` | WebSocket | binary 16 kHz mono float32 PCM frames → `StreamingSession.accept_audio` → `{partial}`; a text `__eof__` frame → `StreamingSession.finalize()` (offline re-decode) → `{final, rtf}` |
 
-Live partials come from the causal streaming encoder + CTC prefix beam (`StreamingSession`), so they
-appear mid-utterance; on endpoint the partials are replaced by the authoritative full-context
-offline result. The browser captures at a 16 kHz `AudioContext` (no server-side resampling on the
-live path).
+Live partials come from the causal streaming encoder + greedy RNN-T decoding (`StreamingSession`),
+so they appear mid-utterance; on endpoint the partials are replaced by the authoritative
+full-context beam-search result. The browser captures at a 16 kHz `AudioContext` (no server-side
+resampling on the live path).
 
 ## Artifacts
 
-- Consumes: `data/checkpoints/stage_b_best.pt`, `data/tokenizer/bpe500.model` (and
+- Consumes: `data/checkpoints/transducer_best.pt`, `data/tokenizer/bpe500.model` (and
   `data/checkpoints/lm_best.pt` when `--lm-weight > 0` enables shallow fusion).
 - Produces: nothing on disk — an interactive service.
 

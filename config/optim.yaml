@@ -8,3 +8,9 @@ ns_steps: 5
 weight_decay: 1.0e-2
 mup_enabled: false
 mup_base_dims: [192, 256, 384, 512, 384, 256]
+# Discriminative fine-tuning: the encoder is BEST-RQ-pretrained but predictor/joiner/heads start
+# fresh, so a single peak LR erodes the pretrained features once the RNN-T gradient engages (SP5
+# regression: interctc climbs + dev-WER back off ~10k steps past the LR peak). Scale the encoder's
+# Muon+AdamW peak LRs down so fresh modules adapt fast while the encoder is nudged, not overwritten.
+# 1.0 = disabled (uniform LR); tune in ~[0.25, 0.5].
+encoder_lr_scale: 0.5

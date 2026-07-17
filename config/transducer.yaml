@@ -1,0 +1,8 @@
+# config/transducer.yaml — RNN-T transducer architecture (SP5). Arch params only; the training
+# loop's hyperparameters live in training.yaml's `transducer:` section, decode params in decode.yaml.
+predictor_dim: 512        # token embedding width == stateless-predictor output width
+predictor_context: 2      # depthwise Conv1d left context (icefall-style stateless predictor)
+joiner_dim: 512           # additive joiner hidden width
+ctc_aux_weight: 0.2       # total = rnnt + ctc_aux_weight*ctc + sum(interctc_weights*interctc_k)
+interctc_layers: [3, 4]   # tap after the two widest encoder stacks (base-rate ~50Hz)
+interctc_weights: [0.15, 0.15]
