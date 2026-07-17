@@ -79,7 +79,7 @@ Scale-out over the full `train-clean-100 + train-clean-360 + train-other-500` (9
 # 1. Manifests for all 5 splits (parallel soundfile probe; seconds)
 PYTHONPATH=. python scripts/build_manifests.py
 
-# 2. Retrain BPE-500 on 960h transcripts (overwrites data/tokenizer/bpe500.model; invalidates old LM)
+# 2. Train BPE-500 on 960h transcripts (writes data/tokenizer/bpe500.model; the LM must match this tokenizer)
 PYTHONPATH=. python scripts/train_tokenizer.py
 
 # 3. CMVN over a 15% random sample of 960h (stats converge well before the full set)
@@ -91,11 +91,11 @@ PYTHONPATH=. python scripts/precompute_features.py
 
 * The cache (`data/features/mel/<split>.{f16,index.npy,header.json}`) is streamed via mmap so the
   training epoch loop is GPU-bound (no per-epoch FLAC decode / FFT).
-* Retraining the tokenizer on 960h invalidates the old LM data + checkpoint — regenerate the LM
-  (Step 6) after this build.
-* SpecAugment runs as a GPU batch op (`ExtractFeatures/SpecAugmentBatch.py`, SP1), applied inside
+* The LM (Step 6) is tokenizer-specific — regenerate its packed data + checkpoint whenever the
+  tokenizer changes.
+* SpecAugment runs as a GPU batch op (`ExtractFeatures/SpecAugmentBatch.py`), applied inside
   `TransducerModel.joint_loss` on the train path only — gated by `training.spec_augment` (default
-  `true`). Speed-perturb was dropped.
+  `true`).
 
 ### Step 2b: (Optional) BEST-RQ Encoder Pretrain (SP4)
 
@@ -162,10 +162,6 @@ the live checkpoint.
 # Fresh transducer run (ignore transducer_last.pt); swap the handler/command names for pretrain
 python -c "from src.slices.TrainAcousticModel.TransducerTrainer_Handler import run_transducer; from src.slices.TrainAcousticModel.TransducerTrainer_Command import TransducerTrainCommand; import dataclasses as d; run_transducer(d.replace(TransducerTrainCommand(), resume=False))"
 ```
-
-> ⚠️ **Old checkpoints are incompatible.** The SP2 schema stores an `"optimizers"` **list**; pre-SP2
-> `*.pt` files (singular `"optimizer"`) raise `KeyError` on load — this hits decode/demo/eval and the LM
-> too. Delete/regenerate `transducer_*.pt` and `lm_*.pt` before loading them.
 
 ### Step 5: Streaming Decode Options
 
