@@ -1,6 +1,8 @@
 # src/slices/TrainAcousticModel/TransducerTrainer_Handler.py
+import glob
 import os
 import random
+import re
 import time
 
 import torch
@@ -28,6 +30,40 @@ from src.slices.TrainAcousticModel._train_utils import (
     _seed_all,
 )
 from src.slices.TrainAcousticModel.TransducerTrainer_Command import TransducerTrainCommand
+
+
+def _write_rolling_snapshot(
+    ckpt_dir: str,
+    model: TransducerModel,
+    optimizers,
+    step: int,
+    best_wer: float,
+    resume_count: int,
+    keep_last_n: int,
+) -> None:
+    # Retain the newest `keep_last_n` numbered snapshots (transducer_step{N}.pt) so
+    # scripts/average_checkpoints.py can mean the tail of training into one decode checkpoint --
+    # the standard ASR "checkpoint averaging" win. Distinct from transducer_last.pt (overwritten
+    # every ckpt_every for resume); these are immutable per-step points. keep_last_n <= 0 disables.
+    if keep_last_n <= 0:
+        return
+    snap = os.path.join(ckpt_dir, f"transducer_step{step}.pt")
+    save_checkpoint(
+        snap,
+        model,
+        optimizers,
+        step,
+        best_wer=best_wer,
+        resume_count=resume_count,
+        kind="transducer",
+    )
+    existing = glob.glob(os.path.join(ckpt_dir, "transducer_step*.pt"))
+    numbered = sorted(
+        ((int(m.group(1)), p) for p in existing if (m := re.search(r"step(\d+)\.pt$", p))),
+        key=lambda x: x[0],
+    )
+    for _, path in numbered[:-keep_last_n]:
+        os.remove(path)
 
 
 def _warm_start_encoder(model: TransducerModel, path: str, log) -> None:
@@ -271,6 +307,15 @@ def run_transducer(cmd: TransducerTrainCommand) -> str:
                         best_wer=best_wer,
                         resume_count=resume_count,
                         kind="transducer",
+                    )
+                    _write_rolling_snapshot(
+                        cmd.ckpt_dir,
+                        model,
+                        optimizers,
+                        step,
+                        best_wer,
+                        resume_count,
+                        tr.keep_last_n,
                     )
 
                 step += 1

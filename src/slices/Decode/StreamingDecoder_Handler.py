@@ -46,6 +46,8 @@ class StreamingDecoder_Handler:
         # lm_weight override lets Evaluate sweep alpha on dev without mutating the authoritative
         # decode.yaml (whose lm_weight=0.0 is the alpha=0 regression lock); None = configured value.
         self.lm_weight = lm_weight if lm_weight is not None else self.cfg.decode.lm_weight
+        # Per-token bonus applied at n-best re-ranking to offset RNN-T's deletion bias.
+        self.length_bonus = self.cfg.decode.length_bonus
         # Load the LM only when fuse_lm actually consumes it AND lm_weight > 0; lm_weight == 0 (or
         # fuse_lm=False) keeps it None, so no checkpoint is read and search() reproduces the
         # pre-LM decoder exactly (the alpha=0 regression lock).
@@ -81,13 +83,23 @@ class StreamingDecoder_Handler:
         )
 
     def _search_rescore(self, memory: torch.Tensor) -> list[tuple[list[int], float]]:
-        # Acoustic beam, then (if an LM is attached) re-rank the n-best by acoustic + alpha*lm_seq:
-        # one LM full-sequence forward per hypothesis, replacing per-step shallow fusion. No LM ->
-        # the acoustic order is returned untouched (the alpha=0 / no-LM regression lock).
+        # Acoustic beam, then re-rank the n-best by acoustic + alpha*lm_seq + length_bonus*len:
+        # the LM term is one full-sequence forward per hyp (replacing per-step shallow fusion),
+        # the length term offsets RNN-T's deletion bias. With no LM AND length_bonus==0 the acoustic
+        # order is returned untouched (the alpha=0 / no-LM regression lock).
         nbest = self.searcher.search(memory)
-        if self.lm_scorer is None:
+        lb = self.length_bonus
+        if self.lm_scorer is None and lb == 0.0:
             return nbest
-        scored = [(ids, ac + self.lm_scorer.sequence_score(ids)) for ids, ac in nbest]
+        scored = [
+            (
+                ids,
+                ac
+                + (self.lm_scorer.sequence_score(ids) if self.lm_scorer is not None else 0.0)
+                + lb * len(ids),
+            )
+            for ids, ac in nbest
+        ]
         scored.sort(key=lambda c: c[1], reverse=True)
         return scored
 

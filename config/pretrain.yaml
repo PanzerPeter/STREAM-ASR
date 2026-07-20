@@ -3,7 +3,13 @@
 # from optim.yaml; this file owns only the BEST-RQ knobs and schedule length.
 codebook_size: 8192
 codebook_dim: 16
-mask_prob: 0.01
+# mask_prob is the per-frame span-START probability (wav2vec2 convention): apply_span_mask samples
+# int(mask_prob*valid) span starts, each extended by mask_span, so the expected masked fraction is
+# ~mask_prob*mask_span before overlap. 0.01 masked only ~10% of frames -- far below the 40-50% that
+# BEST-RQ/wav2vec2 rely on, making the SSL infill task trivially easy and the learned features weak.
+# 0.05 (x span 10) lands at ~39% masked (measured), the designed difficulty. Raise toward 0.065
+# (~48%) only if pretrain loss stays too low.
+mask_prob: 0.05
 mask_span: 10
 noise_std: 0.1
 stack_frames: 0

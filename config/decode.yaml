@@ -7,3 +7,6 @@ beam_size: 10
 lm_weight: 0.0
 lm_checkpoint: data/checkpoints/lm_best.pt
 max_symbols: 5   # max non-blank emissions per encoder frame in transducer beam search
+# Per-token re-ranking bonus (counters RNN-T's un-normalised deletion bias). 0.0 = off / regression
+# lock. Swept jointly with lm_weight by evaluate.py --tune. Try ~[0.0, 1.0] if deletions dominate.
+length_bonus: 0.0

@@ -7,9 +7,9 @@ LibriSpeech **960 h** set (`train-clean-100 + train-clean-360 + train-other-500`
 RTX 5070 (12 GB, Blackwell sm_120) and is built to stay hardware-efficient: state-of-the-art building
 blocks reimplemented in pure PyTorch, with no k2/icefall dependency and no pretrained weights.
 
-**Result (test-clean, 2,620 utts):** offline **7.27 % WER** (CER 2.65 %) / streaming **9.72 % WER**
-(CER 3.67 %) with the RNN-T beam + LM rescoring — real-time factor ≪ 1 on the one GPU. Both beat the
-design targets. See [Evaluation](#evaluation).
+**Result (test-clean, 2,620 utts):** offline **4.30 % WER** (CER 1.53 %) / streaming **5.73 % WER**
+(CER 2.13 %) with the RNN-T beam + LM rescoring — real-time factor ≪ 1 on the one GPU. Both land
+well inside the design targets. See [Evaluation](#evaluation).
 
 ## Approach
 
@@ -43,16 +43,17 @@ whereas the zero-init gate does not. The encoder's streaming path caches post-re
 are conv/linear-based (no attention), so value residual does not apply to them.
 
 **Not Whisper-scale by design** — the goal is the best result achievable from this data on this GPU,
-and the from-scratch target (offline 6–8 % / streaming 8–10 % WER at RTF < 0.3) is met.
+and the from-scratch target (offline 6–8 % / streaming 8–10 % WER at RTF < 0.3) is beaten on both
+paths.
 
 ## Status
 
 Complete and GPU-validated end-to-end. The pipeline — 960 h data build → BEST-RQ encoder pretrain →
-single joint transducer stage (120 k steps, ~4 h, best dev transducer-WER **0.0890**) → STREAM-LM
-(val ppl **17.2**) → `test-clean` eval — runs on one RTX 5070 and produces the [Evaluation](#evaluation)
-numbers. Training uses a resumable, SIGINT-safe harness and a Muon+AdamW+muP optimizer stack; all
-tunables live in `config/*.yaml`. The local [demo](#local-demo-web-ui) serves the model over a browser
-UI.
+single joint transducer stage (120 k steps, best dev transducer-WER **0.0637**) → STREAM-LM
+(40 k steps, val ppl **16.19**) → `test-clean` eval — runs on one RTX 5070 and produces the
+[Evaluation](#evaluation) numbers. Training uses a resumable, SIGINT-safe harness and a
+Muon+AdamW+muP optimizer stack; all tunables live in `config/*.yaml`. The local
+[demo](#local-demo-web-ui) serves the model over a browser UI.
 
 ## Layout
 
@@ -87,6 +88,7 @@ src/
 scripts/verify_env.py     # asserts Blackwell + working torch
 scripts/build_manifests.py, scripts/train_tokenizer.py, scripts/precompute_features.py  # 960h build
 scripts/download_lm_text.py  # fetch the LibriSpeech-LM corpus for STREAM-LM
+scripts/average_checkpoints.py  # mean the tail of transducer_step*.pt snapshots into one decode checkpoint
 tests/                    # shape / round-trip / equivalence / count sanity tests
 data/                     # LibriSpeech splits, manifests, tokenizer, cmvn, checkpoints, lm_data (gitignored)
 ```
@@ -143,9 +145,18 @@ checkpoints `*_last.pt` (model + all optimizers + RNG + step) and **auto-resumes
 re-launch the same command after an interrupt or crash. Ctrl-C is caught cooperatively (finishes
 the step, checkpoints, exits clean). Force a fresh run with `resume=False` on the command.
 
+**Checkpoint averaging.** The transducer trainer keeps a rolling window of
+`transducer_step{N}.pt` snapshots (`training.transducer.keep_last_n`, default 5). Mean the tail into
+one decode checkpoint and point `config/decode.yaml` / `config/eval.yaml` at it:
+
+```bash
+PYTHONPATH=. .venv/bin/python scripts/average_checkpoints.py --last-n 5   # → data/checkpoints/transducer_avg.pt
+```
+
 All tunables are read from `config/*.yaml` via `get_config()` — edit the YAML, no code change
 required. The optimizer stack (Muon+AdamW+muP) lives in `config/optim.yaml`, BEST-RQ pretrain in
-`config/pretrain.yaml`.
+`config/pretrain.yaml` (`mask_prob: 0.05` × `mask_span: 10` ≈ 39 % of frames masked — the SSL task
+must be hard enough to force useful features).
 
 ## Streaming / Offline Decode
 
@@ -154,18 +165,23 @@ The encoder is causal-in-time: causal `Conv2dSubsampling` frontend, per-frame `C
 `ZipformerEncoder.streaming_forward()` with exact equivalence to full-context batched `forward()`.
 
 ```bash
-# Offline (single-pass RNN-T beam over full-context encoder memory): test-clean 7.3–7.8 % WER
+# Offline (single-pass RNN-T beam over full-context encoder memory): test-clean 4.3–5.1 % WER
 PYTHONPATH=. .venv/bin/python -m src.slices.Decode.streaming_decode data/Val/dev-clean-0001.flac --offline
 
-# Streaming (single-pass RNN-T beam over chunked, cached encoder memory): test-clean 9.7–10.9 %, low latency
+# Streaming (single-pass RNN-T beam over chunked, cached encoder memory): test-clean 5.7–7.0 %, low latency
 PYTHONPATH=. .venv/bin/python -m src.slices.Decode.streaming_decode data/Val/dev-clean-0001.flac
 ```
 
 Both modes use `data/checkpoints/transducer_best.pt` as the default checkpoint and
 `data/tokenizer/bpe500.model` for tokenization. Decoding parameters (chunk size, beam width,
 left-context trim, language-model weight) live in `config/decode.yaml`. Setting `lm_weight > 0`
-turns on STREAM-LM **n-best rescoring** of the acoustic beam (the tuned optimum is **α = 0.5**);
-`lm_weight: 0.0` (the shipped default) is byte-identical to the pre-LM decoder.
+turns on STREAM-LM **n-best rescoring** of the acoustic beam (the tuned optimum is **α = 0.4**);
+`lm_weight: 0.0` (the shipped default) is byte-identical to the pre-LM decoder. `length_bonus`
+adds a per-token re-ranking bonus to counter RNN-T's un-normalised deletion bias (default `0.0`,
+swept alongside α by `evaluate.py --tune`).
+
+Hypotheses that share a token prefix are **recombined** (log-sum-exp merged) inside the beam, so the
+beam width buys distinct transcripts instead of duplicate alignments of the same one.
 
 ## Evaluation
 
@@ -175,16 +191,18 @@ offline/streaming), writing `runs/eval/report.json`. Runs execute **two at a tim
 (offline + streaming of a stage in parallel, and the α-grid two-at-a-time under `--tune`), so the
 ablation table and the sweep finish roughly twice as fast.
 
-**test-clean results (n = 2,620, tuned α = 0.5).** Search and the LM both help monotonically:
+**test-clean results (n = 2,620, tuned α = 0.4).** Search and the LM both help monotonically:
 
 | Stage | Offline WER / CER | Streaming WER / CER | RTF (off / stream) |
 |---|---|---|---|
-| `greedy_transducer` | 7.95 % / 2.97 % | 10.89 % / 4.23 % | 0.013 / 0.045 |
-| `beam` | 7.81 % / 2.83 % | 10.41 % / 3.89 % | 0.050 / 0.085 |
-| **`beam_lm`** | **7.27 % / 2.65 %** | **9.72 % / 3.67 %** | 0.071 / 0.104 |
+| `greedy_transducer` | 5.41 % / 1.90 % | 7.34 % / 2.67 % | 0.015 / 0.051 |
+| `beam` | 5.12 % / 1.76 % | 6.97 % / 2.48 % | 0.060 / 0.099 |
+| **`beam_lm`** | **4.30 % / 1.53 %** | **5.73 % / 2.13 %** | 0.115 / 0.160 |
 
-Streaming latency ≈ 19 ms (first partial). The streaming↔offline gap (~2.4 abs pts) is the expected
-cost of the chunked causal encoder.
+Streaming latency ≈ 27 ms (first partial). The streaming↔offline gap is **1.4 abs pts** — the cost
+of the chunked causal encoder. The LM is worth −0.82 abs offline / −1.24 abs streaming on top of the
+beam; beam over greedy is worth another −0.29 / −0.37. RTFs are measured with the offline and
+streaming passes sharing the GPU, so each is a pessimistic bound on a dedicated run.
 
 ```bash
 # Acoustic-only (LM off): the single-pass transducer ablation on test-clean.
@@ -201,7 +219,8 @@ exactly and the run warns that it is inactive, so the report never silently misl
 is applied by **n-best rescoring** — the acoustic beam runs once, then each hypothesis is re-ranked
 by `acoustic + α·lm_seq` (one full-sequence LM forward per hypothesis). Tuning decodes dev once
 acoustic-only and sweeps α over the cached scores for free, which is why the whole eval finishes in
-a few GPU-hours rather than a day. The 2026-07-17 run selected **α = 0.5** (dev WER 0.0721).
+a few GPU-hours rather than a day. The 2026-07-20 run selected **α = 0.4** (dev WER 0.0469, against
+0.0534 acoustic-only).
 
 ## Local demo (web UI)
 
@@ -212,7 +231,7 @@ partials, then a full-context final that replaces them on endpoint).
 
 ```bash
 PYTHONPATH=. .venv/bin/python -m src.slices.Demo.serve_demo   # then open http://127.0.0.1:8000
-# --lm-weight 0.5 turns on LM n-best rescoring (the tuned optimum); --checkpoint / --tokenizer /
+# --lm-weight 0.4 turns on LM n-best rescoring (the tuned optimum); --checkpoint / --tokenizer /
 # --host / --port also available. Omit --lm-weight for the faster acoustic-only decoder.
 ```
 
@@ -222,7 +241,7 @@ Binds `127.0.0.1` only (local, no auth); runs on GPU if available, else CPU. The
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest -q          # expect 138 passed, 2 deselected (slow gates)
+.venv/bin/python -m pytest -q          # expect 144 passed, 2 deselected (slow gates)
 ```
 
 ## Notes

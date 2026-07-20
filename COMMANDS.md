@@ -28,6 +28,12 @@ python -m src.slices.PretrainEncoder.pretrain_bestrq
 # Step 3: Train the transducer (single joint stage; encoder + StatelessPredictor + TransducerJoiner,
 # warm-started from data/checkpoints/bestrq_encoder.pt by default — training.transducer.warm_start)
 python -m src.slices.TrainAcousticModel.train_transducer
+tensorboard --logdir runs/transducer
+
+# Step 3b (optional): average the tail of the rolling transducer_step*.pt snapshots
+# (training.transducer.keep_last_n) into one decode checkpoint
+python scripts/average_checkpoints.py --last-n 5   # -> data/checkpoints/transducer_avg.pt
+
 
 # Resume after an interrupt/crash (SP2): re-run the SAME train command — the trainer auto-resumes
 python -c "from src.slices.TrainAcousticModel.TransducerTrainer_Handler import run_transducer; from src.slices.TrainAcousticModel.TransducerTrainer_Command import TransducerTrainCommand; import dataclasses as d; run_transducer(d.replace(TransducerTrainCommand(), resume=False))"
@@ -40,6 +46,8 @@ python -m src.slices.Decode.streaming_decode data/Val/dev-clean/1272/128104/1272
 python scripts/download_lm_text.py && gunzip -k data/lm_text/librispeech-lm-norm.txt.gz
 python -c "from src.slices.TrainLanguageModel.PrepareLmData_Handler import PrepareLmData_Handler as H; from src.slices.TrainLanguageModel.PrepareLmData_Command import PrepareLmData_Command as C; from src.shared_kernel.Tokenizer_Adapter import SentencePieceTokenizer as T; from src.shared_kernel.Config_Adapter import get_config as g; lm=g().lm; H(T('data/tokenizer/bpe500.model')).run(C('data/lm_text/librispeech-lm-norm.txt', 'data/lm_data', lm.subset_words, lm.val_words))"
 python -m src.slices.TrainLanguageModel.train_lm
+tensorboard --logdir runs/lm
+
 
 # Step 7: Evaluation (Acoustic beam + LM n-best rescoring)
 # --tune decodes dev ONCE acoustic-only, sweeps lm_weight (alpha) over the cached (acoustic, LM-
@@ -49,8 +57,8 @@ python -m src.slices.Evaluate.evaluate data/manifests/test.jsonl --tune data/man
 # Quick liveness smoke (finishes in ~1-2 min): a tiny dev subset + coarse grid + capped test table.
 python -m src.slices.Evaluate.evaluate data/manifests/test.jsonl --tune data/manifests/dev.jsonl --tune-limit 30 --lm-grid 0.0,0.2,0.4 --limit 30
 
-# Step 8: Launch Local Web UI Demo (--lm-weight 0.5 = tuned optimum; omit it for acoustic-only)
-python -m src.slices.Demo.serve_demo --lm-weight 0.5
+# Step 8: Launch Local Web UI Demo (--lm-weight 0.4 = tuned optimum; omit it for acoustic-only)
+python -m src.slices.Demo.serve_demo --lm-weight 0.4
 
 ```
 
@@ -132,8 +140,8 @@ python -m src.slices.TrainAcousticModel.train_transducer
   (`training.transducer.warm_start`); predictor/joiner/heads always train from scratch.
 * **Target:** ~120k steps (`training.transducer.total_steps`). Checkpoints:
   `data/checkpoints/transducer_last.pt` (periodic) / `transducer_best.pt` (best dev
-  greedy-transducer WER). Reference: the 2026-07-17 run took ~4 h and hit best dev
-  transducer-WER **0.0890**.
+  greedy-transducer WER). Reference: the 2026-07-20 run hit best dev
+  transducer-WER **0.0637**.
 * **Telemetry:** Watch `dev/blank_frac` fall from ~1.000 and `dev/transducer_wer` via TensorBoard.
 * **OOM resolution:** lower `training.transducer.max_frames_per_batch` (18000) or
   `max_tokens_per_batch` (4000 — bounds the `B*T*(U+1)` RNN-T joiner lattice), or set
@@ -175,8 +183,8 @@ python -c "from src.slices.TrainAcousticModel.TransducerTrainer_Handler import r
 ### Step 6: Train Neural LM (STREAM-LM)
 
 * Trains a deep-narrow causal Transformer (GQA + QK-norm + value-residual, tied embeddings; AdamW warmup $\rightarrow$ cosine, bf16).
-* `total_steps=40000` $\approx$ 0.3-0.5 epoch over the ~803M-word corpus. The 2026-07-17 run reached
-  **val ppl 17.2**; at the tuned α=0.5 it buys −0.5/−0.7 abs WER offline/streaming over acoustic-only.
+* `total_steps=40000` $\approx$ 0.3-0.5 epoch over the ~803M-word corpus. The 2026-07-20 run reached
+  **val ppl 16.185**; at the tuned α=0.4 it buys −0.82/−1.24 abs WER offline/streaming over acoustic-only.
 
 ### Step 7: Evaluation Alternates
 
@@ -184,22 +192,23 @@ python -c "from src.slices.TrainAcousticModel.TransducerTrainer_Handler import r
 # Acoustic-only evaluation (LM off, α=0)
 python -m src.slices.Evaluate.evaluate data/manifests/test.jsonl
 
-# Evaluation with a fixed α (skip dev sweep, explicit reproducibility; 0.5 = tuned optimum)
-python -m src.slices.Evaluate.evaluate data/manifests/test.jsonl --lm-weight 0.5
+# Evaluation with a fixed α (skip dev sweep, explicit reproducibility; 0.4 = tuned optimum)
+python -m src.slices.Evaluate.evaluate data/manifests/test.jsonl --lm-weight 0.4
 
 ```
 
 > ⚠️ **Note:** Tuning via `--tune` is executed exclusively on the dev set to keep the test headline WER an honest held-out metric.
 
-**Reference results (test-clean, n=2,620, 2026-07-17 run, tuned α=0.5) → `runs/eval/report.json`:**
+**Reference results (test-clean, n=2,620, 2026-07-20 run, tuned α=0.4) → `runs/eval/report.json`:**
 
 | Stage | Offline WER / CER | Streaming WER / CER |
 | --- | --- | --- |
-| `greedy_transducer` | 7.95% / 2.97% | 10.89% / 4.23% |
-| `beam` | 7.81% / 2.83% | 10.41% / 3.89% |
-| **`beam_lm`** | **7.27% / 2.65%** | **9.72% / 3.67%** |
+| `greedy_transducer` | 5.41% / 1.90% | 7.34% / 2.67% |
+| `beam` | 5.12% / 1.76% | 6.97% / 2.48% |
+| **`beam_lm`** | **4.30% / 1.53%** | **5.73% / 2.13%** |
 
-RTF stays ≪ 1 across the board (offline ~0.07, streaming ~0.10 with LM).
+RTF stays ≪ 1 across the board (offline ~0.12, streaming ~0.16 with LM, measured with both passes
+sharing the GPU).
 
 ---
 
@@ -240,9 +249,9 @@ PYTHONPATH=. mypy src         # Type check checking (Strict: expect 0 errors)
 | `config/audio.yaml` | Sample rate, n_mels, FFT/window/hop, CMVN epsilon |
 | `config/augment.yaml` | SpecAugment masks (GPU batch op, applied in `TransducerModel.joint_loss`, gated by `training.spec_augment`). Speed-perturb dropped (SP1) |
 | `config/model.yaml` | Encoder dims/layers/heads, conv kernel, dropout, RoPE base, `encoder_value_residual_lambda`, vocab size |
-| `config/training.yaml` | `transducer` settings (SP5): `max_frames_per_batch`, `max_tokens_per_batch`, `grad_accum`, `warmup_steps`/`total_steps`, `chunk_sizes`, `warm_start`, `grad_checkpoint`, `dev_wer_utts` |
+| `config/training.yaml` | `transducer` settings (SP5): `max_frames_per_batch`, `max_tokens_per_batch`, `grad_accum`, `warmup_steps`/`total_steps`, `chunk_sizes`, `warm_start`, `grad_checkpoint`, `dev_wer_utts`, `keep_last_n` |
 | `config/transducer.yaml` | Transducer architecture (SP5): `predictor_dim`, `predictor_context`, `joiner_dim`, `ctc_aux_weight`, `interctc_layers`/`interctc_weights` |
-| `config/decode.yaml` | `chunk_size`, `beam_size`, `max_symbols`, `lm_weight` ($\alpha$), `lm_checkpoint` |
+| `config/decode.yaml` | `chunk_size`, `beam_size`, `max_symbols`, `lm_weight` ($\alpha$), `lm_checkpoint`, `length_bonus` |
 | `config/lm.yaml` | STREAM-LM: `d_model`/`layers`/`heads`/`kv_groups`, `context_len`, schedule, `subset_words` |
 | `config/eval.yaml` | `ablation_stages` (`greedy_transducer`/`beam`/`beam_lm`), `report_path` |
 | `config/optim.yaml` | Optimizer stack (SP3): `optimizer` (`adamw`\|`muon+adamw`), `muon_lr`/`adamw_lr`, `muon_momentum`, `ns_steps`, `weight_decay`, `mup_enabled`/`mup_base_dims` |

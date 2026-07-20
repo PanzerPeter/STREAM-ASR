@@ -100,6 +100,10 @@ class TransducerTrainConfig(BaseModel):
     warm_start: str
     dev_wer_utts: int = 200
     spec_augment: bool = True
+    # Rolling snapshots kept for post-training checkpoint averaging (icefall/ESPnet-style). Every
+    # ckpt_every steps the trainer writes transducer_step{N}.pt, pruned to the newest keep_last_n;
+    # scripts/average_checkpoints.py means their weights into one decode checkpoint. 0 disables.
+    keep_last_n: int = 5
 
 
 class TrainingConfig(BaseModel):
@@ -112,6 +116,11 @@ class DecodeConfig(BaseModel):
     lm_weight: float
     lm_checkpoint: str
     max_symbols: int
+    # Per-token bonus added to each hyp at n-best re-ranking (score += length_bonus*len(ids)).
+    # RNN-T acoustic scores are un-normalised sums of emission log-probs, so every extra token only
+    # lowers the score -- a standing bias toward deletions. A small positive bonus offsets it. 0.0 =
+    # off (regression lock); swept alongside lm_weight in the eval tuner.
+    length_bonus: float = 0.0
 
 
 class LmConfig(BaseModel):

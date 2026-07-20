@@ -15,3 +15,4 @@ transducer:
   warm_start: data/checkpoints/bestrq_encoder.pt
   dev_wer_utts: 200              # #dev utterances for the periodic greedy-transducer WER probe
   spec_augment: true             # SpecAugment on the log-mel input during training (regularisation)
+  keep_last_n: 5                 # rolling transducer_step{N}.pt snapshots kept for checkpoint averaging (0 = off)

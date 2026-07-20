@@ -102,17 +102,25 @@ _RescoreCache = list[tuple[str, list[tuple[list[int], float, float]]]]
 
 
 def _pick_best_alpha(
-    cache: _RescoreCache, grid: list[float], tok: SentencePieceTokenizer
+    cache: _RescoreCache,
+    grid: list[float],
+    tok: SentencePieceTokenizer,
+    length_bonus: float = 0.0,
 ) -> tuple[float, dict[float, float]]:
     # Pure alpha sweep over cached scores -- no decoding. For each alpha, each utterance emits the
-    # n-best hypothesis maximising acoustic + alpha*lm; corpus WER over those picks scores it.
-    # Returns the WER-minimising alpha and the full alpha->WER map (for logging). An empty n-best
-    # (silence / no emission) contributes an empty hypothesis, exactly as the decode path would.
+    # n-best hypothesis maximising acoustic + alpha*lm + length_bonus*len; corpus WER over those
+    # picks scores it. The length term must match the live decode ranking (StreamingDecoder_Handler.
+    # _search_rescore) so the alpha chosen here is the alpha used there. Returns the WER-minimising
+    # alpha and the full alpha->WER map. An empty n-best contributes an empty hypothesis.
     wer_by_alpha: dict[float, float] = {}
     refs = [ref for ref, _ in cache]
     for alpha in grid:
         hyps = [
-            tok.decode(max(nb, key=lambda h: h[1] + alpha * h[2])[0]) if nb else ""
+            (
+                tok.decode(max(nb, key=lambda h: h[1] + alpha * h[2] + length_bonus * len(h[0]))[0])
+                if nb
+                else ""
+            )
             for _, nb in cache
         ]
         wer_by_alpha[alpha] = corpus_wer(refs, hyps)
@@ -163,7 +171,7 @@ def _tune_alpha_rescore(
                     f"ETA {per * (total - i):.0f}s",
                     flush=True,
                 )
-    best_alpha, wer_by_alpha = _pick_best_alpha(cache, grid, tok)
+    best_alpha, wer_by_alpha = _pick_best_alpha(cache, grid, tok, get_config().decode.length_bonus)
     for alpha in grid:
         marker = "  <- best" if alpha == best_alpha else ""
         print(f"  lm_weight={alpha:<5} dev WER={wer_by_alpha[alpha]:.4f}{marker}", flush=True)

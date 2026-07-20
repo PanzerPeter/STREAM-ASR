@@ -116,6 +116,28 @@ def test_nbest_for_rescore_requires_lm():
     raise AssertionError("nbest_for_rescore must reject a handler with no LM")
 
 
+def test_length_bonus_reorders_toward_longer_hypotheses():
+    # length_bonus adds length_bonus*len(ids) at n-best re-ranking. With no LM, a large enough bonus
+    # must promote a longer hypothesis over a shorter one that led on pure acoustic score; a bonus of
+    # 0.0 must leave the acoustic order byte-identical (the regression lock).
+    torch.manual_seed(0)
+    model = TransducerModel(cmvn_path=None).eval()
+    handler = StreamingDecoder_Handler(model, _StubTok(), fuse_lm=False)
+
+    # Stub the searcher: a short hyp leads acoustically by 0.5 over a hyp two tokens longer.
+    class _StubSearch:
+        def search(self, memory):
+            return [([7], -1.0), ([7, 8, 9], -1.5)]
+
+    handler.searcher = _StubSearch()  # type: ignore[assignment]
+
+    handler.length_bonus = 0.0
+    assert handler._search_rescore(torch.zeros(1, 1, 1))[0][0] == [7]  # acoustic order kept
+
+    handler.length_bonus = 1.0  # +2.0 for the longer hyp -> it wins (-1.5+3 > -1.0+1)
+    assert handler._search_rescore(torch.zeros(1, 1, 1))[0][0] == [7, 8, 9]
+
+
 def test_streaming_greedy_equals_chunked_forward_greedy():
     # Load-bearing equivalence: the STREAMING decode path reproduces greedy decode over the
     # batched CHUNKED-forward encoder memory exactly. This is test_streaming_forward_equivalence

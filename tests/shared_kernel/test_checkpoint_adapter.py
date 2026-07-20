@@ -3,7 +3,11 @@ import random
 
 import torch
 
-from src.shared_kernel.Checkpoint_Adapter import save_checkpoint, load_checkpoint
+from src.shared_kernel.Checkpoint_Adapter import (
+    average_checkpoints,
+    load_checkpoint,
+    save_checkpoint,
+)
 
 
 def _model_opt():
@@ -50,6 +54,37 @@ def test_rng_state_restored(tmp_path):
     torch.manual_seed(999)
     load_checkpoint(path, model, opt)  # restores RNG captured at save time
     assert (random.random(), torch.rand(1).item()) == expected
+
+
+def test_average_checkpoints_means_weights(tmp_path):
+    # Three snapshots with known weights -> the averaged checkpoint holds their exact elementwise
+    # mean, and load_checkpoint reads it back into a fresh model unchanged.
+    paths = []
+    weights = []
+    for i in range(3):
+        m = torch.nn.Linear(4, 3)
+        with torch.no_grad():
+            m.weight.fill_(float(i))  # 0, 1, 2 -> mean 1.0
+            m.bias.fill_(float(2 * i))  # 0, 2, 4 -> mean 2.0
+        weights.append(m.weight.clone())
+        p = str(tmp_path / f"snap{i}.pt")
+        save_checkpoint(p, m, None, step=i)
+        paths.append(p)
+
+    out = str(tmp_path / "avg.pt")
+    average_checkpoints(paths, out)
+
+    target = torch.nn.Linear(4, 3)
+    load_checkpoint(out, target)  # no optimizers, no RNG -> must not raise
+    assert torch.allclose(target.weight, torch.full_like(target.weight, 1.0))
+    assert torch.allclose(target.bias, torch.full_like(target.bias, 2.0))
+
+
+def test_average_checkpoints_requires_paths(tmp_path):
+    import pytest
+
+    with pytest.raises(ValueError):
+        average_checkpoints([], str(tmp_path / "avg.pt"))
 
 
 def test_atomic_no_partial_on_replace(tmp_path):

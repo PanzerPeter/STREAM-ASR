@@ -67,6 +67,43 @@ def load_checkpoint(path: str, model, optimizers=None, map_location="cpu") -> di
     }
 
 
+def average_checkpoints(paths: list[str], out_path: str, map_location: str = "cpu") -> str:
+    # Checkpoint averaging (icefall/ESPnet): mean the model weights of several late-training
+    # snapshots into one checkpoint. Averaging points along the SGD trajectory approximates a wider,
+    # flatter minimum and reliably shaves ASR WER at zero training cost. Accumulate in float64 so a
+    # long tail of bf16-trained snapshots does not lose precision, then cast back to each tensor's
+    # dtype. Non-float buffers (integer counters) are undefined under a mean, so the first
+    # snapshot's value is kept. The output payload is shaped like save_checkpoint's, so
+    # load_checkpoint reads it unchanged (empty optimizers, no RNG to restore).
+    if not paths:
+        raise ValueError("average_checkpoints needs at least one checkpoint path")
+    states = [torch.load(p, map_location=map_location, weights_only=False)["model"] for p in paths]
+    n = len(states)
+    avg: dict = {}
+    for key, ref in states[0].items():
+        if torch.is_floating_point(ref):
+            acc = torch.zeros_like(ref, dtype=torch.float64)
+            for s in states:
+                acc += s[key].to(torch.float64)
+            avg[key] = (acc / n).to(ref.dtype)
+        else:
+            avg[key] = ref.clone()
+    payload = {
+        "model": avg,
+        "optimizers": [],
+        "step": 0,
+        "best_wer": math.inf,
+        "resume_count": 0,
+        "kind": "transducer-avg",
+        "rng": None,
+        "extra": {"averaged_from": list(paths)},
+    }
+    tmp = out_path + ".tmp"
+    torch.save(payload, tmp)
+    os.replace(tmp, out_path)
+    return out_path
+
+
 def resume_if_available(
     ckpt_path: str,
     model: torch.nn.Module,
