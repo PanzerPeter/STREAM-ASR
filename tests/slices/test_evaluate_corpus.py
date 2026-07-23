@@ -43,25 +43,76 @@ def test_handler_aggregates_wer_and_means(tmp_path):
     assert resp.stage == "beam" and resp.mode == "offline"
 
 
-def test_pick_best_alpha_selects_lm_favoured_hypothesis():
-    # Rescore-mode alpha sweep: for a fixed n-best, alpha=0 must pick the acoustic winner and a
+class _MapTok:
+    def __init__(self, m: dict[tuple[int, ...], str]) -> None:
+        self.m = m
+
+    def decode(self, ids: list[int]) -> str:
+        return self.m[tuple(ids)]
+
+
+def test_pick_best_weights_selects_lm_favoured_hypothesis():
+    # Rescore-mode weight sweep: for a fixed n-best, alpha=0 must pick the acoustic winner and a
     # large-enough alpha must let the LM's preferred (correct) hypothesis win -- proving the sweep
     # ranks by acoustic + alpha*lm and minimises corpus WER over the cached scores (no decoding).
-    from src.slices.Evaluate.evaluate import _pick_best_alpha
-
-    class _MapTok:
-        def __init__(self, m: dict[tuple[int, ...], str]) -> None:
-            self.m = m
-
-        def decode(self, ids: list[int]) -> str:
-            return self.m[tuple(ids)]
+    from src.slices.Decode.StreamingDecode_Response import NbestEntry
+    from src.slices.Evaluate.evaluate import _pick_best_weights
 
     tok = _MapTok({(1,): "ONE WRONG", (2,): "ONE TWO"})
     # id1: acoustic-preferred but wrong (1 sub / 2 words -> WER 0.5); id2: correct, LM-preferred.
-    cache = [("ONE TWO", [([1], 1.0, -5.0), ([2], 0.9, 0.0)])]
-    best, wer = _pick_best_alpha(cache, [0.0, 0.5], tok)
-    assert best == 0.5
-    assert wer[0.0] == 0.5 and wer[0.5] == 0.0
+    cache = [
+        (
+            "ONE TWO",
+            [
+                NbestEntry(ids=[1], acoustic=1.0, lm=-5.0, ilm=0.0),
+                NbestEntry(ids=[2], acoustic=0.9, lm=0.0, ilm=0.0),
+            ],
+        )
+    ]
+    best, wer = _pick_best_weights(cache, [0.0, 0.5], [0.0], tok)
+    assert best == (0.5, 0.0)
+    assert wer[(0.0, 0.0)] == 0.5 and wer[(0.5, 0.0)] == 0.0
+
+
+def test_pick_best_weights_uses_ilm_subtraction_to_break_a_tie():
+    # beta must actually enter the ranking: with the two hypotheses tied on acoustic + alpha*lm,
+    # only subtracting the internal-LM term can move the winner -- the double-count the transducer
+    # carries is what ILME removes.
+    from src.slices.Decode.StreamingDecode_Response import NbestEntry
+    from src.slices.Evaluate.evaluate import _pick_best_weights
+
+    tok = _MapTok({(1,): "ONE WRONG", (2,): "ONE TWO"})
+    cache = [
+        (
+            "ONE TWO",
+            [
+                NbestEntry(ids=[1], acoustic=1.0, lm=0.0, ilm=0.0),
+                NbestEntry(ids=[2], acoustic=1.0, lm=0.0, ilm=-4.0),
+            ],
+        )
+    ]
+    best, wer = _pick_best_weights(cache, [0.0], [0.0, 0.5], tok)
+    assert best == (0.0, 0.5)
+    assert wer[(0.0, 0.5)] == 0.0
+
+
+def test_oracle_wer_is_the_best_reachable_hypothesis_in_the_nbest():
+    # The oracle picks the lowest-error entry per utterance: it bounds what any rescoring weights
+    # can reach, so a tuned WER sitting on it means the beam, not the LM, is the bottleneck.
+    from src.slices.Decode.StreamingDecode_Response import NbestEntry
+    from src.slices.Evaluate.evaluate import _oracle_wer
+
+    tok = _MapTok({(1,): "ONE WRONG", (2,): "ONE TWO"})
+    cache = [
+        (
+            "ONE TWO",
+            [
+                NbestEntry(ids=[1], acoustic=1.0, lm=0.0, ilm=0.0),
+                NbestEntry(ids=[2], acoustic=-9.0, lm=-9.0, ilm=0.0),
+            ],
+        )
+    ]
+    assert _oracle_wer(cache, tok) == 0.0
 
 
 def test_handler_respects_limit(tmp_path):

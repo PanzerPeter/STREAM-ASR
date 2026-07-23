@@ -90,8 +90,8 @@ def test_nbest_for_rescore_separates_acoustic_and_lm(tmp_path, monkeypatch):
     model = TransducerModel(cmvn_path=None).eval()
 
     class _StubScorer:
-        def raw_sequence_logprob(self, ids: list[int]) -> float:
-            return -float(len(ids))
+        def raw_sequence_logprobs(self, nbest: list[list[int]]) -> list[float]:
+            return [-float(len(ids)) for ids in nbest]
 
     monkeypatch.setattr(StreamingDecoder_Handler, "_load_lm", lambda self: _StubScorer())
     handler = StreamingDecoder_Handler(model, _StubTok(), beam_size=4, fuse_lm=True, lm_weight=1.0)
@@ -101,8 +101,10 @@ def test_nbest_for_rescore_separates_acoustic_and_lm(tmp_path, monkeypatch):
         wave = load_audio(path)
         mem, _ = handler._encode(wave, False, 0.0)
         ref = TransducerBeamSearch(model, 4, handler.cfg.decode.max_symbols).search(mem)
-    assert [(ids, ac) for ids, ac, _ in nb] == ref  # acoustic beam == pure LM-off search
-    assert all(lm == -float(len(ids)) for ids, _, lm in nb)  # unweighted LM score attached
+    assert [(e.ids, e.acoustic) for e in nb] == ref  # acoustic beam == pure LM-off search
+    assert all(e.lm == -float(len(e.ids)) for e in nb)  # unweighted LM score attached
+    # The internal-LM term is attached unweighted too, so one decode serves the whole beta grid.
+    assert all(e.ilm <= 0.0 for e in nb)
 
 
 def test_nbest_for_rescore_requires_lm():

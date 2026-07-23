@@ -53,7 +53,7 @@
 </head>
 <body>
   <h1><span>STREAM</span> ASR — local demo</h1>
-  <p class="sub">Zipformer + CTC/attention, streaming-capable · runs entirely on your machine</p>
+  <p class="sub">Zipformer encoder + streaming RNN-T, LM-rescored · runs entirely on your machine</p>
 
   <div class="wrap">
     <div class="card">
@@ -80,6 +80,9 @@
 
 <script>
 const $ = (id) => document.getElementById(id);
+// Transcript text is injected into innerHTML to grey out the running partial, so it goes through
+// the DOM's own escaper first — an apostrophe or ampersand in a hypothesis must render, not parse.
+const esc = (s) => { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; };
 
 /* ---------- file upload ---------- */
 const fileInput = $("file"), upBtn = $("upBtn"), upOut = $("upOut"), upMeta = $("upMeta");
@@ -139,8 +142,8 @@ micBtn.onclick = async () => {
   ws.onmessage = (ev) => {
     const j = JSON.parse(ev.data);
     if (j.partial !== undefined) {
-      micOut.innerHTML = (finalText ? finalText + " " : "") +
-        `<span class="partial">${j.partial || "…"}</span>`;
+      micOut.innerHTML = (finalText ? esc(finalText) + " " : "") +
+        `<span class="partial">${esc(j.partial) || "…"}</span>`;
     } else if (j.final !== undefined) {
       finalText = j.final; micOut.textContent = finalText || "(empty)";
       micMeta.textContent = `final (full-context) · RTF ${j.rtf.toFixed(3)}`;
@@ -170,7 +173,7 @@ function cleanupMic() {
   if (ctx && ctx.state !== "closed") { ctx.close(); }
   if (ws && ws.readyState === 1) ws.close();
   micBtn.disabled = false; micBtn.classList.remove("rec"); micStop.disabled = true;
-  if (micBadge.textContent !== "recording") setBadge("idle", false); else setBadge("idle", false);
+  setBadge("idle", false);
 }
 </script>
 </body>

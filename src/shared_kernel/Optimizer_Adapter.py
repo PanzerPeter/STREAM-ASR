@@ -28,11 +28,16 @@ def partition_params(
 ) -> tuple[list[nn.Parameter], list[nn.Parameter]]:
     muon: list[nn.Parameter] = []
     adamw: list[nn.Parameter] = []
+    # Tied weights (STREAM-LM ties its readout to the embedding table) surface under two module
+    # names; taking both would step the same tensor twice per optimizer step. First placement wins,
+    # and module order puts the embedding ahead of the readout.
+    seen: set[int] = set()
     for module_name, module in model.named_modules():
         excluded = any(pat in module_name for pat in head_patterns)
         for pname, p in module.named_parameters(recurse=False):
-            if not p.requires_grad:
+            if not p.requires_grad or id(p) in seen:
                 continue
+            seen.add(id(p))
             is_hidden_matrix = isinstance(module, nn.Linear) and pname == "weight" and p.ndim == 2
             if is_hidden_matrix and not excluded:
                 muon.append(p)

@@ -48,5 +48,17 @@ PYTHONPATH=. .venv/bin/python -m src.slices.TrainLanguageModel.train_lm   # ~2-3
 ## Notes
 `LmDataset` memory-maps the packed `uint16` bin files for cheap random access (nanoGPT-style);
 both train and val bins must contain more tokens than `context_len` or `LmDataset.__len__` goes
-negative. Vocab size and `sos_id`/`eos_id` are shared with the acoustic model
+negative. Vocab size and `bos_id`/`eos_id` are shared with the acoustic model
 (`get_config().model`), keeping the LM and ASR tokenizers in lockstep.
+
+**BOS is EOS.** `PrepareLmData` packs the corpus as `line tokens + eos_id` and writes no separate
+start symbol, so the only sentence-start context that ever gets trained is "previous line's EOS".
+Scoring a hypothesis from a distinct start id would read an embedding row the model never saw as an
+input, making every hypothesis' first-token score noise — hence `ModelConfig.bos_id == eos_id`.
+
+**Document masking.** `LmDataset` cuts windows at arbitrary offsets, so nearly every one straddles
+several corpus lines. Each window therefore also carries per-token segment ids, and
+`StreamLmModel.forward(tokens, segments=...)` restricts attention to earlier tokens of the same
+line. Training context then matches decode context exactly: a rescored ASR hypothesis is always a
+single sentence scored from BOS with nothing before it. `segments=None` keeps the plain causal path
+that the single-sequence scorers use.

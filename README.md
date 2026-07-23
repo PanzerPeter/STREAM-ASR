@@ -7,9 +7,9 @@ LibriSpeech **960 h** set (`train-clean-100 + train-clean-360 + train-other-500`
 RTX 5070 (12 GB, Blackwell sm_120) and is built to stay hardware-efficient: state-of-the-art building
 blocks reimplemented in pure PyTorch, with no k2/icefall dependency and no pretrained weights.
 
-**Result (test-clean, 2,620 utts):** offline **4.30 % WER** (CER 1.53 %) / streaming **5.73 % WER**
-(CER 2.13 %) with the RNN-T beam + LM rescoring — real-time factor ≪ 1 on the one GPU. Both land
-well inside the design targets. See [Evaluation](#evaluation).
+**Result (test-clean, 2,620 utts):** offline **3.55 % WER** (CER 1.24 %) / streaming **4.68 % WER**
+(CER 1.67 %) with the RNN-T beam + LM rescoring and ILME — real-time factor ≪ 1 on the one GPU. Both
+land well inside the design targets. See [Evaluation](#evaluation).
 
 ## Approach
 
@@ -21,7 +21,8 @@ A single-pass streaming RNN-T (transducer) system built around a Zipformer acous
 | Prediction network | `StatelessPredictor` | icefall-style: embeds the previous non-blank token + a small causal depthwise-conv context — no recurrence, so streaming state is just the last `context-1` token ids |
 | Joint network | `TransducerJoiner` | additive joiner (project encoder + predictor, sum, tanh, readout to vocab+blank); trains against the full `[B,T,U+1,V]` lattice, decodes one `(t,u)` cell at a time |
 | Auxiliary heads | CTC head + InterCTC taps | `ctc_aux_weight * CTC` on the final encoder output plus weighted CTC losses tapped after two intermediate stacks — regularizers and a cheap greedy-WER health probe, not a separate decoding pass |
-| Language model | Causal Transformer LM (STREAM-LM) | optional **n-best rescoring** of the acoustic beam: re-rank each hypothesis by `acoustic + α·lm_seq`, one full-sequence LM forward per hypothesis (`decode.lm_weight`, α) |
+| Language model | Causal Transformer LM (STREAM-LM) | optional **n-best rescoring** of the acoustic beam: re-rank by `acoustic + α·lm_seq − β·ilm_seq`, one batched LM forward per utterance (`decode.lm_weight`, `decode.ilm_weight`) |
+| Internal-LM estimate | `InternalLmScorer` (ILME) | the transducer's own language prior, read off the joiner with the encoder memory zeroed and renormalised over non-blank labels — subtracted at β so the external LM is not counted on top of a prior the model already has |
 
 The model is ~55.3 M params total. A single set of encoder weights runs either offline (full
 context, best WER) or streaming (small chunk, low latency) through dynamic-chunk masking, and one
@@ -49,8 +50,8 @@ paths.
 ## Status
 
 Complete and GPU-validated end-to-end. The pipeline — 960 h data build → BEST-RQ encoder pretrain →
-single joint transducer stage (120 k steps, best dev transducer-WER **0.0637**) → STREAM-LM
-(40 k steps, val ppl **16.19**) → `test-clean` eval — runs on one RTX 5070 and produces the
+single joint transducer stage (175 k steps, best dev transducer-WER **0.0553**) → STREAM-LM
+(40 k steps, document-masked) → `test-clean` eval — runs on one RTX 5070 and produces the
 [Evaluation](#evaluation) numbers. Training uses a resumable, SIGINT-safe harness and a
 Muon+AdamW+muP optimizer stack; all tunables live in `config/*.yaml`. The local
 [demo](#local-demo-web-ui) serves the model over a browser UI.
@@ -81,8 +82,8 @@ src/
     ExtractFeatures/        # fp16 log-mel mmap cache + dataset/collator/sampler + GPU SpecAugment
     PretrainEncoder/        # BEST-RQ self-supervised encoder pretrain → data/checkpoints/bestrq_encoder.pt
     TrainAcousticModel/     # Zipformer encoder + CTC/InterCTC heads + StatelessPredictor + TransducerJoiner + transducer trainer
-    TrainLanguageModel/     # STREAM-LM: causal GQA Transformer + corpus prep + LM trainer
-    Decode/                 # streaming/offline single-pass RNN-T beam search + LM n-best rescoring; StreamingSession (live)
+    TrainLanguageModel/     # STREAM-LM: causal GQA Transformer + corpus prep + document-masked LM trainer
+    Decode/                 # streaming/offline single-pass RNN-T beam search + LM n-best rescoring + ILME; StreamingSession (live)
     Evaluate/               # corpus WER/CER/RTF/latency + ablation table (jiwer) + dev α-tune
     Demo/                   # local FastAPI web UI: file upload + live-mic streaming transcription
 scripts/verify_env.py     # asserts Blackwell + working torch
@@ -126,7 +127,7 @@ the 960 h tokenizer):
 .venv/bin/python -m src.slices.PretrainEncoder.pretrain_bestrq
 
 # Transducer — single joint training stage: Zipformer encoder + StatelessPredictor + TransducerJoiner,
-# trained with rnnt + ctc_aux_weight*ctc + interctc losses (~120k steps). Warm-starts the encoder from
+# trained with rnnt + ctc_aux_weight*ctc + interctc losses (~175k steps). Warm-starts the encoder from
 # data/checkpoints/bestrq_encoder.pt by default (training.transducer.warm_start)
 # → data/checkpoints/transducer_last.pt / transducer_best.pt
 .venv/bin/python -m src.slices.TrainAcousticModel.train_transducer
@@ -134,7 +135,8 @@ the 960 h tokenizer):
 # Monitor any run (separate terminal): loss / lr / dev transducer-WER / dev blank_frac
 .venv/bin/tensorboard --logdir runs/transducer
 
-# STREAM-LM — trained on the 960h tokenizer (val ppl 17.2). Download the LibriSpeech-LM corpus,
+# STREAM-LM — trained on the 960h tokenizer, document-masked (each position attends only its own
+# corpus line, matching how a rescored hypothesis is scored at decode time). Download the LibriSpeech-LM corpus,
 # pack it to uint16 bins (streamed to disk, bounded RAM), then train.
 .venv/bin/python scripts/download_lm_text.py    # then gunzip; pack via PrepareLmData (see COMMANDS.md Step 6)
 .venv/bin/python -m src.slices.TrainLanguageModel.train_lm
@@ -165,20 +167,21 @@ The encoder is causal-in-time: causal `Conv2dSubsampling` frontend, per-frame `C
 `ZipformerEncoder.streaming_forward()` with exact equivalence to full-context batched `forward()`.
 
 ```bash
-# Offline (single-pass RNN-T beam over full-context encoder memory): test-clean 4.3–5.1 % WER
+# Offline (single-pass RNN-T beam over full-context encoder memory): test-clean 3.6–4.6 % WER
 PYTHONPATH=. .venv/bin/python -m src.slices.Decode.streaming_decode data/Val/dev-clean-0001.flac --offline
 
-# Streaming (single-pass RNN-T beam over chunked, cached encoder memory): test-clean 5.7–7.0 %, low latency
+# Streaming (single-pass RNN-T beam over chunked, cached encoder memory): test-clean 4.7–6.4 %, low latency
 PYTHONPATH=. .venv/bin/python -m src.slices.Decode.streaming_decode data/Val/dev-clean-0001.flac
 ```
 
 Both modes use `data/checkpoints/transducer_best.pt` as the default checkpoint and
 `data/tokenizer/bpe500.model` for tokenization. Decoding parameters (chunk size, beam width,
 left-context trim, language-model weight) live in `config/decode.yaml`. Setting `lm_weight > 0`
-turns on STREAM-LM **n-best rescoring** of the acoustic beam (the tuned optimum is **α = 0.4**);
-`lm_weight: 0.0` (the shipped default) is byte-identical to the pre-LM decoder. `length_bonus`
-adds a per-token re-ranking bonus to counter RNN-T's un-normalised deletion bias (default `0.0`,
-swept alongside α by `evaluate.py --tune`).
+turns on STREAM-LM **n-best rescoring** of the acoustic beam (the tuned optimum is **α = 0.6**);
+`lm_weight: 0.0` (the shipped default) is byte-identical to the pre-LM decoder. `ilm_weight` (β,
+tuned optimum **0.2**) subtracts the transducer's own internal language prior (ILME) so α is not
+fighting a double count; `length_bonus` adds a per-token re-ranking bonus to counter RNN-T's
+un-normalised deletion bias. Both default to `0.0` and are swept alongside α by `evaluate.py --tune`.
 
 Hypotheses that share a token prefix are **recombined** (log-sum-exp merged) inside the beam, so the
 beam width buys distinct transcripts instead of duplicate alignments of the same one.
@@ -191,18 +194,21 @@ offline/streaming), writing `runs/eval/report.json`. Runs execute **two at a tim
 (offline + streaming of a stage in parallel, and the α-grid two-at-a-time under `--tune`), so the
 ablation table and the sweep finish roughly twice as fast.
 
-**test-clean results (n = 2,620, tuned α = 0.4).** Search and the LM both help monotonically:
+**test-clean results (n = 2,620, tuned α = 0.6, β = 0.2).** Search, the LM, and ILME all help:
 
 | Stage | Offline WER / CER | Streaming WER / CER | RTF (off / stream) |
 |---|---|---|---|
-| `greedy_transducer` | 5.41 % / 1.90 % | 7.34 % / 2.67 % | 0.015 / 0.051 |
-| `beam` | 5.12 % / 1.76 % | 6.97 % / 2.48 % | 0.060 / 0.099 |
-| **`beam_lm`** | **4.30 % / 1.53 %** | **5.73 % / 2.13 %** | 0.115 / 0.160 |
+| `greedy_transducer` | 4.61 % / 1.60 % | 6.36 % / 2.28 % | 0.016 / 0.053 |
+| `beam` | 4.41 % / 1.52 % | 6.07 % / 2.13 % | 0.101 / 0.148 |
+| **`beam_lm`** | **3.55 % / 1.24 %** | **4.68 % / 1.67 %** | 0.114 / 0.149 |
 
-Streaming latency ≈ 27 ms (first partial). The streaming↔offline gap is **1.4 abs pts** — the cost
-of the chunked causal encoder. The LM is worth −0.82 abs offline / −1.24 abs streaming on top of the
-beam; beam over greedy is worth another −0.29 / −0.37. RTFs are measured with the offline and
-streaming passes sharing the GPU, so each is a pessimistic bound on a dedicated run.
+Streaming latency ≈ 27 ms (first partial). The streaming↔offline gap is **1.1 abs pts** — the cost
+of the chunked causal encoder. The LM+ILME is worth −0.86 abs offline / −1.39 abs streaming on top
+of the beam; beam over greedy is worth another −0.20 / −0.29. On dev the ILME subtraction (β = 0.2)
+buys a further −0.08 abs over plain fusion at the same α. The **n-best oracle WER is 2.34 %** on dev
+(against the tuned 3.53 %) — the beam still holds better hypotheses than rescoring selects, so the
+gap is LM headroom, not search coverage. RTFs are measured with the offline and streaming passes
+sharing the GPU, so each is a pessimistic bound on a dedicated run.
 
 ```bash
 # Acoustic-only (LM off): the single-pass transducer ablation on test-clean.
@@ -217,10 +223,12 @@ PYTHONPATH=. .venv/bin/python -m src.slices.Evaluate.evaluate \
 The LM only contributes at α (`lm_weight`) `> 0`; at α = 0 the `beam_lm` stage equals `beam`
 exactly and the run warns that it is inactive, so the report never silently misleads. The LM prior
 is applied by **n-best rescoring** — the acoustic beam runs once, then each hypothesis is re-ranked
-by `acoustic + α·lm_seq` (one full-sequence LM forward per hypothesis). Tuning decodes dev once
-acoustic-only and sweeps α over the cached scores for free, which is why the whole eval finishes in
-a few GPU-hours rather than a day. The 2026-07-20 run selected **α = 0.4** (dev WER 0.0469, against
-0.0534 acoustic-only).
+by `acoustic + α·lm_seq − β·ilm_seq` (one batched LM forward and one batched internal-LM forward per
+utterance). Tuning decodes dev once acoustic-only and sweeps the whole (α, β) grid over the cached
+scores for free, which is why the whole eval finishes in a few GPU-hours rather than a day. The
+2026-07-23 run selected **α = 0.6, β = 0.2** (dev WER 0.0353, against 0.0440 acoustic-only). Tuning
+also prints the **n-best oracle WER** — the floor any rescoring of that beam can reach — so a tuned
+number sitting on the oracle points at beam width, not at the LM.
 
 ## Local demo (web UI)
 
@@ -230,10 +238,18 @@ drives the Decode slice (upload → full-context offline single-pass RNN-T beam;
 partials, then a full-context final that replaces them on endpoint).
 
 ```bash
-PYTHONPATH=. .venv/bin/python -m src.slices.Demo.serve_demo   # then open http://127.0.0.1:8000
-# --lm-weight 0.4 turns on LM n-best rescoring (the tuned optimum); --checkpoint / --tokenizer /
-# --host / --port also available. Omit --lm-weight for the faster acoustic-only decoder.
+PYTHONPATH=. .venv/bin/python -m src.slices.Demo.serve_demo --lm-weight 0.6 --ilm-weight 0.2
+# then open http://127.0.0.1:8000
+# --lm-weight (alpha) 0.6 + --ilm-weight (beta) 0.2 = LM n-best rescoring with ILME at the weights
+# tuned on dev — the configuration the 3.55 % number was measured at; both default to the alpha=0
+# lock in config/decode.yaml, so omit them for the faster acoustic-only decoder. --beam-size,
+# --checkpoint, --tokenizer, --host, --port also available.
 ```
+
+Transcripts are sentence-cased on the display path (the model is trained on LibriSpeech's upper-case
+unpunctuated text): lower case, leading capital, pronoun "I". Nothing else is inferred — proper
+nouns and sentence boundaries cannot be recovered from unpunctuated output — and the Decode slice
+still emits raw corpus casing, so evaluation stays comparable.
 
 Binds `127.0.0.1` only (local, no auth); runs on GPU if available, else CPU. The browser captures at
 16 kHz and sends raw PCM over a WebSocket for the live path — no FFmpeg or external assets needed.
@@ -241,7 +257,7 @@ Binds `127.0.0.1` only (local, no auth); runs on GPU if available, else CPU. The
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest -q          # expect 144 passed, 2 deselected (slow gates)
+.venv/bin/python -m pytest -q          # expect 159 passed, 2 deselected (slow gates)
 ```
 
 ## Notes

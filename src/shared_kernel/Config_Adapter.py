@@ -54,20 +54,29 @@ class ModelConfig(BaseModel):
     def logits_width(self) -> int:
         return self.vocab_size + 1
 
-    # sos_id/eos_id/decoder_vocab_size: the acoustic model's attention decoder (Stage-B, U2++) that
+    # bos_id/eos_id/decoder_vocab_size: the acoustic model's attention decoder (Stage-B, U2++) that
     # originally motivated this label space is gone (SP5 transducer replaces it), but STREAM-LM
-    # (TrainLanguageModel slice) still frames next-token prediction as SOS-conditioned generation
+    # (TrainLanguageModel slice) still frames next-token prediction as BOS-conditioned generation
     # over this same vocab, so the ids stay live.
+    #
+    # BOS *is* EOS on purpose. PrepareLmData packs the corpus as `line tokens + eos_id` with no
+    # separate start symbol, so the only sentence-start context the LM is ever trained on is
+    # "previous line's EOS". A distinct start id would index an embedding row that never appears as
+    # a model input during training, making the first-token score of every rescored hypothesis
+    # come out of an untrained vector. Reusing EOS keeps decode-time scoring in-distribution.
     @computed_field  # type: ignore[prop-decorator]
     @property
-    def sos_id(self) -> int:
-        return self.vocab_size
+    def bos_id(self) -> int:
+        return self.vocab_size + 1
 
     @computed_field  # type: ignore[prop-decorator]
     @property
     def eos_id(self) -> int:
         return self.vocab_size + 1
 
+    # +2, not +1: id `vocab_size` is an unused hole (it was the old separate start symbol) that the
+    # table must still span to make eos_id = vocab_size + 1 addressable. Renumbering it away would
+    # invalidate every packed LM bin and LM checkpoint for one wasted embedding row.
     @computed_field  # type: ignore[prop-decorator]
     @property
     def decoder_vocab_size(self) -> int:
@@ -116,6 +125,9 @@ class DecodeConfig(BaseModel):
     lm_weight: float
     lm_checkpoint: str
     max_symbols: int
+    # ILME subtraction weight (beta): score -= ilm_weight * internal-LM logprob. Cancels the
+    # transducer's own language prior so the external LM is not counted on top of it. 0.0 = off.
+    ilm_weight: float = 0.0
     # Per-token bonus added to each hyp at n-best re-ranking (score += length_bonus*len(ids)).
     # RNN-T acoustic scores are un-normalised sums of emission log-probs, so every extra token only
     # lowers the score -- a standing bias toward deletions. A small positive bonus offsets it. 0.0 =
@@ -132,6 +144,9 @@ class LmConfig(BaseModel):
     dropout: float
     context_len: int
     value_residual_lambda: float
+    optimizer: str
+    muon_lr: float
+    z_loss: float
     lr_peak: float
     warmup_steps: int
     total_steps: int

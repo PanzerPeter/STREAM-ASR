@@ -35,8 +35,8 @@ def test_causality_end_to_end():
 def test_step_logprob_matches_full_forward():
     lm = _lm()
     ids = [3, 7, 42, 100]
-    # Full-forward log-probs of each next token given the SOS-prefixed prefix.
-    sos = get_config().model.sos_id
+    # Full-forward log-probs of each next token given the BOS-prefixed prefix.
+    sos = get_config().model.bos_id
     seq = torch.tensor([[sos] + ids])
     full = torch.log_softmax(lm(seq)[0], dim=-1)
     state = None

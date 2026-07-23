@@ -25,6 +25,7 @@ from src.shared_kernel.Checkpoint_Adapter import load_checkpoint
 from src.shared_kernel.Tokenizer_Adapter import SentencePieceTokenizer
 from src.slices.TrainAcousticModel.TransducerModel import TransducerModel
 from src.slices.Decode.StreamingDecode_Command import StreamingDecode_Command
+from src.slices.Decode.StreamingDecode_Response import NbestEntry
 from src.slices.Decode.StreamingDecoder_Handler import StreamingDecoder_Handler
 from src.slices.Evaluate.EvaluateCorpus_Command import EvaluateCorpus_Command
 from src.slices.Evaluate.EvaluateCorpus_Handler import EvaluateCorpus_Handler
@@ -70,14 +71,16 @@ def _run_stage(
     tok: SentencePieceTokenizer,
     stage: str,
     lm_weight: float,
+    ilm_weight: float,
     manifest: str,
     mode: str,
     limit: int | None,
     label: str = "",
 ) -> EvaluateCorpus_Response:
-    # Build a decoder configured for exactly this ablation stage + alpha, then score the corpus.
-    # The decoder loads the LM only when the stage's fuse_lm gate is set AND lm_weight > 0, so
-    # non-LM stages (and alpha == 0) pay no LM cost.
+    # Build a decoder configured for exactly this ablation stage + (alpha, beta), then score the
+    # corpus. The decoder loads the LM only when the stage's fuse_lm gate is set AND lm_weight > 0,
+    # so non-LM stages (and alpha == 0) pay no LM cost; the same gate zeroes beta, keeping the
+    # acoustic-only stages byte-identical to a run without ILME.
     f = _STAGES[stage]
     decoder = StreamingDecoder_Handler(
         model,
@@ -85,6 +88,7 @@ def _run_stage(
         beam_size=f.beam_size,
         fuse_lm=f.fuse_lm,
         lm_weight=lm_weight,
+        ilm_weight=ilm_weight,
     )
     handler = EvaluateCorpus_Handler(decoder, label=label or f"{stage}/{mode}")
     # no_grad is thread-local: set it here so this holds whether _run_stage runs inline (tuning) or
@@ -97,54 +101,65 @@ def _run_stage(
         )
 
 
-# Cached per-utterance rescore state: (reference text, n-best of (ids, acoustic_logp, lm_seq_logp)).
-_RescoreCache = list[tuple[str, list[tuple[list[int], float, float]]]]
+# Cached per-utterance rescore state: (reference text, acoustic n-best with its scoring terms).
+_RescoreCache = list[tuple[str, list[NbestEntry]]]
 
 
-def _pick_best_alpha(
+def _pick_best_weights(
     cache: _RescoreCache,
-    grid: list[float],
+    alpha_grid: list[float],
+    beta_grid: list[float],
     tok: SentencePieceTokenizer,
     length_bonus: float = 0.0,
-) -> tuple[float, dict[float, float]]:
-    # Pure alpha sweep over cached scores -- no decoding. For each alpha, each utterance emits the
-    # n-best hypothesis maximising acoustic + alpha*lm + length_bonus*len; corpus WER over those
-    # picks scores it. The length term must match the live decode ranking (StreamingDecoder_Handler.
-    # _search_rescore) so the alpha chosen here is the alpha used there. Returns the WER-minimising
-    # alpha and the full alpha->WER map. An empty n-best contributes an empty hypothesis.
-    wer_by_alpha: dict[float, float] = {}
+) -> tuple[tuple[float, float], dict[tuple[float, float], float]]:
+    # Pure (alpha, beta) sweep over cached scores -- no decoding. For each point, each utterance
+    # emits the n-best hypothesis maximising
+    #     acoustic + alpha*lm - beta*ilm + length_bonus*len
+    # and corpus WER over those picks scores the point. The ranking expression must match the live
+    # decode one (StreamingDecoder_Handler._search_rescore) so the weights chosen here are the
+    # weights used there. An empty n-best contributes an empty hypothesis.
+    wer_by_point: dict[tuple[float, float], float] = {}
     refs = [ref for ref, _ in cache]
-    for alpha in grid:
-        hyps = [
-            (
-                tok.decode(max(nb, key=lambda h: h[1] + alpha * h[2] + length_bonus * len(h[0]))[0])
-                if nb
-                else ""
-            )
-            for _, nb in cache
-        ]
-        wer_by_alpha[alpha] = corpus_wer(refs, hyps)
-    best_alpha = min(grid, key=lambda a: wer_by_alpha[a])
-    return best_alpha, wer_by_alpha
+    for alpha in alpha_grid:
+        for beta in beta_grid:
+
+            def rank(h: NbestEntry, a: float = alpha, b: float = beta) -> float:
+                return h.acoustic + a * h.lm - b * h.ilm + length_bonus * len(h.ids)
+
+            hyps = [tok.decode(max(nb, key=rank).ids) if nb else "" for _, nb in cache]
+            wer_by_point[(alpha, beta)] = corpus_wer(refs, hyps)
+    best = min(wer_by_point, key=lambda p: wer_by_point[p])
+    return best, wer_by_point
 
 
-def _tune_alpha_rescore(
+def _oracle_wer(cache: _RescoreCache, tok: SentencePieceTokenizer) -> float:
+    # Lower bound on what ANY rescorer can reach: pick, per utterance, the n-best entry with the
+    # fewest word errors against its own reference. If the tuned WER already sits near this, the
+    # bottleneck is the acoustic beam's coverage (widen it), not the rescoring weights or the LM.
+    picks = [
+        tok.decode(min(nb, key=lambda h: corpus_wer([ref], [tok.decode(h.ids)])).ids) if nb else ""
+        for ref, nb in cache
+    ]
+    return corpus_wer([ref for ref, _ in cache], picks)
+
+
+def _tune_rescore_weights(
     model: TransducerModel,
     tok: SentencePieceTokenizer,
     dev_manifest: str,
-    grid: list[float],
+    alpha_grid: list[float],
+    beta_grid: list[float],
     limit: int | None,
     beam_size: int,
-) -> float:
+) -> tuple[float, float]:
     # Rescore-mode tuning: decode dev ONCE acoustic-only (LM off), cache each utterance's n-best
-    # with separated acoustic + unweighted-LM scores, then sweep alpha over the cache for free. This
-    # is ~beam_size * n_alpha times cheaper than the shallow-fusion sweep (which re-runs a full
-    # beam+LM decode per alpha). The chosen alpha is still applied via true shallow fusion in the
-    # final table -- only alpha *selection* is done by rescoring here.
-    print(f"--- tuning lm_weight on {dev_manifest} (rescore mode, offline, n<= {limit}) ---")
+    # with its acoustic / external-LM / internal-LM terms kept apart, then sweep the whole
+    # (alpha, beta) grid over the cache for free -- the acoustic beam does not depend on either
+    # weight, so no point of the grid costs another decode.
+    print(f"--- tuning lm_weight/ilm_weight on {dev_manifest} (rescore mode, offline, n<= {limit})")
     print(
-        f"    decode dev ONCE acoustic-only, then sweep {len(grid)} alphas over cached LM sequence "
-        f"scores (no re-decode).",
+        f"    decode dev ONCE acoustic-only, then sweep {len(alpha_grid)}x{len(beta_grid)} "
+        f"(alpha, beta) points over cached LM + internal-LM scores (no re-decode).",
         flush=True,
     )
     rescorer = StreamingDecoder_Handler(
@@ -171,12 +186,23 @@ def _tune_alpha_rescore(
                     f"ETA {per * (total - i):.0f}s",
                     flush=True,
                 )
-    best_alpha, wer_by_alpha = _pick_best_alpha(cache, grid, tok, get_config().decode.length_bonus)
-    for alpha in grid:
-        marker = "  <- best" if alpha == best_alpha else ""
-        print(f"  lm_weight={alpha:<5} dev WER={wer_by_alpha[alpha]:.4f}{marker}", flush=True)
-    print(f"--- selected lm_weight={best_alpha} (dev WER={wer_by_alpha[best_alpha]:.4f}) ---")
-    return best_alpha
+    best, wer_by_point = _pick_best_weights(
+        cache, alpha_grid, beta_grid, tok, get_config().decode.length_bonus
+    )
+    for point in sorted(wer_by_point):
+        marker = "  <- best" if point == best else ""
+        print(
+            f"  lm_weight={point[0]:<5} ilm_weight={point[1]:<5} "
+            f"dev WER={wer_by_point[point]:.4f}{marker}",
+            flush=True,
+        )
+    oracle = _oracle_wer(cache, tok)
+    print(
+        f"--- selected lm_weight={best[0]} ilm_weight={best[1]} "
+        f"(dev WER={wer_by_point[best]:.4f}) | n-best oracle WER={oracle:.4f} "
+        f"(the floor this beam can be rescored to) ---"
+    )
+    return best
 
 
 def main() -> None:
@@ -199,14 +225,30 @@ def main() -> None:
     )
     ap.add_argument(
         "--lm-grid",
-        default="0.0,0.1,0.2,0.3,0.4,0.5",
+        default="0.0,0.1,0.2,0.3,0.4,0.5,0.6",
         help="comma-separated alpha grid for --tune",
+    )
+    ap.add_argument(
+        "--ilm-weight",
+        type=float,
+        default=None,
+        help="fixed ILME subtraction weight (beta); ignored when --tune sweeps one instead",
+    )
+    ap.add_argument(
+        "--ilm-grid",
+        default="0.0,0.1,0.2,0.3",
+        help="comma-separated beta (ILME subtraction) grid for --tune",
     )
     ap.add_argument(
         "--tune-limit",
         type=int,
         default=500,
         help="cap dev utterances during --tune (a subset keeps the sweep quick)",
+    )
+    ap.add_argument(
+        "--report",
+        default=None,
+        help="report path; overrides eval.report_path so a second split cannot clobber the first",
     )
     args = ap.parse_args()
 
@@ -219,15 +261,21 @@ def main() -> None:
 
     # _run_stage sets no_grad per task (thread-local), so no outer no_grad wrapper is needed.
     if args.tune is not None:
-        grid = [float(x) for x in args.lm_grid.split(",")]
-        lm_weight = _tune_alpha_rescore(
-            model, tok, args.tune, grid, args.tune_limit, cfg.decode.beam_size
+        lm_weight, ilm_weight = _tune_rescore_weights(
+            model,
+            tok,
+            args.tune,
+            [float(x) for x in args.lm_grid.split(",")],
+            [float(x) for x in args.ilm_grid.split(",")],
+            args.tune_limit,
+            cfg.decode.beam_size,
         )
     else:
         # CLI override wins, else the configured value. The authoritative decode.yaml keeps
         # lm_weight=0.0 (the alpha=0 regression lock), so sweeps never mutate it.
         lm_weight = args.lm_weight if args.lm_weight is not None else cfg.decode.lm_weight
-    print(f"lm_weight (alpha) = {lm_weight}")
+        ilm_weight = args.ilm_weight if args.ilm_weight is not None else cfg.decode.ilm_weight
+    print(f"lm_weight (alpha) = {lm_weight} · ilm_weight (beta) = {ilm_weight}")
 
     report = []
     for stage in cfg.eval.ablation_stages:
@@ -241,7 +289,7 @@ def main() -> None:
         resps = _map_parallel(
             _run_stage,
             [
-                (model, tok, stage, lm_weight, args.manifest, mode, args.limit)
+                (model, tok, stage, lm_weight, ilm_weight, args.manifest, mode, args.limit)
                 for mode in ("offline", "streaming")
             ],
         )
@@ -252,9 +300,23 @@ def main() -> None:
                 f"RTF={resp.rtf:.3f} lat={resp.latency_s:.3f}s n={resp.num_utts}"
             )
 
-    out = Path(cfg.eval.report_path)
+    out = Path(args.report or cfg.eval.report_path)
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps({"lm_weight": lm_weight, "rows": report}, indent=2))
+    # Which split produced these numbers (and where alpha came from) is part of the result -- a
+    # test-other table is not comparable to a test-clean one.
+    out.write_text(
+        json.dumps(
+            {
+                "manifest": args.manifest,
+                "tune_manifest": args.tune,
+                "checkpoint": args.checkpoint,
+                "lm_weight": lm_weight,
+                "ilm_weight": ilm_weight,
+                "rows": report,
+            },
+            indent=2,
+        )
+    )
     print(f"wrote {out}")
 
 

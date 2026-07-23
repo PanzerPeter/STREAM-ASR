@@ -17,8 +17,13 @@ from src.slices.TrainAcousticModel.StreamCache import StreamCache
 from src.slices.TrainLanguageModel.StreamLmModel import StreamLmModel
 from src.slices.Decode.TransducerBeamSearch import TransducerBeamSearch
 from src.slices.Decode.LmScorer import LmScorer
+from src.slices.Decode.InternalLmScorer import InternalLmScorer
 from src.slices.Decode.StreamingDecode_Command import StreamingDecode_Command
-from src.slices.Decode.StreamingDecode_Response import StreamingDecode_Response, SegmentResult
+from src.slices.Decode.StreamingDecode_Response import (
+    NbestEntry,
+    SegmentResult,
+    StreamingDecode_Response,
+)
 
 
 class _Tokenizer(Protocol):
@@ -35,6 +40,7 @@ class StreamingDecoder_Handler:
         beam_size: int | None = None,
         fuse_lm: bool = True,
         lm_weight: float | None = None,
+        ilm_weight: float | None = None,
     ) -> None:
         # Single ablation gate (fuse_lm) replaces the old two-pass beam/rescore gate pair -- there
         # is only one pass now, so there is only one place the LM can attach. lm_weight == 0 forces
@@ -48,6 +54,15 @@ class StreamingDecoder_Handler:
         self.lm_weight = lm_weight if lm_weight is not None else self.cfg.decode.lm_weight
         # Per-token bonus applied at n-best re-ranking to offset RNN-T's deletion bias.
         self.length_bonus = self.cfg.decode.length_bonus
+        # ILME subtraction weight (beta). Only meaningful alongside an external LM -- with fuse_lm
+        # off there is no double count to remove, so the stage stays byte-identical to pure
+        # acoustic decoding.
+        self.ilm_weight = (
+            (ilm_weight if ilm_weight is not None else self.cfg.decode.ilm_weight)
+            if fuse_lm
+            else 0.0
+        )
+        self.ilm_scorer = InternalLmScorer(model)
         # Load the LM only when fuse_lm actually consumes it AND lm_weight > 0; lm_weight == 0 (or
         # fuse_lm=False) keeps it None, so no checkpoint is read and search() reproduces the
         # pre-LM decoder exactly (the alpha=0 regression lock).
@@ -83,39 +98,49 @@ class StreamingDecoder_Handler:
         )
 
     def _search_rescore(self, memory: torch.Tensor) -> list[tuple[list[int], float]]:
-        # Acoustic beam, then re-rank the n-best by acoustic + alpha*lm_seq + length_bonus*len:
-        # the LM term is one full-sequence forward per hyp (replacing per-step shallow fusion),
-        # the length term offsets RNN-T's deletion bias. With no LM AND length_bonus==0 the acoustic
-        # order is returned untouched (the alpha=0 / no-LM regression lock).
+        # Acoustic beam, then re-rank the n-best by
+        #     acoustic + alpha*lm_seq - beta*ilm_seq + length_bonus*len
+        # The LM and internal-LM terms are each ONE batched forward over the whole n-best
+        # (replacing per-step shallow fusion and per-hypothesis loops); the ILM term removes the
+        # language prior the transducer already carries, so alpha is not fighting a double count;
+        # the length term offsets RNN-T's deletion bias. With no LM, beta==0 AND length_bonus==0
+        # the acoustic order is returned untouched (the alpha=0 / no-LM regression lock).
         nbest = self.searcher.search(memory)
         lb = self.length_bonus
-        if self.lm_scorer is None and lb == 0.0:
+        if self.lm_scorer is None and self.ilm_weight == 0.0 and lb == 0.0:
             return nbest
+        ids_only = [ids for ids, _ in nbest]
+        lm = self.lm_scorer.sequence_scores(ids_only) if self.lm_scorer is not None else None
+        ilm = self.ilm_scorer.sequence_logprob_batch(ids_only) if self.ilm_weight else None
         scored = [
             (
                 ids,
                 ac
-                + (self.lm_scorer.sequence_score(ids) if self.lm_scorer is not None else 0.0)
+                + (lm[i] if lm is not None else 0.0)
+                - self.ilm_weight * (ilm[i] if ilm is not None else 0.0)
                 + lb * len(ids),
             )
-            for ids, ac in nbest
+            for i, (ids, ac) in enumerate(nbest)
         ]
         scored.sort(key=lambda c: c[1], reverse=True)
         return scored
 
-    def nbest_for_rescore(
-        self, cmd: StreamingDecode_Command
-    ) -> list[tuple[list[int], float, float]]:
-        # Alpha-tuning support: return the acoustic n-best as (ids, acoustic_logp, lm_seq_logp) with
-        # the *unweighted* LM sequence logprob attached. The acoustic beam is alpha-independent, so
-        # a whole alpha sweep reuses one decode: the caller ranks by acoustic + alpha*lm at any
-        # alpha without re-decoding. Requires an LM.
+    def nbest_for_rescore(self, cmd: StreamingDecode_Command) -> list[NbestEntry]:
+        # Weight-tuning support: return the acoustic n-best with the *unweighted* external-LM and
+        # internal-LM sequence logprobs attached. The acoustic beam does not depend on either
+        # weight, so one decode serves a whole (alpha, beta) grid: the caller ranks by
+        # acoustic + alpha*lm - beta*ilm at any point of the grid without re-decoding. Requires
+        # an LM (beta alone would not need one, but the tuner always sweeps both together).
         if self.lm_scorer is None:
             raise ValueError("nbest_for_rescore requires an LM: fuse_lm=True with lm_weight>0")
         memory, _ = self._encode(load_audio(cmd.audio_path), cmd.streaming, time.perf_counter())
+        nbest = self.searcher.search(memory)
+        ids_only = [ids for ids, _ in nbest]
+        lm = self.lm_scorer.raw_sequence_logprobs(ids_only)
+        ilm = self.ilm_scorer.sequence_logprob_batch(ids_only)
         return [
-            (ids, ac, self.lm_scorer.raw_sequence_logprob(ids))
-            for ids, ac in self.searcher.search(memory)
+            NbestEntry(ids=ids, acoustic=ac, lm=lm[i], ilm=ilm[i])
+            for i, (ids, ac) in enumerate(nbest)
         ]
 
     def _encode(

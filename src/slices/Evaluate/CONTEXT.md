@@ -17,14 +17,20 @@ streaming}. Stages are cumulative:
 |---|---|
 | `greedy_transducer` | beam_size 1, no LM |
 | `beam` | full beam search, no LM |
-| `beam_lm` | + LM n-best rescoring (`fuse_lm=True`): re-rank the acoustic beam by `acoustic + alpha·lm_seq` |
+| `beam_lm` | + LM n-best rescoring (`fuse_lm=True`): re-rank the acoustic beam by `acoustic + alpha·lm_seq − beta·ilm_seq` |
 
 The `beam_lm` stage requires a fusion weight `alpha > 0` (so the LM checkpoint is loaded); `alpha =
 0` reproduces the pure-acoustic decoder exactly and the script warns that stage is inactive. Because
 the LM contributes nothing at `alpha = 0`, the honest way to evaluate it is `--tune DEV`: the script
-decodes DEV once acoustic-only, sweeps `--lm-grid` over the cached `(acoustic, LM-sequence)` scores
-for free (no re-decode), picks the WER-minimising `alpha`, then freezes it for the test table — so
-the headline number is never tuned on the test set.
+decodes DEV once acoustic-only, sweeps `--lm-grid` × `--ilm-grid` over the cached
+`(acoustic, LM-sequence, internal-LM-sequence)` scores for free (no re-decode — neither weight moves
+the acoustic beam), picks the WER-minimising `(alpha, beta)`, then freezes it for the test table —
+so the headline number is never tuned on the test set.
+
+Tuning also prints the **n-best oracle WER**: the corpus WER you would get by picking, per
+utterance, the lowest-error hypothesis the beam produced. It is the floor any rescoring can reach.
+A tuned WER close to it means the acoustic beam's coverage is the bottleneck (widen `beam_size`);
+a large gap means the rescoring terms still have room.
 
 ## Artifacts
 
@@ -37,6 +43,6 @@ the headline number is never tuned on the test set.
 `PYTHONPATH=. .venv/bin/python -m src.slices.Evaluate.evaluate data/manifests/test.jsonl`
 (`--limit N` caps utterances for a smoke run; GPU; user-run). To evaluate the LM, tune then run in
 one command: `... evaluate data/manifests/test.jsonl --tune data/manifests/dev.jsonl` (optional
-`--lm-grid`, `--tune-limit`). `Metrics.corpus_wer/corpus_cer` wrap `jiwer`;
+`--lm-grid`, `--ilm-grid`, `--tune-limit`). `Metrics.corpus_wer/corpus_cer` wrap `jiwer`;
 `EvaluateCorpus_Handler` aggregates over the manifest; config is `config/eval.yaml`. The report
-JSON is `{"lm_weight": <alpha>, "rows": [...]}`.
+JSON is `{"lm_weight": <alpha>, "ilm_weight": <beta>, "rows": [...]}`.

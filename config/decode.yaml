@@ -5,6 +5,11 @@ chunk_size: 16
 beam_size: 10
 # LM fusion. lm_weight (alpha) = 0.0 reproduces the pre-LM decoder exactly.
 lm_weight: 0.0
+# ILME subtraction weight (beta): the re-ranker subtracts beta * internal-LM logprob, cancelling
+# the language prior the transducer's own predictor+joiner already carries so the external LM is
+# not double-counting it. 0.0 = plain fusion (regression lock). Swept jointly with lm_weight by
+# evaluate.py --tune; useful range ~[0.0, 0.5] (it must stay below alpha or the prior flips sign).
+ilm_weight: 0.0
 lm_checkpoint: data/checkpoints/lm_best.pt
 max_symbols: 5   # max non-blank emissions per encoder frame in transducer beam search
 # Per-token re-ranking bonus (counters RNN-T's un-normalised deletion bias). 0.0 = off / regression

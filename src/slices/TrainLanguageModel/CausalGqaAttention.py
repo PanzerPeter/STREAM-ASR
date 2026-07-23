@@ -65,7 +65,12 @@ class CausalGqaAttention(nn.Module):
         return q, k, v
 
     def _attend(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, is_causal: bool
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        is_causal: bool,
+        attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         kx = k.repeat_interleave(self.rep, dim=1)  # broadcast KV heads to query heads
         vx = v.repeat_interleave(self.rep, dim=1)
@@ -73,7 +78,10 @@ class CausalGqaAttention(nn.Module):
             q,
             kx,
             vx,
-            is_causal=is_causal,
+            attn_mask=attn_mask,
+            # SDPA rejects is_causal together with an explicit mask; the caller's mask is already
+            # causal (it is the causal mask ANDed with the same-line constraint).
+            is_causal=is_causal and attn_mask is None,
             dropout_p=self.dropout_p if self.training else 0.0,
         )
         b = out.shape[0]
@@ -81,12 +89,15 @@ class CausalGqaAttention(nn.Module):
         return self.out(out)
 
     def forward(
-        self, x: torch.Tensor, value_residual: torch.Tensor | None
+        self,
+        x: torch.Tensor,
+        value_residual: torch.Tensor | None,
+        attn_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         q, k, v = self._project(x, pos_offset=0)
         if value_residual is not None:
             v = v + self.lam * value_residual
-        out = self._attend(q, k, v, is_causal=True)
+        out = self._attend(q, k, v, is_causal=True, attn_mask=attn_mask)
         return out, v
 
     def step(

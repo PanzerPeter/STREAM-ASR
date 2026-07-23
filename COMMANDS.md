@@ -30,12 +30,11 @@ python -m src.slices.PretrainEncoder.pretrain_bestrq
 python -m src.slices.TrainAcousticModel.train_transducer
 tensorboard --logdir runs/transducer
 
-# Step 3b (optional): average the tail of the rolling transducer_step*.pt snapshots
+# Step 4 (optional): average the tail of the rolling transducer_step*.pt snapshots
 # (training.transducer.keep_last_n) into one decode checkpoint
 python scripts/average_checkpoints.py --last-n 5   # -> data/checkpoints/transducer_avg.pt
 
-
-# Resume after an interrupt/crash (SP2): re-run the SAME train command — the trainer auto-resumes
+# Start new transducer model training
 python -c "from src.slices.TrainAcousticModel.TransducerTrainer_Handler import run_transducer; from src.slices.TrainAcousticModel.TransducerTrainer_Command import TransducerTrainCommand; import dataclasses as d; run_transducer(d.replace(TransducerTrainCommand(), resume=False))"
 
 # Step 5: Streaming Decode (single-pass RNN-T beam search)
@@ -50,15 +49,18 @@ tensorboard --logdir runs/lm
 
 
 # Step 7: Evaluation (Acoustic beam + LM n-best rescoring)
-# --tune decodes dev ONCE acoustic-only, sweeps lm_weight (alpha) over the cached (acoustic, LM-
-# sequence) scores for free, freezes the best, then runs the test table (greedy/beam/beam_lm x
-# offline/streaming) with it. Batched beam search keeps the full run within a few GPU-hours.
+# --tune decodes dev ONCE acoustic-only, sweeps lm_weight (alpha) x ilm_weight (beta, the ILME
+# subtraction) over the cached (acoustic, LM-sequence, internal-LM-sequence) scores for free,
+# freezes the best pair, then runs the test table (greedy/beam/beam_lm x offline/streaming) with it.
+# It also prints the n-best oracle WER = the floor any rescoring of that beam can reach.
 python -m src.slices.Evaluate.evaluate data/manifests/test.jsonl --tune data/manifests/dev.jsonl
 # Quick liveness smoke (finishes in ~1-2 min): a tiny dev subset + coarse grid + capped test table.
-python -m src.slices.Evaluate.evaluate data/manifests/test.jsonl --tune data/manifests/dev.jsonl --tune-limit 30 --lm-grid 0.0,0.2,0.4 --limit 30
+python -m src.slices.Evaluate.evaluate data/manifests/test.jsonl --tune data/manifests/dev.jsonl --tune-limit 30 --lm-grid 0.0,0.2,0.4 --ilm-grid 0.0,0.2 --limit 30
 
-# Step 8: Launch Local Web UI Demo (--lm-weight 0.4 = tuned optimum; omit it for acoustic-only)
-python -m src.slices.Demo.serve_demo --lm-weight 0.4
+# Step 8: Launch Local Web UI Demo. 0.6 / 0.2 = the (alpha, beta) tuned on dev, i.e. the setup the
+# 3.55 % test-clean number was measured at; drop both flags for the faster acoustic-only decoder.
+# Startup prints the resolved beam/LM settings. Transcripts are sentence-cased for display only.
+python -m src.slices.Demo.serve_demo --lm-weight 0.6 --ilm-weight 0.2
 
 ```
 
@@ -174,17 +176,20 @@ python -c "from src.slices.TrainAcousticModel.TransducerTrainer_Handler import r
 ### Step 5: Streaming Decode Options
 
 * **Offline:** Full-context single encoder pass, then one RNN-T beam search over the whole memory —
-  test-clean WER 7.3–7.8% (beam+LM / beam).
+  test-clean WER 3.6–4.4% (beam+LM / beam).
 * **Streaming:** Chunked/cached encoder (`StreamCache`) feeding the same beam search as frames
-  arrive — test-clean WER 9.7–10.4%, ~19 ms first-partial latency. LM off (`lm_weight: 0.0`) by
+  arrive — test-clean WER 4.7–6.1%, ~27 ms first-partial latency. LM off (`lm_weight: 0.0`) by
   default until Step 6.
 * `--offline` selects offline mode; omitting it runs streaming (the `streaming_decode.py` default).
 
 ### Step 6: Train Neural LM (STREAM-LM)
 
-* Trains a deep-narrow causal Transformer (GQA + QK-norm + value-residual, tied embeddings; AdamW warmup $\rightarrow$ cosine, bf16).
-* `total_steps=40000` $\approx$ 0.3-0.5 epoch over the ~803M-word corpus. The 2026-07-20 run reached
-  **val ppl 16.185**; at the tuned α=0.4 it buys −0.82/−1.24 abs WER offline/streaming over acoustic-only.
+* Trains a deep-narrow causal Transformer (GQA + QK-norm + value-residual, tied embeddings; Muon+AdamW
+  warmup $\rightarrow$ cosine, bf16, z-loss). Windows are **document-masked**: each position attends
+  only its own corpus line, matching how a rescored hypothesis is scored at decode time.
+* `total_steps=40000` $\approx$ 0.3-0.5 epoch over the ~803M-word corpus. At the tuned α=0.6, β=0.2
+  the LM+ILME buys −0.86/−1.39 abs WER offline/streaming over acoustic-only. (Val ppl is not
+  comparable to pre-masking runs — masked scoring is a strictly harder, and more honest, metric.)
 
 ### Step 7: Evaluation Alternates
 
@@ -192,20 +197,25 @@ python -c "from src.slices.TrainAcousticModel.TransducerTrainer_Handler import r
 # Acoustic-only evaluation (LM off, α=0)
 python -m src.slices.Evaluate.evaluate data/manifests/test.jsonl
 
-# Evaluation with a fixed α (skip dev sweep, explicit reproducibility; 0.4 = tuned optimum)
-python -m src.slices.Evaluate.evaluate data/manifests/test.jsonl --lm-weight 0.4
+# Evaluation with fixed weights (skip dev sweep, explicit reproducibility; 0.6/0.2 = tuned optimum)
+python -m src.slices.Evaluate.evaluate data/manifests/test.jsonl --lm-weight 0.6 --ilm-weight 0.2
+
+# test-other (n=2,939): the hard split. α re-tuned on dev-other so the acoustic condition matches;
+# --report is mandatory here, otherwise it overwrites the test-clean report.
+python -m src.slices.Evaluate.evaluate data/manifests/test-other.jsonl \
+  --tune data/manifests/dev-other.jsonl --report runs/eval/report-other.json
 
 ```
 
 > ⚠️ **Note:** Tuning via `--tune` is executed exclusively on the dev set to keep the test headline WER an honest held-out metric.
 
-**Reference results (test-clean, n=2,620, 2026-07-20 run, tuned α=0.4) → `runs/eval/report.json`:**
+**Reference results (test-clean, n=2,620, 2026-07-23 run, tuned α=0.6/β=0.2) → `runs/eval/report.json`:**
 
 | Stage | Offline WER / CER | Streaming WER / CER |
 | --- | --- | --- |
-| `greedy_transducer` | 5.41% / 1.90% | 7.34% / 2.67% |
-| `beam` | 5.12% / 1.76% | 6.97% / 2.48% |
-| **`beam_lm`** | **4.30% / 1.53%** | **5.73% / 2.13%** |
+| `greedy_transducer` | 4.61% / 1.60% | 6.36% / 2.28% |
+| `beam` | 4.41% / 1.52% | 6.07% / 2.13% |
+| **`beam_lm`** | **3.55% / 1.24%** | **4.68% / 1.67%** |
 
 RTF stays ≪ 1 across the board (offline ~0.12, streaming ~0.16 with LM, measured with both passes
 sharing the GPU).
@@ -251,8 +261,8 @@ PYTHONPATH=. mypy src         # Type check checking (Strict: expect 0 errors)
 | `config/model.yaml` | Encoder dims/layers/heads, conv kernel, dropout, RoPE base, `encoder_value_residual_lambda`, vocab size |
 | `config/training.yaml` | `transducer` settings (SP5): `max_frames_per_batch`, `max_tokens_per_batch`, `grad_accum`, `warmup_steps`/`total_steps`, `chunk_sizes`, `warm_start`, `grad_checkpoint`, `dev_wer_utts`, `keep_last_n` |
 | `config/transducer.yaml` | Transducer architecture (SP5): `predictor_dim`, `predictor_context`, `joiner_dim`, `ctc_aux_weight`, `interctc_layers`/`interctc_weights` |
-| `config/decode.yaml` | `chunk_size`, `beam_size`, `max_symbols`, `lm_weight` ($\alpha$), `lm_checkpoint`, `length_bonus` |
-| `config/lm.yaml` | STREAM-LM: `d_model`/`layers`/`heads`/`kv_groups`, `context_len`, schedule, `subset_words` |
+| `config/decode.yaml` | `chunk_size`, `beam_size`, `max_symbols`, `lm_weight` ($\alpha$), `ilm_weight` ($\beta$, ILME subtraction), `lm_checkpoint`, `length_bonus` |
+| `config/lm.yaml` | STREAM-LM: `d_model`/`layers`/`heads`/`kv_groups`, `context_len`, `optimizer`/`muon_lr`/`lr_peak`/`z_loss`, schedule, `subset_words` |
 | `config/eval.yaml` | `ablation_stages` (`greedy_transducer`/`beam`/`beam_lm`), `report_path` |
 | `config/optim.yaml` | Optimizer stack (SP3): `optimizer` (`adamw`\|`muon+adamw`), `muon_lr`/`adamw_lr`, `muon_momentum`, `ns_steps`, `weight_decay`, `mup_enabled`/`mup_base_dims` |
 | `config/pretrain.yaml` | BEST-RQ pretrain (SP4): `codebook_size`/`codebook_dim`, `mask_prob`/`mask_span`/`noise_std`, `stack_frames`, `warmup_steps`/`total_steps`, `grad_clip`/`log_every`/`save_every`, `seed` |

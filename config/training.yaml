@@ -3,7 +3,7 @@ transducer:
   max_tokens_per_batch: 4000     # transcript-char budget: caps the RNN-T joiner lattice B*T*(U+1)
   grad_accum: 4
   warmup_steps: 10000
-  total_steps: 120000
+  total_steps: 175000
   weight_decay: 1.0e-2
   grad_clip: 5.0
   log_every: 50
