@@ -1,4 +1,3 @@
-# src/slices/TrainAcousticModel/ConvModule.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,7 +9,8 @@ class ConvModule(nn.Module):
     """Conformer/Zipformer depthwise conv module: pointwise GLU expand -> causal depthwise conv
     -> per-frame BiasNorm -> SiLU -> pointwise project. The conv reads no future frames (left pad
     only) and the norm is per-frame, so a streaming chunk is bit-for-bit the full-sequence result.
-    (GroupNorm-over-time, used previously, could not: its statistics span the whole sequence.)"""
+    The per-frame norm is load-bearing: a GroupNorm over time would tie the result to the whole
+    sequence and break that equivalence."""
 
     def __init__(self, dim: int, kernel: int) -> None:
         super().__init__()

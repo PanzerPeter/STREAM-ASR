@@ -1,4 +1,4 @@
-# src/shared_kernel/LogMel_Transform.py — pure feature transform (Shared Kernel eligible)
+# Pure feature transform (Shared Kernel eligible)
 import torch
 import torchaudio
 

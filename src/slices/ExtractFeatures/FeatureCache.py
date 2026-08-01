@@ -1,5 +1,4 @@
-# src/slices/ExtractFeatures/FeatureCache.py
-# fp16 log-mel cache: one flat memmap per split streamed via mmap, so the training epoch loop is
+# Fp16 log-mel cache: one flat memmap per split streamed via mmap, so the training epoch loop is
 # GPU-bound (no per-epoch FLAC decode / FFT). A header records the front-end params the cache was
 # built with; a mismatch against config fails loudly rather than feeding stale features silently.
 import json

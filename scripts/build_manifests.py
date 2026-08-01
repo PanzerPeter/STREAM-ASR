@@ -1,4 +1,4 @@
-# scripts/build_manifests.py — build all 960h + eval manifests
+# Build all 960h + eval manifests
 from src.slices.BuildManifest.BuildManifest_Command import BuildManifestCommand
 from src.slices.BuildManifest.BuildManifest_Handler import build_manifest
 

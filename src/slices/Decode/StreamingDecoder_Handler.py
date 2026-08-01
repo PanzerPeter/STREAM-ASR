@@ -3,7 +3,7 @@
 # full-context encoder forward. Both funnel into the same TransducerBeamSearch so the only
 # difference between the two modes is how `memory` gets built.
 import time
-from typing import Protocol
+from typing import Protocol, TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
@@ -25,6 +25,9 @@ from src.slices.Decode.StreamingDecode_Response import (
     StreamingDecode_Response,
 )
 
+if TYPE_CHECKING:
+    from src.slices.Decode.CudaGraphedTransducerStep import CudaGraphedTransducerStep
+
 
 class _Tokenizer(Protocol):
     # Structural type: the handler only needs `.decode(ids) -> str`; it must not import a
@@ -42,9 +45,8 @@ class StreamingDecoder_Handler:
         lm_weight: float | None = None,
         ilm_weight: float | None = None,
     ) -> None:
-        # Single ablation gate (fuse_lm) replaces the old two-pass beam/rescore gate pair -- there
-        # is only one pass now, so there is only one place the LM can attach. lm_weight == 0 forces
-        # the LM off regardless of fuse_lm.
+        # Decode is a single pass, so there is exactly one place the LM can attach and one gate
+        # (fuse_lm) controlling it. lm_weight == 0 forces the LM off regardless of fuse_lm.
         self.model = model
         self.tok = tokenizer
         self.cfg = get_config()
@@ -68,9 +70,20 @@ class StreamingDecoder_Handler:
         # pre-LM decoder exactly (the alpha=0 regression lock).
         needs_lm = fuse_lm and self.lm_weight > 0
         self.lm_scorer = self._load_lm() if needs_lm else None
-        # The searcher is pure acoustic; the LM (when present) re-ranks its n-best in
-        # _search_rescore below -- there is no per-step fusion path any more.
-        self.searcher = TransducerBeamSearch(model, self.beam_size, self.cfg.decode.max_symbols)
+        # The searcher is pure acoustic by construction; the LM (when present) re-ranks its n-best
+        # in _search_rescore below rather than fusing per emission step.
+        self.searcher = TransducerBeamSearch(
+            model, self.beam_size, self.cfg.decode.max_symbols, graph_step=self._graph_step()
+        )
+
+    def _graph_step(self) -> "CudaGraphedTransducerStep | None":
+        # CUDA-graph capture is CUDA-only and opt-in; on CPU or with the flag off the searcher stays
+        # on the eager launch-per-step path. Imported lazily so a CPU-only decode never touches it.
+        if not self.cfg.decode.cuda_graph or self.model.ctc_head.weight.device.type != "cuda":
+            return None
+        from src.slices.Decode.CudaGraphedTransducerStep import CudaGraphedTransducerStep
+
+        return CudaGraphedTransducerStep(self.model, self.beam_size)
 
     def _load_lm(self) -> LmScorer:
         device = self.model.ctc_head.weight.device
@@ -79,29 +92,45 @@ class StreamingDecoder_Handler:
         lm.to(device).eval()
         return LmScorer(lm, self.lm_weight)
 
+    def prime(self) -> None:
+        # Capture the CUDA graph (decode.cuda_graph) NOW, on the calling thread. Capture runs in
+        # CUDA's *global* mode: any other thread launching work on this device while it runs aborts
+        # the capture, so a corpus run with concurrent decode passes must prime every decoder before
+        # it starts its workers. No-op on the eager path.
+        self.searcher.prime()
+
     def decode(self, cmd: StreamingDecode_Command) -> StreamingDecode_Response:
         return self.decode_waveform(load_audio(cmd.audio_path), cmd.streaming)
 
     def decode_waveform(self, wave: torch.Tensor, streaming: bool) -> StreamingDecode_Response:
         # Waveform-in entry (the demo server decodes uploaded bytes / a live mic buffer that never
         # touch disk). decode() is just load_audio + this; both share the exact single-pass path.
+        # Audio IO sits outside the timer on purpose: rtf/decode_s measure the model, not libsndfile
         audio_seconds = wave.shape[0] / self.cfg.audio.sample_rate
         start = time.perf_counter()
         memory, first_latency = self._encode(wave, streaming, start)
+        encoded = time.perf_counter()
         nbest = self._search_rescore(memory)
         best_ids = nbest[0][0] if nbest else []
         text = self.tok.decode(best_ids)
         seg = SegmentResult(text=text, nbest=[(self.tok.decode(h), sc) for h, sc in nbest])
-        rtf = (time.perf_counter() - start) / max(audio_seconds, 1e-6)
+        end = time.perf_counter()
+        decode_s = end - start
         return StreamingDecode_Response(
-            text=text, segments=[seg], rtf=rtf, first_partial_latency_s=first_latency
+            text=text,
+            segments=[seg],
+            rtf=decode_s / max(audio_seconds, 1e-6),
+            decode_s=decode_s,
+            audio_s=audio_seconds,
+            finalize_s=end - encoded,
+            first_partial_latency_s=first_latency,
         )
 
     def _search_rescore(self, memory: torch.Tensor) -> list[tuple[list[int], float]]:
         # Acoustic beam, then re-rank the n-best by
         #     acoustic + alpha*lm_seq - beta*ilm_seq + length_bonus*len
         # The LM and internal-LM terms are each ONE batched forward over the whole n-best
-        # (replacing per-step shallow fusion and per-hypothesis loops); the ILM term removes the
+        # (not per-step fusion or per-hypothesis loops); the ILM term removes the
         # language prior the transducer already carries, so alpha is not fighting a double count;
         # the length term offsets RNN-T's deletion bias. With no LM, beta==0 AND length_bonus==0
         # the acoustic order is returned untouched (the alpha=0 / no-LM regression lock).
@@ -145,7 +174,7 @@ class StreamingDecoder_Handler:
 
     def _encode(
         self, wave: torch.Tensor, streaming: bool, start: float
-    ) -> tuple[torch.Tensor, float]:
+    ) -> tuple[torch.Tensor, float | None]:
         # Waveform -> encoder memory (streaming | offline), shared by decode_waveform and
         # nbest_for_rescore. Front end is CPU-only (soundfile + torchaudio mel); move to the model's
         # device so decode runs on the GPU the CLI placed the model on -- everything downstream
@@ -164,7 +193,9 @@ class StreamingDecoder_Handler:
         f = self.cfg.model.final_downsample
         return (base + f - 1) // f
 
-    def _stream_encode(self, feats: torch.Tensor, start: float) -> tuple[torch.Tensor, float]:
+    def _stream_encode(
+        self, feats: torch.Tensor, start: float
+    ) -> tuple[torch.Tensor, float | None]:
         enc = self.model.encoder
         base = self.cfg.decode.chunk_size
         feat_chunk = 2 * base  # feature-rate chunk -> base base-rate frames
@@ -174,7 +205,7 @@ class StreamingDecoder_Handler:
             feats = F.pad(feats, (0, 0, 0, pad))
         cache = StreamCache.init(enc, batch_size=1, device=feats.device)
         mems: list[torch.Tensor] = []
-        first_latency = 0.0
+        first_latency: float | None = None
         emitted = 0
         for i, s in enumerate(range(0, feats.shape[1], feat_chunk)):
             mem, cache = enc.streaming_forward(feats[:, s : s + feat_chunk], cache)
@@ -192,7 +223,8 @@ class StreamingDecoder_Handler:
         )
         return memory, first_latency
 
-    def _offline_encode(self, feats: torch.Tensor) -> tuple[torch.Tensor, float]:
+    def _offline_encode(self, feats: torch.Tensor) -> tuple[torch.Tensor, None]:
+        # No partials exist in a one-shot encoder call, so the latency is None (not 0.0).
         lengths = torch.tensor([feats.shape[1]], device=feats.device)
         memory, out_len = self.model.encoder(feats, lengths, chunk_size=0)
-        return memory[:, : int(out_len[0])], 0.0
+        return memory[:, : int(out_len[0])], None

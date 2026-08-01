@@ -1,6 +1,5 @@
-# src/slices/PretrainEncoder/BestRqPretrainer_Handler.py
-# BEST-RQ pretrain loop (SP4): span-mask -> encoder -> masked-prediction CE, on the SP2 resumable
-# harness and the SP3 Muon+muP optimizer. Reads the SP1 fp16 mel cache (labels ignored). Emits a
+# BEST-RQ pretrain loop: span-mask -> encoder -> masked-prediction CE, on the resumable
+# harness and the Muon+muP optimizer. Reads the fp16 mel cache (labels ignored). Emits a
 # full-state checkpoint (bestrq_last.pt, for crash/interrupt resume) plus an encoder-only checkpoint
 # (bestrq_encoder.pt) that warm-starts the transducer trainer's encoder.
 import math
@@ -59,13 +58,13 @@ def run_pretrain(cmd: BestRqPretrainCommand) -> str:
     # build_optimizer sets each group's lr to its calibrated PEAK (Muon >> AdamW per
     # config/optim.yaml). Snapshot the peaks so the warmup+cosine schedule is applied as a
     # 0->1->0 SHAPE multiplier per group. A single absolute overwrite would clobber Muon's much
-    # larger base LR and any muP ratios, defeating SP3 (the same bug fixed in Stage-A/B).
+    # larger base LR and any muP ratios, defeating the whole optimizer split.
     peak_lrs = [[g["lr"] for g in opt.param_groups] for opt in optimizers]
 
     last_ckpt = os.path.join(cmd.ckpt_dir, "bestrq_last.pt")
     encoder_ckpt = os.path.join(cmd.ckpt_dir, "bestrq_encoder.pt")
     # Restore full training state (model + optimizers + step + RNG) after a crash/interrupt and bump
-    # resume_count so the sampler reseeds a fresh, non-repeating epoch (SP2 resumable harness).
+    # resume_count so the sampler reseeds a fresh, non-repeating epoch.
     resumed = resume_if_available(last_ckpt, model, optimizers, cmd.resume)
     step = int(resumed["step"])
     resume_count = int(resumed["resume_count"])
@@ -120,7 +119,7 @@ def run_pretrain(cmd: BestRqPretrainCommand) -> str:
                 break
 
     # Persist the final full-state resume point, then emit the encoder-only warm-start artifact
-    # (drop the BEST-RQ head) for supervised Stage-A.
+    # (drop the BEST-RQ head) for supervised transducer training.
     save_checkpoint(last_ckpt, model, optimizers, step, resume_count=resume_count, kind="bestrq")
     save_checkpoint(
         encoder_ckpt,

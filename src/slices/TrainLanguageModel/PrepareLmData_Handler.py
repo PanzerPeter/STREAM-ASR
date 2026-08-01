@@ -1,4 +1,3 @@
-# src/slices/TrainLanguageModel/PrepareLmData_Handler.py
 # Text corpus -> BPE-500 token ids (+EOS per line) -> packed uint16 train/val bins. The whole
 # corpus is streamed straight to disk in flushed shards, so RAM stays bounded no matter how large
 # it is; uniform coverage comes from the training DataLoader shuffling the memmapped bin, not from

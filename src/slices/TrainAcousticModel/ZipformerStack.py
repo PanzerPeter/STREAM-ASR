@@ -1,4 +1,3 @@
-# src/slices/TrainAcousticModel/ZipformerStack.py
 from typing import cast
 
 import torch

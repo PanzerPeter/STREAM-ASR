@@ -1,4 +1,4 @@
-# scripts/train_tokenizer.py — retrain BPE-500 on the 960h train transcripts
+# Retrain BPE-500 on the 960h train transcripts
 from src.slices.BuildManifest.TrainTokenizer_Command import TrainTokenizerCommand
 from src.slices.BuildManifest.TrainTokenizer_Handler import train_tokenizer
 

@@ -1,4 +1,4 @@
-# src/slices/Decode/InternalLmScorer.py — internal-LM estimation (ILME) for the RNN-T.
+# Internal-LM estimation (ILME) for the RNN-T.
 #
 # An RNN-T's score already contains a language prior: the predictor+joiner learned one from the
 # 960 h transcripts. Adding an external LM on top therefore counts language evidence twice, which

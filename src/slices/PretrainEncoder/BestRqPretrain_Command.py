@@ -1,4 +1,3 @@
-# src/slices/PretrainEncoder/BestRqPretrain_Command.py — input DTO (AC-009)
 from dataclasses import dataclass, field
 
 from src.shared_kernel.Config_Adapter import get_config
@@ -16,7 +15,7 @@ class BestRqPretrainCommand:
     device: str = "cuda"
     resume: bool = True
     # DataLoader worker processes; 0 forces single-process loading (CPU smoke test: forking after
-    # torch/OpenMP threads are live deadlocks — same footgun SP1's precompute_features hit).
+    # torch/OpenMP threads are live deadlocks — the same footgun precompute_features hit).
     num_workers: int = 2
     # Test hook: stop after N optimizer steps so the smoke test exercises the full loop cheaply.
     max_steps_smoke: int | None = None

@@ -54,9 +54,9 @@ def test_validation_rejects_bad_type(tmp_path):
 
 
 def test_bos_eos_decoder_vocab_ids():
-    # These label-space ids no longer back an acoustic attention decoder (deleted with the
-    # CTC/attention two-stage path), but STREAM-LM (TrainLanguageModel slice) still consumes them
-    # for BOS-conditioned next-token prediction, so they stay live on ModelConfig. BOS == EOS
+    # These label-space ids back no acoustic decoder — the acoustic model is a transducer — but
+    # STREAM-LM (TrainLanguageModel slice) consumes them for BOS-conditioned next-token
+    # prediction, so they stay live on ModelConfig. BOS == EOS
     # because the packed corpus separates lines with EOS and has no other start symbol.
     m = get_config().model
     assert m.bos_id == m.eos_id == 501

@@ -1,4 +1,4 @@
-# src/slices/Demo/serve_demo.py — entry point for the local demo server.
+# Entry point for the local demo server.
 # Loads the trained transducer checkpoint once, builds the Decode handler (offline for uploads, the
 # same config drives live StreamingSessions), and serves the browser UI on 127.0.0.1. Heavy/GPU
 # runs are the user's; this only holds one model resident and answers local requests.
@@ -21,7 +21,7 @@ from src.slices.Demo.DemoServer_Handler import build_app
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--checkpoint", default="data/checkpoints/transducer_best.pt")
+    ap.add_argument("--checkpoint", default="data/checkpoints/transducer_avg.pt")
     ap.add_argument("--tokenizer", default="data/tokenizer/bpe500.model")
     ap.add_argument("--host", default="127.0.0.1")  # local-only; no auth on this server
     ap.add_argument("--port", type=int, default=8000)
@@ -64,7 +64,9 @@ def main() -> None:
         f"STREAM ASR demo on http://{args.host}:{args.port}"
         f"  (device={device}, beam={handler.beam_size}, LM {lm})"
     )
-    uvicorn.run(build_app(handler), host=args.host, port=args.port, log_level="warning")
+    uvicorn.run(
+        build_app(handler, args.checkpoint), host=args.host, port=args.port, log_level="warning"
+    )
 
 
 if __name__ == "__main__":

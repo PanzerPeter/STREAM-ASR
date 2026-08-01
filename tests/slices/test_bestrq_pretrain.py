@@ -33,7 +33,7 @@ def test_pretrain_smoke_emits_warmstartable_encoder(tmp_path):
         device="cpu",
         max_steps_smoke=3,
         # CPU smoke test: worker processes fork after torch/OpenMP threads are already live, which
-        # deadlocks (same footgun SP1's precompute_features hit) — force single-process loading.
+        # deadlocks (the same footgun precompute_features hit) — force single-process loading.
         num_workers=0,
     )
     out = run_pretrain(cmd)

@@ -1,6 +1,6 @@
-# scripts/average_checkpoints.py — mean the tail of training's transducer_step{N}.pt snapshots into
-# one decode checkpoint (standard ASR checkpoint averaging). Point config/decode.yaml or
-# config/eval.yaml at the output. Snapshots come from TransducerTrainer's keep_last_n retention.
+# Mean the tail of training's transducer_step{N}.pt snapshots into one decode checkpoint (standard
+# ASR checkpoint averaging). Point config/decode.yaml or config/eval.yaml at the output. Snapshots
+# come from TransducerTrainer's keep_last_n retention.
 import argparse
 import glob
 import os

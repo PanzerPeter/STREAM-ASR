@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from src.shared_kernel.Config_Adapter import get_config
 
@@ -16,12 +17,27 @@ class TransducerJoiner(nn.Module):
         self.enc_proj = nn.Linear(model.encoder_dims[-1], t.joiner_dim)
         self.pred_proj = nn.Linear(t.predictor_dim, t.joiner_dim)
         self.out = nn.Linear(t.joiner_dim, model.logits_width)
+        # The readout is the model's largest GEMM by a wide margin (it is the only one that runs
+        # over the whole [B, T, U+1] lattice), and its N is logits_width = vocab + blank = 501.
+        # A bf16 tensor-core GEMM needs its N stride 16-byte aligned to reach the fast kernels;
+        # 501 * 2 bytes is not, so cuBLAS picks an alignment-2 fallback that measured 29 TFLOPS
+        # against 57 at N = 504. Rounding N up to a multiple of 8 is worth 14% of the whole
+        # training step. The padded columns carry a -inf bias, so exp() of their logit is exactly
+        # 0: every log-softmax, gather and softmax downstream is bit-for-bit the 501-wide result,
+        # their gradient is exactly 0, and the parameters stay 501-wide so checkpoints are
+        # unaffected. Kept out of `step()`, which is one cell wide and GEMM-bound by nothing.
+        self._pad = -model.logits_width % 8
 
     def forward(self, enc: torch.Tensor, pred: torch.Tensor) -> torch.Tensor:
         # enc [B, T, De], pred [B, U', Dp] -> [B, T, U', V] via broadcast over the (T, U') grid.
         e = self.enc_proj(enc).unsqueeze(2)  # [B, T, 1, J]
         p = self.pred_proj(pred).unsqueeze(1)  # [B, 1, U', J]
-        return self.out(torch.tanh(e + p))
+        h = torch.tanh(e + p)
+        return F.linear(
+            h,
+            F.pad(self.out.weight, (0, 0, 0, self._pad)),
+            F.pad(self.out.bias, (0, self._pad), value=float("-inf")),
+        )
 
     def step(self, enc_t: torch.Tensor, pred_u: torch.Tensor) -> torch.Tensor:
         # enc_t [B, De], pred_u [B, Dp] -> [B, V] for a single decode cell.

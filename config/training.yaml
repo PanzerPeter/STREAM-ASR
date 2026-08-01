@@ -1,9 +1,42 @@
 transducer:
   max_frames_per_batch: 18000    # frame budget (base of the frame×token bucket)
-  max_tokens_per_batch: 4000     # transcript-char budget: caps the RNN-T joiner lattice B*T*(U+1)
+  max_tokens_per_batch: 4000     # transcript-char budget (sum over the batch)
+  # Worst-case cap on the RNN-T joiner lattice, in units of B * max(frames) * max(chars). The two
+  # budgets above are sums, so they bound the *average* batch and leave the tail free: the densest
+  # batch of a train_sp epoch ran 1.7x the p99.9 one, which is what produced periodic
+  # "CUDA OOM - batch dropped". 6.0e6 clips that tail for +14 batches in 60,347, mean batch size
+  # unchanged. Raise it if you raise max_frames_per_batch.
+  max_lattice_per_batch: 6000000
+  # Re-sort by transcript length inside a sliding window of the duration sort, so a batch is
+  # homogeneous in U as well as in T and the lattice is not charged for the spread. Measured over
+  # train.jsonl: lattice padding waste 21.6% -> 13.9% (-8.8% cells) at an unchanged batch count,
+  # frame padding still 0.2%, and end to end 138 -> 126 ms/step with peak VRAM 5.36 -> 5.06 GiB.
+  # 1 = off (plain duration sort); 256/1024/4096 measure 15.0/13.9/15.3% waste. Off by default
+  # because making every batch homogeneous in transcript length is a training-semantics change no
+  # run has isolated yet -- the recipe that shipped 3.55% test-clean did not have it.
+  token_sort_window: 1
   grad_accum: 4
   warmup_steps: 10000
   total_steps: 175000
+  # LR shape after warmup: hold the stable level, then a 1-sqrt anneal over the last lr_decay_frac
+  # of the budget. Preferred over `cosine` because cosine's total_steps IS its curve — bumping it
+  # mid-run re-heats the LR at the resume step — whereas under WSD the same bump only moves the
+  # decay window. Full rationale in TrainAcousticModel/CONTEXT.md.
+  lr_schedule: wsd
+  # Stable-phase level as a fraction of the peak LRs in optim.yaml. 1.0 is the fresh-run recipe;
+  # **set it back to 1.0 for any run started with --fresh**. 0.45 is a splice value: it continues a
+  # run already 96k steps into the old single cosine, whose shape there was 0.47, so the switch to
+  # WSD resumes at the LR that run had reached instead of re-heating a settled encoder.
+  #
+  # MEASURED 2026-07-30: a fresh 175k run left at 0.45 by mistake came out WORSE, not better --
+  # full-dev ctc-WER 0.0633 vs the spliced run's 0.0610, test-clean greedy 4.82 %/6.64 % and beam
+  # 4.57 %/6.31 % (offline/streaming, `_best` checkpoint) against 4.50/6.27 and 4.30/5.95 from the
+  # spliced run's averaged checkpoint. Its dev/transducer_wer probe looked far better (0.0455 vs
+  # 0.0622) -- do not believe that number across runs: the probe is ~1k words and its sampling
+  # changed between the two runs. The encoder wants the full peak early.
+  lr_stable_ratio: 1.0
+  lr_decay_frac: 0.25            # last 25% of total_steps = the anneal window
+  lr_min_ratio: 0.01             # floor: an LR reaching exactly 0 wastes the last few k steps
   weight_decay: 1.0e-2
   grad_clip: 5.0
   log_every: 50
@@ -14,5 +47,5 @@ transducer:
   chunk_sizes: [0, 16, 32]       # 0 = full context; 16/32 = base-rate frames sampled per batch
   warm_start: data/checkpoints/bestrq_encoder.pt
   dev_wer_utts: 200              # #dev utterances for the periodic greedy-transducer WER probe
-  spec_augment: true             # SpecAugment on the log-mel input during training (regularisation)
-  keep_last_n: 5                 # rolling transducer_step{N}.pt snapshots kept for checkpoint averaging (0 = off)
+  spec_augment: true             # SpecAugment on the log-mel input during training
+  keep_last_n: 5                 # rolling transducer_step{N}.pt kept for averaging (0 = off)

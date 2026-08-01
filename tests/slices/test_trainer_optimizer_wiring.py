@@ -1,4 +1,3 @@
-# tests/slices/test_trainer_optimizer_wiring.py
 import torch
 import torch.nn as nn
 
@@ -21,9 +20,9 @@ def test_optimizers_step_and_schedule_as_list():
 
 
 def test_shape_schedule_preserves_distinct_muon_and_adamw_peaks():
-    # Regression lock for the SP3 LR bug: the per-group shape schedule the trainers apply
-    # (peak * lr_shape) must keep Muon's large base LR (2e-2) distinct from AdamW's (1.5e-3).
-    # The old absolute overwrite collapsed both to one value, silently training Muon ~13x too low.
+    # Regression lock: the per-group shape schedule the trainers apply (peak * lr_shape) must keep
+    # Muon's large base LR (2e-2) distinct from AdamW's (1.5e-3). An absolute overwrite would
+    # collapse both to one value, silently training Muon ~13x too low.
     class _M(nn.Module):
         def __init__(self):
             super().__init__()

@@ -1,4 +1,4 @@
-# src/slices/Demo/TranscriptFormat.py — presentation-only readability pass for demo output.
+# Presentation-only readability pass for demo output.
 # The tokenizer is trained on LibriSpeech transcripts, which are upper-case and unpunctuated, so a
 # raw decode reads as "MISTER QUILTER IS THE APOSTLE". That is exactly what Evaluate must score
 # against the references, so the Decode slice keeps emitting it verbatim -- the cosmetic pass lives

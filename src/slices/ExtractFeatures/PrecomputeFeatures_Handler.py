@@ -1,4 +1,3 @@
-# src/slices/ExtractFeatures/PrecomputeFeatures_Handler.py
 # One-time pass: decode + log-mel every utterance and write the fp16 memmap cache. Decoding is the
 # cost, so it runs in a process pool; imap preserves manifest row order (the collator/sampler index
 # the cache by row), and the main process streams results straight into write_feature_cache.

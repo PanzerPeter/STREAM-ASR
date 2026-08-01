@@ -10,6 +10,9 @@ def test_dtos_are_frozen():
         text="hi",
         segments=[SegmentResult("hi", [("hi", -0.1)])],
         rtf=0.2,
+        decode_s=0.4,
+        audio_s=2.0,
+        finalize_s=0.05,
         first_partial_latency_s=0.4,
     )
     assert resp.segments[0].text == "hi"

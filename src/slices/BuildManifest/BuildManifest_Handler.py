@@ -1,4 +1,7 @@
-# src/slices/BuildManifest/BuildManifest_Handler.py
+# Index a LibriSpeech split into a JSONL manifest. torchaudio 2.11 dropped its metadata backend, so
+# frame counts come from soundfile.info reading the FLAC header directly (no TorchCodec/FFmpeg).
+# Header reads are IO-bound, so a process pool over ~281k utterances turns minutes of serial
+# probing into seconds.
 import json
 import multiprocessing as mp
 import os
@@ -7,10 +10,6 @@ from glob import glob
 import soundfile as sf
 
 from src.slices.BuildManifest.BuildManifest_Command import BuildManifestCommand
-
-# torchaudio 2.11 dropped its metadata backend; soundfile.info reads the FLAC header for frame
-# counts without pulling in TorchCodec/FFmpeg. Header reads are IO-bound, so a process pool over
-# ~281k utterances turns minutes of serial probing into seconds.
 
 
 def _probe(task: tuple[str, str, str]) -> tuple[str, str, str, int]:

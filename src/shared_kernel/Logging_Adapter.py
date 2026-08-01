@@ -1,4 +1,4 @@
-# src/shared_kernel/Logging_Adapter.py — loguru sink setup (cross-cutting infra)
+# Loguru sink setup (cross-cutting infra)
 import sys
 
 from loguru import logger

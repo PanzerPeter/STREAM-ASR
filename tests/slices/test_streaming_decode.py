@@ -48,7 +48,12 @@ def test_streaming_and_offline_paths_run(tmp_path):
         o = handler.decode(StreamingDecode_Command(audio_path=path, streaming=False))
     assert isinstance(s.text, str) and isinstance(o.text, str)
     assert s.rtf > 0 and math.isfinite(o.rtf)
-    assert s.first_partial_latency_s >= 0 and o.first_partial_latency_s == 0.0
+    # Offline has no partials, so its latency is None -- 0.0 would read as "instant", not "n/a".
+    assert s.first_partial_latency_s is not None and s.first_partial_latency_s >= 0
+    assert o.first_partial_latency_s is None
+    # rtf is exactly the ratio of the two terms reported alongside it (corpus RTF sums them).
+    assert abs(o.rtf - o.decode_s / o.audio_s) < 1e-9
+    assert 0.0 <= o.finalize_s <= o.decode_s
     assert len(s.segments) >= 1 and len(o.segments) >= 1
 
 
@@ -120,8 +125,8 @@ def test_nbest_for_rescore_requires_lm():
 
 def test_length_bonus_reorders_toward_longer_hypotheses():
     # length_bonus adds length_bonus*len(ids) at n-best re-ranking. With no LM, a large enough bonus
-    # must promote a longer hypothesis over a shorter one that led on pure acoustic score; a bonus of
-    # 0.0 must leave the acoustic order byte-identical (the regression lock).
+    # must promote a longer hypothesis over a shorter one that led on pure acoustic score; a bonus
+    # of 0.0 must leave the acoustic order byte-identical (the regression lock).
     torch.manual_seed(0)
     model = TransducerModel(cmvn_path=None).eval()
     handler = StreamingDecoder_Handler(model, _StubTok(), fuse_lm=False)

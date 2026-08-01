@@ -1,10 +1,6 @@
-# src/slices/TrainLanguageModel/StreamLmModel.py
 # STREAM-LM: deep-narrow causal Transformer. Reuses shared BiasNorm/SwiGluFfn + RoPE; adds GQA
 # (CausalGqaAttention), QK-norm, tied embeddings, and value-residual (layer-0 values injected into
-# every deeper layer). Inference exposes a full-sequence scorer (rescore) and an incremental
-# next-token scorer (shallow fusion).
-from typing import cast
-
+# every deeper layer). Inference exposes a full-sequence scorer for n-best rescoring.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,7 +8,7 @@ import torch.nn.functional as F
 from src.shared_kernel.BiasNorm import BiasNorm
 from src.shared_kernel.SwiGluFfn import SwiGluFfn
 from src.shared_kernel.Config_Adapter import get_config
-from src.slices.TrainLanguageModel.CausalGqaAttention import CausalGqaAttention, KvCache
+from src.slices.TrainLanguageModel.CausalGqaAttention import CausalGqaAttention
 
 
 class _Block(nn.Module):
@@ -36,14 +32,6 @@ class _Block(nn.Module):
         x = x + a
         x = x + self.ffn(self.norm_ffn(x))
         return x, v
-
-    def step(
-        self, x_t: torch.Tensor, cache: KvCache, value_residual: torch.Tensor | None
-    ) -> tuple[torch.Tensor, torch.Tensor, KvCache]:
-        a, v, cache = self.attn.step(self.norm_attn(x_t), cache, value_residual)
-        x_t = x_t + a
-        x_t = x_t + self.ffn(self.norm_ffn(x_t))
-        return x_t, v, cache
 
 
 class StreamLmModel(nn.Module):
@@ -121,32 +109,3 @@ class StreamLmModel(nn.Module):
             lengths, device=device
         ).unsqueeze(1)
         return (picked * valid).sum(dim=1).tolist()
-
-    def step_logprob(
-        self, token: int, state: list[KvCache] | None
-    ) -> tuple[torch.Tensor, list[KvCache]]:
-        # state: (list[KvCache] per block, v0 for the current step start) or None to begin at BOS.
-        device = self.tok_emb.weight.device
-        lm = get_config().lm
-        if state is None:
-            # ModuleList.__getitem__ is typed to return the base Module; cast to recover
-            # the concrete _Block so mypy sees .attn.head_dim (int), matching the codebase's
-            # existing ModuleList-indexing idiom (see ZipformerStack.streaming_forward).
-            head_dim = cast(_Block, self.blocks[0]).attn.head_dim
-            caches = [
-                KvCache.empty(1, lm.kv_groups, head_dim, device, self.tok_emb.weight.dtype)
-                for _ in self.blocks
-            ]
-        else:
-            caches = state
-        x = self.tok_emb(torch.tensor([[token]], device=device))
-        v0 = None
-        new_caches = []
-        for i, blk_module in enumerate(self.blocks):
-            blk = cast(_Block, blk_module)
-            x, v, c = blk.step(x, caches[i], value_residual=None if i == 0 else v0)
-            if i == 0:
-                v0 = v
-            new_caches.append(c)
-        logp = F.log_softmax(self.head(self.norm_out(x))[0, 0], dim=-1)
-        return logp, new_caches

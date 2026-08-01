@@ -1,4 +1,3 @@
-# scripts/compute_cmvn.py
 from src.slices.ComputeCmvn.ComputeCmvn_Command import ComputeCmvnCommand
 from src.slices.ComputeCmvn.ComputeCmvn_Handler import compute_cmvn
 

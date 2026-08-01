@@ -1,5 +1,16 @@
 # Corpus evaluation + ablation. Stages run cumulatively over the single-pass transducer: greedy
-# (beam_size=1) -> beam (full beam search) -> beam+LM (shallow fusion), so the report shows each
+# (beam_size=1) -> beam (full beam search) -> beam+LM (n-best rescoring), so the report shows each
 # component's WER/CER/RTF/latency contribution.
 ablation_stages: ["greedy_transducer", "beam", "beam_lm"]
-report_path: runs/eval/report.json
+# {split} is filled with the --clean/--other condition, so a test-other run cannot overwrite the
+# test-clean report.
+report_path: runs/eval/report-{split}.json
+# Worker PROCESSES decoding the ablation passes concurrently in the QUALITY pass. A single decode
+# leaves the GPU ~70 % idle (the RNN-T beam is Python-bound), so overlapping the six stage x mode
+# passes is what fills it. Measured 1 -> 6 workers on the 5070: 96.0 s -> 53.5 s, GPU 31 % -> 85 %,
+# VRAM 2.4 -> 5.3 GB; the curve is flat past ~3-4, so 4 buys nearly all of it inside 12 GB. Timing
+# is measured in a separate serial pass, so this costs accuracy nothing -- only VRAM.
+workers: 4
+# Utterances (evenly strided) in the serial, contention-free timing pass that produces the reported
+# RTF / first-partial latency / finalize cost. 0 skips it and reports them as null.
+rtf_probe_utts: 200

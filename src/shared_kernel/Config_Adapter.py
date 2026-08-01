@@ -1,6 +1,7 @@
-# src/shared_kernel/Config_Adapter.py — YAML-backed, pydantic-validated run config (infra)
+# YAML-backed, pydantic-validated run config (infra)
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 import yaml
 from pydantic import BaseModel, computed_field
@@ -54,10 +55,9 @@ class ModelConfig(BaseModel):
     def logits_width(self) -> int:
         return self.vocab_size + 1
 
-    # bos_id/eos_id/decoder_vocab_size: the acoustic model's attention decoder (Stage-B, U2++) that
-    # originally motivated this label space is gone (SP5 transducer replaces it), but STREAM-LM
-    # (TrainLanguageModel slice) still frames next-token prediction as BOS-conditioned generation
-    # over this same vocab, so the ids stay live.
+    # bos_id/eos_id/decoder_vocab_size: the acoustic model is a transducer and has no attention
+    # decoder, but STREAM-LM (TrainLanguageModel slice) frames next-token prediction as
+    # BOS-conditioned generation over this same vocab, so the ids stay live.
     #
     # BOS *is* EOS on purpose. PrepareLmData packs the corpus as `line tokens + eos_id` with no
     # separate start symbol, so the only sentence-start context the LM is ever trained on is
@@ -90,14 +90,26 @@ class TransducerConfig(BaseModel):
     ctc_aux_weight: float
     interctc_layers: tuple[int, ...]
     interctc_weights: tuple[float, ...]
+    cr_ctc: bool = False
+    cr_weight: float = 0.2
 
 
 class TransducerTrainConfig(BaseModel):
     max_frames_per_batch: int
     max_tokens_per_batch: int
+    max_lattice_per_batch: int
+    # Width of the transcript-length re-sort inside the duration sort (FrameBucketSampler). 1 = off.
+    token_sort_window: int = 1
     grad_accum: int
     warmup_steps: int
     total_steps: int
+    # LR shape after warmup. "wsd" = hold lr_stable_ratio * peak until the last lr_decay_frac of
+    # total_steps, then 1-sqrt anneal to lr_min_ratio * peak; "cosine" = anneal from step
+    # warmup_steps to lr_min_ratio * peak at total_steps. Both land at total_steps exactly.
+    lr_schedule: Literal["cosine", "wsd"] = "cosine"
+    lr_stable_ratio: float = 1.0
+    lr_decay_frac: float = 0.25
+    lr_min_ratio: float = 0.0
     weight_decay: float
     grad_clip: float
     log_every: int
@@ -133,6 +145,9 @@ class DecodeConfig(BaseModel):
     # lowers the score -- a standing bias toward deletions. A small positive bonus offsets it. 0.0 =
     # off (regression lock); swept alongside lm_weight in the eval tuner.
     length_bonus: float = 0.0
+    # Capture the RNN-T beam's predictor+joiner step in a CUDA graph (opt-in, CUDA-only). Identical
+    # numerics to eager; false keeps the eager launch-per-step path (the default).
+    cuda_graph: bool = False
 
 
 class LmConfig(BaseModel):
@@ -153,8 +168,12 @@ class LmConfig(BaseModel):
     weight_decay: float
     grad_clip: float
     batch_size: int
+    # batch_size is the EFFECTIVE (optimiser-step) batch; it is split into grad_accum micro-batches
+    # so peak activation memory scales with batch_size/grad_accum while the gradient is unchanged.
+    grad_accum: int = 1
     eval_interval: int
     log_every: int
+    ckpt_every: int
     subset_words: int
     val_words: int
     seed: int
@@ -162,7 +181,9 @@ class LmConfig(BaseModel):
 
 class EvalConfig(BaseModel):
     ablation_stages: tuple[str, ...]
-    report_path: str
+    report_path: str  # may contain a {split} placeholder (clean|other)
+    workers: int
+    rtf_probe_utts: int
 
 
 class OptimConfig(BaseModel):

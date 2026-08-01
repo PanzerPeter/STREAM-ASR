@@ -1,6 +1,5 @@
-# src/slices/PretrainEncoder/MelOnlyDataset.py
-# BEST-RQ ignores transcripts, so pretraining reads only cached log-mel (SP1 fp16 mmap cache) — the
-# lightest possible item path, keeping the pretrain loop GPU-bound (SP4).
+# BEST-RQ ignores transcripts, so pretraining reads only the cached fp16 log-mel mmap — the
+# lightest possible item path, keeping the pretrain loop GPU-bound.
 import json
 
 import torch

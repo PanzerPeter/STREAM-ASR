@@ -1,7 +1,10 @@
-# src/shared_kernel/Checkpoint_Adapter.py
+# Checkpoint infrastructure shared by every trainer: atomic save, restore-and-resume (model +
+# optimizers + step + RNG), and post-training weight averaging. Every write goes through a .tmp +
+# os.replace so an interrupt can never leave a truncated checkpoint behind.
 import math
 import os
 import random
+from typing import Any
 
 import torch
 
@@ -25,7 +28,7 @@ def save_checkpoint(
 ) -> None:
     # Atomic write: torch.save to a sibling .tmp then os.replace (a same-dir rename is atomic on
     # POSIX), so a process killed mid-write never truncates the live checkpoint — at worst it leaves
-    # an orphan .tmp. This is the core of the SIGINT-safe harness (SP2).
+    # an orphan .tmp. This is the core of the SIGINT-safe training harness.
     payload = {
         "model": model.state_dict(),
         "optimizers": [o.state_dict() for o in _as_list(optimizers)],
@@ -109,15 +112,19 @@ def resume_if_available(
     model: torch.nn.Module,
     optimizers: list[torch.optim.Optimizer],
     resume: bool,
-) -> dict[str, float]:
-    # Pragmatic resume (SP2): restore weights/optimizer(s)/step/best_wer/RNG, and bump resume_count
+) -> dict[str, Any]:
+    # Pragmatic resume: restore weights/optimizer(s)/step/best_wer/RNG, and bump resume_count
     # so the caller can reseed a *fresh* shuffled epoch (base_seed + resume_count) rather than
     # replay the exact pre-interrupt batch order — indistinguishable in final WER over a long run.
+    # `extra` rides along because not every trainer selects on WER: the LM's best-so-far metric is
+    # validation perplexity, which lives there and must survive a restart or the first post-resume
+    # eval overwrites lm_best.pt with a worse model.
     if not resume or not os.path.isfile(ckpt_path):
-        return {"step": 0, "best_wer": math.inf, "resume_count": 0}
+        return {"step": 0, "best_wer": math.inf, "resume_count": 0, "extra": {}}
     meta = load_checkpoint(ckpt_path, model, optimizers)
     return {
         "step": meta["step"],
         "best_wer": meta["best_wer"],
         "resume_count": meta["resume_count"] + 1,
+        "extra": meta["extra"],
     }

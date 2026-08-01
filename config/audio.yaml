@@ -1,6 +1,8 @@
+# Log-mel front end. Fixed contract: the feature cache header, cmvn.pt and every checkpoint are
+# tied to these values, so changing one invalidates all three.
 sample_rate: 16000
 n_mels: 80
 n_fft: 400
 win_length: 400
-hop_length: 160
+hop_length: 160              # 100 fps
 cmvn_eps: 1.0e-5

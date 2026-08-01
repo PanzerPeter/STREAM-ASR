@@ -1,8 +1,19 @@
-# config/transducer.yaml — RNN-T transducer architecture (SP5). Arch params only; the training
-# loop's hyperparameters live in training.yaml's `transducer:` section, decode params in decode.yaml.
+# RNN-T transducer architecture. Arch params only: the training loop's hyperparameters live in
+# training.yaml's `transducer:` section, decode params in decode.yaml.
 predictor_dim: 512        # token embedding width == stateless-predictor output width
 predictor_context: 2      # depthwise Conv1d left context (icefall-style stateless predictor)
 joiner_dim: 512           # additive joiner hidden width
 ctc_aux_weight: 0.2       # total = rnnt + ctc_aux_weight*ctc + sum(interctc_weights*interctc_k)
 interctc_layers: [3, 4]   # tap after the two widest encoder stacks (base-rate ~50Hz)
 interctc_weights: [0.15, 0.15]
+
+# CR-CTC (Yao et al. 2024): train-time consistency regularisation of the CTC head across two
+# independently SpecAugment-masked views, via bidirectional KL on their frame posteriors. The
+# second view costs a second encoder forward, so on 12 GB pair it with grad_checkpoint: true or a
+# lower max_frames_per_batch. The RNN-T lattice is computed on view 1 ONLY.
+#
+# OFF: a full 164k-step run reached dev transducer-WER 0.0674 vs the shipped recipe's 0.0553, with
+# InterCTC and grad-norm climbing through the tail — it over-regularises this model at this budget.
+# Re-enable only alongside a retune of cr_weight / ctc_aux_weight.
+cr_ctc: false
+cr_weight: 0.2            # weight on the consistency KL term; 0 disables even with cr_ctc on

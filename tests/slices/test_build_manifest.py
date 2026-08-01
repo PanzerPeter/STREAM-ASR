@@ -26,3 +26,24 @@ def test_build_manifest_parallel_sorted(tmp_path):
     assert [r["uttid"] for r in lines] == ["a-1", "b-2"]  # sorted by uttid
     assert lines[0]["num_samples"] == 8000
     assert lines[1]["num_samples"] == 16000
+
+
+def test_speed_perturb_manifest_triples_rows_and_corrects_samples(tmp_path):
+    from src.slices.BuildManifest.SpeedPerturbManifest_Command import SpeedPerturbManifestCommand
+    from src.slices.BuildManifest.SpeedPerturbManifest_Handler import (
+        build_speed_perturb_manifest,
+    )
+
+    src = tmp_path / "train.jsonl"
+    src.write_text(
+        json.dumps({"uttid": "a-1", "audio_filepath": "x.flac", "text": "HI", "num_samples": 9000})
+        + "\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "train_sp.jsonl"
+    n = build_speed_perturb_manifest(SpeedPerturbManifestCommand(str(src), str(out)))
+    rows = {r["speed"]: r for r in (json.loads(x) for x in out.read_text().splitlines())}
+    assert n == 3 and set(rows) == {0.9, 1.0, 1.1}
+    assert rows[1.0]["uttid"] == "a-1" and rows[1.0]["num_samples"] == 9000  # original untouched
+    assert rows[0.9]["uttid"] == "a-1_sp0.9" and rows[0.9]["num_samples"] == round(9000 / 0.9)
+    assert rows[1.1]["num_samples"] == round(9000 / 1.1)  # faster -> fewer samples

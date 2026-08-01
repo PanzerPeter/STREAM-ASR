@@ -10,7 +10,7 @@ from src.shared_kernel.Config_Adapter import get_config
 
 def test_collate_produces_padded_batch():
     tok = SentencePieceTokenizer("data/tokenizer/bpe500.model")
-    ds = LibriSpeechDataset("data/manifests/dev.jsonl", tok, train=False)
+    ds = LibriSpeechDataset("data/manifests/dev.jsonl", tok)
     loader = DataLoader(ds, batch_size=4, collate_fn=collate_features)
 
     batch = next(iter(loader))

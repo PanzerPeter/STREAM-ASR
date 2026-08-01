@@ -1,6 +1,6 @@
 # Maximal Update Parametrization helpers (Yang & Hu, muTransfer). muP keeps per-layer activation and
 # update scale width-invariant so a learning rate tuned at a small proxy width transfers to a larger
-# target width — the mechanism for a future cheap encoder-size search (SP3). Hidden Adam LRs scale
+# target width — the mechanism for a cheap encoder-size search. Hidden Adam LRs scale
 # 1/width via the per-param _mup_lr_scale tag; the readout uses a 1/fan_in forward multiplier and
 # zero-init. All tags default to no-op so a non-muP model is unaffected.
 import math

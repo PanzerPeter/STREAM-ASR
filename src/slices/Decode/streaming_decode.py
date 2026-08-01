@@ -13,7 +13,7 @@ from src.slices.Decode.StreamingDecode_Command import StreamingDecode_Command
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("audio_path")
-    ap.add_argument("--checkpoint", default="data/checkpoints/transducer_best.pt")
+    ap.add_argument("--checkpoint", default="data/checkpoints/transducer_avg.pt")
     ap.add_argument("--tokenizer", default="data/tokenizer/bpe500.model")
     ap.add_argument("--offline", action="store_true")
     args = ap.parse_args()
@@ -27,9 +27,11 @@ def main() -> None:
         resp = handler.decode(
             StreamingDecode_Command(audio_path=args.audio_path, streaming=not args.offline)
         )
+    lat = resp.first_partial_latency_s
     print(
         f"[{'offline' if args.offline else 'streaming'}] rtf={resp.rtf:.3f} "
-        f"latency={resp.first_partial_latency_s:.3f}s"
+        f"audio={resp.audio_s:.2f}s decode={resp.decode_s:.2f}s finalize={resp.finalize_s:.3f}s "
+        f"first_partial={'n/a (offline)' if lat is None else f'{lat:.3f}s'}"
     )
     print(resp.text)
 

@@ -1,4 +1,3 @@
-# src/slices/TrainAcousticModel/ZipformerEncoder.py
 import math
 import os
 from typing import cast
@@ -18,7 +17,7 @@ from src.slices.TrainAcousticModel.StreamCache import FrontendCache, StreamCache
 class ZipformerEncoder(nn.Module):
     """Acoustic encoder. log-mel -> CMVN -> ×2 conv -> 6 multi-rate stacks -> ×2 downsample
     -> BiasNorm. Output ~25 Hz. The (features, lengths) -> (encoded, out_lengths) signature is
-    the frozen contract the CTC/attention heads and streaming inference depend on."""
+    the frozen contract the CTC heads, the transducer joiner and streaming inference depend on."""
 
     cmvn_mean: torch.Tensor
     cmvn_std: torch.Tensor

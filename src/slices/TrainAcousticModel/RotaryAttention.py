@@ -1,4 +1,3 @@
-# src/slices/TrainAcousticModel/RotaryAttention.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -9,10 +8,10 @@ from src.slices.TrainAcousticModel.StreamCache import AttnCache
 
 
 class RotaryAttention(nn.Module):
-    """Multi-head self-attention with rotary position embeddings. RoPE is applied to q/k
-    before the fused SDPA kernel (flash / mem-efficient under bf16 autocast), so the
-    [B, H, T, T] score matrix is never materialized. SDPA's default scale (1/sqrt(head_dim))
-    and its attn-weight dropout match the previous manual matmul→mask→softmax→matmul path."""
+    """Multi-head self-attention with rotary position embeddings. RoPE is applied to q/k before
+    the fused SDPA kernel (flash / mem-efficient under bf16 autocast), so the [B, H, T, T] score
+    matrix is never materialized. Scaling is SDPA's default 1/sqrt(head_dim) and dropout is on the
+    attention weights, matching the textbook matmul→mask→softmax→matmul formulation."""
 
     def __init__(
         self,

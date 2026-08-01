@@ -1,4 +1,3 @@
-# src/slices/TrainLanguageModel/LmDataset.py
 # Memmapped uint16 token stream -> contiguous next-token windows. nanoGPT-style: cheap random
 # access, no per-item tokenization.
 #

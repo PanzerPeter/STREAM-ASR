@@ -1,7 +1,7 @@
-# BEST-RQ pretraining head over the existing ZipformerEncoder (SP4). The encoder sees span-masked
+# BEST-RQ pretraining head over the ZipformerEncoder. The encoder sees span-masked
 # log-mel; the frozen quantizer labels the CLEAN log-mel (CMVN-normalized, then frame-stacked to the
 # encoder's ~25 Hz output grid). Cross-entropy is computed only on masked, valid output positions.
-# Warm-start later loads encoder.* into AcousticModel and discards pred_head.
+# Warm-start later loads encoder.* into TransducerModel and discards pred_head.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

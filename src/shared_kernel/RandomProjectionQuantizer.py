@@ -1,7 +1,7 @@
 # BEST-RQ target generator (Chiu et al. 2022): FROZEN random linear projection + FROZEN L2-normed
 # random codebook turn input features into discrete labels the encoder learns to predict.
 # Nothing trains here — targets are a fixed, seeded input function; simpler and more stable
-# than a learned quantizer (SP4).
+# than a learned quantizer.
 import torch
 import torch.nn as nn
 

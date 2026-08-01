@@ -1,4 +1,3 @@
-# src/shared_kernel/Tokenizer_Adapter.py
 import sentencepiece as spm
 
 

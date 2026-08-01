@@ -1,4 +1,4 @@
-# scripts/precompute_features.py — build the fp16 log-mel cache for every split (heavy; one-time)
+# Build the fp16 log-mel cache for every split (heavy; one-time)
 from src.shared_kernel.Config_Adapter import get_config
 from src.slices.ExtractFeatures.PrecomputeFeatures_Command import PrecomputeFeaturesCommand
 from src.slices.ExtractFeatures.PrecomputeFeatures_Handler import precompute_features

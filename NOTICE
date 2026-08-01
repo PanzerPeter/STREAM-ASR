@@ -1,0 +1,29 @@
+STREAM ASR
+Copyright 2026 PanzerPeter
+
+This product includes software developed as part of the STREAM ASR project
+(https://github.com/PanzerPeter/STREAM-ASR).
+
+Licensed under the Apache License, Version 2.0. You may use, modify and
+distribute this software freely, for personal, academic and commercial
+purposes alike, including in closed-source products.
+
+ATTRIBUTION
+-----------
+Section 4(d) of the License requires that this NOTICE be carried into any
+Derivative Work you distribute. In practice that means: if you ship a
+product, model, paper or repository built on STREAM ASR — or on a
+substantially derived version of it — include a visible credit reading
+
+    Based on STREAM ASR (https://github.com/PanzerPeter/STREAM-ASR),
+    Copyright 2026 PanzerPeter, licensed under Apache-2.0.
+
+in your documentation, about screen, third-party notices file, or wherever
+you list the other open-source components you use. No permission request and
+no royalty is required; the credit is.
+
+The trained model checkpoints and the derived data artifacts (manifests,
+tokenizer, CMVN statistics, feature caches) are covered by the same terms.
+LibriSpeech itself is distributed by its own authors under CC BY 4.0 and is
+not part of this repository.
+</content>

@@ -38,8 +38,8 @@ def test_muon_step_reduces_quadratic_loss():
 
 def test_muon_rejects_non_2d_params():
     # Lock the 2D-only contract: routing a bias/1D (or any non-matrix) param to Muon must raise,
-    # not silently mis-orthogonalize — non-2D params belong on AdamW (Task 7's partition
-    # enforces this).
+    # not silently mis-orthogonalize — non-2D params belong on AdamW, which is what
+    # partition_params enforces.
     w = torch.nn.Parameter(torch.randn(8))  # 1D
     (w * 2).sum().backward()  # give it a real gradient so step() reaches the ndim check
     opt = Muon([w], lr=0.01)

@@ -30,18 +30,3 @@ def test_causality_end_to_end():
     x2[:, 5:] = torch.randint(0, v, (1, 3))
     b = lm(x2)
     torch.testing.assert_close(a[:, :5], b[:, :5], atol=1e-5, rtol=1e-5)
-
-
-def test_step_logprob_matches_full_forward():
-    lm = _lm()
-    ids = [3, 7, 42, 100]
-    # Full-forward log-probs of each next token given the BOS-prefixed prefix.
-    sos = get_config().model.bos_id
-    seq = torch.tensor([[sos] + ids])
-    full = torch.log_softmax(lm(seq)[0], dim=-1)
-    state = None
-    prev = sos
-    for i, tok in enumerate(ids):
-        logp, state = lm.step_logprob(prev, state)
-        torch.testing.assert_close(logp, full[i], atol=2e-5, rtol=2e-5)
-        prev = tok

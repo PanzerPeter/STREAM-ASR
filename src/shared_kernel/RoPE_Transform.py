@@ -1,4 +1,4 @@
-# src/shared_kernel/RoPE_Transform.py — pure RoPE tables + application (shared transform)
+# Pure RoPE tables + application (shared transform)
 import torch
 
 from src.shared_kernel.Config_Adapter import get_config

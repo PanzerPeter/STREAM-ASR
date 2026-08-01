@@ -126,7 +126,7 @@ def test_zipformer_block_shape_and_backward():
 
 
 def test_encoder_value_residual_gates_init_zero():
-    # Regression lock for the Stage-A blank-collapse fix: under the shipped config every deeper
+    # Regression lock for the blank-collapse fix: under the shipped config every deeper
     # block's value-residual gate must start at 0, so a fresh encoder trains identically to the
     # proven no-value-residual baseline. A non-zero default here re-introduces the collapse.
     from src.slices.TrainAcousticModel.ZipformerEncoder import ZipformerEncoder

@@ -26,7 +26,7 @@ def _forward_reference_greedy(
     model: TransducerModel, memory: torch.Tensor, t_len: int
 ) -> list[int]:
     # Ground-truth greedy computed via `predictor.forward` (batched) instead of `.step` (stateful).
-    # Task 3 proved `step(state, tok)` == `forward([..state, tok])[:, -1]`, so a history-based
+    # `step(state, tok)` == `forward([..state, tok])[:, -1]`, so a history-based
     # forward call is an independently-correct reference: it never touches the `state` threading
     # that the bug corrupts, so it fails to reproduce the bug and instead pins down truth.
     blank = get_config().model.blank_id

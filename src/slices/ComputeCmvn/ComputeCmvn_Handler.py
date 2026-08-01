@@ -1,4 +1,3 @@
-# src/slices/ComputeCmvn/ComputeCmvn_Handler.py
 import json
 import os
 import random

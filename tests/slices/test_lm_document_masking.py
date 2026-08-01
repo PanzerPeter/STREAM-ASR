@@ -31,8 +31,10 @@ def test_masked_forward_equals_scoring_each_line_alone():
         joint = lm(packed, segments=seg)
         alone_a = lm(torch.tensor([line_a]))
         alone_b = lm(torch.tensor([line_b]))
-    torch.testing.assert_close(joint[:, :3], alone_a, atol=2e-5, rtol=2e-5)
-    torch.testing.assert_close(joint[:, 3:], alone_b, atol=2e-5, rtol=2e-5)
+    # atol at 1e-4: exact-equivalence float error scales with d_model (512 accumulates ~4e-5), well
+    # below the O(1) gap a broken document mask would open, so the check stays meaningful.
+    torch.testing.assert_close(joint[:, :3], alone_a, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(joint[:, 3:], alone_b, atol=1e-4, rtol=1e-4)
 
 
 def test_unmasked_forward_still_sees_the_whole_window():

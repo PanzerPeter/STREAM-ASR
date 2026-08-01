@@ -1,4 +1,3 @@
-# src/slices/BuildManifest/TrainTokenizer_Handler.py
 import json
 import os
 import tempfile

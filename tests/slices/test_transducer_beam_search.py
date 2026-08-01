@@ -1,11 +1,11 @@
-# tests/slices/test_transducer_beam_search.py — TDD lock for TransducerBeamSearch (pure acoustic;
-# the LM now rescores the n-best in StreamingDecoder_Handler, not per step): greedy must match the
-# Task-8 trainer reference, and the time-synchronous A/B beam must return a well-formed, best-first,
-# duplicate-free n-best. NOTE: beam_size=1 is deliberately NOT asserted equal to greedy any more --
-# that identity only held for the earlier searcher that re-scored blank once per inner iteration
-# (over-counting blank). The corrected search scores blank exactly once per frame and marginalises
-# equal-prefix alignments via recombination, so its single-best is a true path score, not the
-# locally-argmax greedy heuristic. greedy() itself is unchanged and still anchored to the trainer.
+# TDD lock for TransducerBeamSearch (pure acoustic — the LM rescores the n-best in
+# StreamingDecoder_Handler, not per step): greedy must match the trainer's reference decode, and
+# the time-synchronous A/B beam must return a well-formed, best-first, duplicate-free n-best.
+#
+# NOTE: beam_size=1 is deliberately NOT asserted equal to greedy. That identity holds only for a
+# searcher that re-scores blank once per inner iteration, which over-counts blank; this search
+# scores blank exactly once per frame and marginalises equal-prefix alignments via recombination,
+# so its single-best is a true path score rather than the locally-argmax greedy heuristic.
 import math
 
 import torch
@@ -35,7 +35,7 @@ def test_greedy_matches_trainer_reference() -> None:
 
 def test_beam_size_one_returns_single_hypothesis() -> None:
     # beam=1 must still be a well-formed single-hypothesis search (the batched predictor+joiner
-    # wiring runs with a 1-row batch). We no longer assert equality with greedy (see module note).
+    # wiring runs with a 1-row batch). Equality with greedy is not asserted -- see module note.
     torch.manual_seed(1)
     model = TransducerModel(cmvn_path=None).eval()
     b = collate_features([(torch.randn(160, 80), [3, 4])])

@@ -46,9 +46,9 @@ def test_mup_activation_scale_is_width_invariant():
     rms = {w: _train_and_measure(w, base) for w in (128, 256, 512)}
     lo, hi = min(rms.values()), max(rms.values())
     # muP signature: hidden activation RMS stays ~constant as width grows (no blow-up / decay).
-    # Threshold at 1.8 (measured ~1.5720, so ~2.4% headroom under the old 1.6 bound was too tight
-    # for a BLAS/torch version bump); a true width blow-up reads well above 2, so 1.8 keeps the
-    # discriminating signal while cutting pinned-env flake risk.
+    # Threshold at 1.8: the measured ratio is ~1.5720, and a tighter 1.6 bound leaves only ~2.4%
+    # headroom -- inside the drift a BLAS/torch version bump can cause. A true width blow-up reads
+    # well above 2, so 1.8 keeps the discriminating signal while cutting pinned-env flake risk.
     assert hi / lo < 1.8, rms
 
 

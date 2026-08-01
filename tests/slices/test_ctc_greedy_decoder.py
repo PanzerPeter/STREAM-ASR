@@ -16,5 +16,5 @@ def test_greedy_collapses_repeats_and_drops_blank():
     logits = torch.full((1, len(path), V), -10.0)
     for t, idx in enumerate(path):
         logits[0, t, idx] = 10.0
-    out = ctc_greedy_decode(logits, torch.tensor([len(path)]), _FakeTok())
+    out = ctc_greedy_decode(logits.argmax(dim=-1), torch.tensor([len(path)]), _FakeTok())
     assert out == ["5 7"]

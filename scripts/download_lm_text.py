@@ -1,4 +1,4 @@
-# scripts/download_lm_text.py — one-time fetch of the LibriSpeech-LM normalized corpus.
+# One-time fetch of the LibriSpeech-LM normalized corpus.
 import sys
 import urllib.request
 from pathlib import Path

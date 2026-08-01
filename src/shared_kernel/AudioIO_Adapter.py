@@ -1,6 +1,9 @@
-# src/shared_kernel/AudioIO_Adapter.py
+# Audio load/resample adapter. torchaudio 2.11 removed its native decode backends (it delegates to
+# TorchCodec/FFmpeg), so every decode goes through soundfile, which reads FLAC via libsndfile with
+# no extra system deps; torchaudio is kept only for its pure-tensor resample kernel.
 import io
 import json
+from fractions import Fraction
 from typing import Any, BinaryIO
 
 import soundfile as sf
@@ -9,9 +12,10 @@ import torchaudio
 
 from src.shared_kernel.Config_Adapter import get_config
 
-# torchaudio 2.11 removed its native decode backends (delegates to TorchCodec/FFmpeg).
-# soundfile reads FLAC via libsndfile with no extra system deps, so decode goes through it;
-# torchaudio is kept only for the pure-tensor resample kernel.
+# limit_denominator keeps the resample ratio a small coprime integer pair (9/10, 11/10, ...). Raw
+# sample rates (e.g. 14400 -> 16000) are the coprime-resample footgun: torchaudio then builds a
+# needlessly huge polyphase kernel. 20 covers every standard speed factor to 3 decimals.
+_SPEED_RATIO_MAX_DENOM = 20
 
 
 def _decode(src: str | BinaryIO) -> torch.Tensor:
@@ -28,6 +32,16 @@ def _decode(src: str | BinaryIO) -> torch.Tensor:
         wave = torchaudio.functional.resample(wave, sr, sample_rate)
 
     return wave.squeeze(0).to(torch.float32)
+
+
+def speed_perturb(wave: torch.Tensor, speed: float) -> torch.Tensor:
+    # sox-style `speed s`: resample by 1/s and reinterpret at the original rate, changing tempo AND
+    # pitch. Output length ~= len / s. speed == 1.0 is a no-op. Fraction(1/s) num/denominator
+    # ARE the resample orig/new freqs, so a 0.9 factor resamples 9 -> 10 (length x10/9 = len/0.9).
+    if speed == 1.0:
+        return wave
+    ratio = Fraction(1.0 / speed).limit_denominator(_SPEED_RATIO_MAX_DENOM)
+    return torchaudio.functional.resample(wave, ratio.denominator, ratio.numerator)
 
 
 def load_audio(path: str) -> torch.Tensor:

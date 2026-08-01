@@ -43,8 +43,8 @@ def test_optim_config_loads():
 
 
 def test_partition_routes_transducer_modules():
-    # Regression lock for SP5 Task 7: transducer readouts/embeddings -> AdamW, joiner's hidden
-    # 2D projections -> Muon, matching the routing already locked for the hybrid model.
+    # Regression lock: transducer readouts/embeddings -> AdamW, joiner's hidden 2D projections
+    # -> Muon, matching the routing locked for the encoder.
     from src.slices.TrainAcousticModel.TransducerModel import TransducerModel
 
     m = TransducerModel(cmvn_path=None)
@@ -96,7 +96,7 @@ def test_encoder_lr_scale_downscales_encoder_groups():
 
 
 def test_mup_enabled_scales_adamw_group_lr():
-    # Lock the mup_enabled per-param-LR branch (SP3's muP machinery): a tagged head weight routed
+    # Lock the mup_enabled per-param-LR branch: a tagged head weight routed
     # to AdamW gets lr = adamw_lr * its _mup_lr_scale.
     from src.shared_kernel.Config_Adapter import OptimConfig
     from src.shared_kernel.mup import mup_linear_

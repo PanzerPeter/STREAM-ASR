@@ -1,4 +1,4 @@
-# src/slices/Decode/StreamingSession.py — a live microphone session for the Demo slice.
+# A live microphone session for the Demo slice.
 # Audio arrives incrementally (PCM chunks over a WebSocket); this drives the causal encoder
 # chunk-by-chunk and returns a running greedy-transducer hypothesis as a *partial*. When the
 # speaker stops, finalize() re-decodes the fully buffered waveform through the handler's verified
@@ -20,7 +20,7 @@ class StreamingSession:
     def __init__(self, handler: StreamingDecoder_Handler) -> None:
         # Reuses the handler's model/tokenizer/searcher (incl. any LM fusion) so a live session and
         # a file decode share one configuration; finalize() delegates back to it. The searcher is
-        # NOT rebuilt here -- self.h.searcher is the single TransducerBeamSearch Task 10 built.
+        # NOT rebuilt here -- self.h.searcher is the handler's single TransducerBeamSearch.
         self.h = handler
         self.cfg = handler.cfg
         self.device = handler.model.ctc_head.weight.device

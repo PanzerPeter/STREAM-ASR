@@ -1,4 +1,3 @@
-# src/slices/ExtractFeatures/FeatureCollator.py
 import torch
 
 from src.slices.ExtractFeatures.FeatureBatch_Response import FeatureBatch

@@ -1,3 +1,4 @@
+# Zipformer encoder architecture + shared vocab. ~53.8M encoder params.
 frontend_channels: 128
 encoder_dims: [192, 256, 384, 512, 384, 256]
 encoder_downsampling: [1, 2, 4, 8, 4, 2]
@@ -9,11 +10,9 @@ encoder_dropout: 0.1
 final_downsample: 2
 rope_base: 10000.0
 vocab_size: 500
-# Value residual (ResFormer/SVFormer): block-0 of each Zipformer stack injects its attention values
-# into the stack's deeper blocks, giving a gradient shortcut through attention so the stack trains
-# stably at depth. This is the INITIAL value of a *learnable per-block gate* — 0.0 means a fresh
-# encoder starts identical to a vanilla (no-value-residual) encoder and the residual is introduced
-# only as far as training wants it. Keep at 0.0: a fixed non-zero gate destabilises the CTC
-# blank-collapse escape in Stage A. Streaming caches post-residual values, so streaming_forward
-# stays exactly equal to the chunked forward (test_streaming_forward_equivalence).
+# Value residual (ResFormer/SVFormer): block-0 of each stack injects its attention values into the
+# stack's deeper blocks, a gradient shortcut through attention that keeps the stack stable at depth.
+# This is the INITIAL value of a *learnable per-block gate*, so 0.0 starts a fresh encoder identical
+# to a vanilla one and lets training introduce the residual only as far as it wants.
+# Keep at 0.0 — a fixed non-zero gate destabilises the early-training escape from CTC blank collapse.
 encoder_value_residual_lambda: 0.0

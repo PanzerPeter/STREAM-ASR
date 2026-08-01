@@ -1,7 +1,7 @@
-# wav2vec-style span masking on input log-mel for BEST-RQ pretraining: sample span
+# Wav2vec-style span masking on input log-mel for BEST-RQ pretraining: sample span
 # starts at mask_prob, extend each by mask_span, and overwrite masked frames with Gaussian
 # noise. The encoder sees the masked input while the quantizer labels come from the clean
-# input, so the model must infer masked content from context (SP4).
+# input, so the model must infer masked content from context.
 import torch
 
 

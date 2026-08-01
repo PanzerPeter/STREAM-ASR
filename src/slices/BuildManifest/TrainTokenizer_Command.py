@@ -1,4 +1,3 @@
-# src/slices/BuildManifest/TrainTokenizer_Command.py — input DTO (AC-009)
 from dataclasses import dataclass
 
 

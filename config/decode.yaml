@@ -1,17 +1,28 @@
-# Streaming/offline single-pass RNN-T decoder settings. chunk_size is in BASE-rate (50 fps) frames
-# and MUST be a multiple of ZipformerEncoder.chunk_lcm(); the handler feeds the encoder feature
-# chunks of 2*chunk_size.
+# Streaming/offline single-pass RNN-T decoder. chunk_size is in BASE-rate (50 fps) frames and MUST
+# be a multiple of ZipformerEncoder.chunk_lcm(); the handler feeds the encoder 2*chunk_size feature
+# frames per step.
 chunk_size: 16
 beam_size: 10
-# LM fusion. lm_weight (alpha) = 0.0 reproduces the pre-LM decoder exactly.
-lm_weight: 0.0
-# ILME subtraction weight (beta): the re-ranker subtracts beta * internal-LM logprob, cancelling
-# the language prior the transducer's own predictor+joiner already carries so the external LM is
-# not double-counting it. 0.0 = plain fusion (regression lock). Swept jointly with lm_weight by
-# evaluate.py --tune; useful range ~[0.0, 0.5] (it must stay below alpha or the prior flips sign).
-ilm_weight: 0.0
+max_symbols: 5               # max non-blank emissions per encoder frame
 lm_checkpoint: data/checkpoints/lm_best.pt
-max_symbols: 5   # max non-blank emissions per encoder frame in transducer beam search
-# Per-token re-ranking bonus (counters RNN-T's un-normalised deletion bias). 0.0 = off / regression
-# lock. Swept jointly with lm_weight by evaluate.py --tune. Try ~[0.0, 1.0] if deletions dominate.
+
+# n-best re-ranking: acoustic + lm_weight*lm - ilm_weight*ilm + length_bonus*len. All three weights
+# default to 0.0, which reproduces the pure-acoustic decoder exactly (the regression lock), and all
+# three are swept together by evaluate.py's dev sweep (automatic unless --no-tune).
+# alpha: external STREAM-LM sequence score. Dev-tuned optimum 0.6 in both modes and on both acoustic
+# conditions (2026-08-01) -- but 0.6 is the TOP of evaluate.py's default --lm-grid and it was
+# selected in all four sweeps, so the true optimum may be higher. Widen the grid before trusting it.
+lm_weight: 0.0
+# beta: subtracts the language prior the transducer's own predictor+joiner already carries, so the
+# external LM is not counted on top of it. Useful range ~[0.0, 0.5] — it must stay below alpha, or
+# the net prior flips sign. Dev-tuned optimum 0.2 offline / 0.3 streaming: streaming's acoustic
+# scores are weaker, so more of the internal prior has to come off before the external LM lands. On
+# test-other the tuned pair is 0.3 in BOTH modes.
+ilm_weight: 0.0
+# Per-token bonus offsetting RNN-T's un-normalised deletion bias. Try ~[0.0, 1.0] if deletions
+# dominate the error breakdown.
 length_bonus: 0.0
+
+# Capture the batched predictor+joiner beam step in a CUDA graph: one replay per symbol instead of
+# a fresh kernel-launch chain. Numerically identical to eager; CUDA-only.
+cuda_graph: false

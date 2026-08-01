@@ -1,4 +1,3 @@
-# tests/slices/test_stateless_predictor.py
 import torch
 
 from src.shared_kernel.Config_Adapter import get_config
