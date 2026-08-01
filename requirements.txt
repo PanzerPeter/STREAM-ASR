@@ -14,6 +14,8 @@ python-multipart
 websockets
 loguru
 rich
+# release packaging: pickle-free weight export for the public HuggingFace artifacts
+safetensors
 pydantic
 pyyaml
 pytest
