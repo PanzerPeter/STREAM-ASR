@@ -82,8 +82,6 @@ def test_encoder_lr_scale_downscales_encoder_groups():
         muon_momentum=0.95,
         ns_steps=5,
         weight_decay=0.01,
-        mup_enabled=False,
-        mup_base_dims=(8,),
         encoder_lr_scale=0.25,
     )
     muon, adamw = build_optimizer(net, cfg)
@@ -93,33 +91,3 @@ def test_encoder_lr_scale_downscales_encoder_groups():
     adamw_lr = {id(p): g["lr"] for g in adamw.param_groups for p in g["params"]}
     assert muon_lr[enc_w] == 0.02 * 0.25  # encoder Muon group scaled
     assert adamw_lr[head_w] == 0.01  # fresh head at full AdamW LR
-
-
-def test_mup_enabled_scales_adamw_group_lr():
-    # Lock the mup_enabled per-param-LR branch: a tagged head weight routed
-    # to AdamW gets lr = adamw_lr * its _mup_lr_scale.
-    from src.shared_kernel.Config_Adapter import OptimConfig
-    from src.shared_kernel.mup import mup_linear_
-
-    class _M(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.hidden = nn.Linear(8, 8)  # -> Muon
-            self.ctc_head = nn.Linear(8, 4)  # head pattern -> AdamW
-
-    net = _M()
-    mup_linear_(net.ctc_head, base_fan_in=4)  # ctc_head.weight._mup_lr_scale = 4/8 = 0.5
-    cfg = OptimConfig(
-        optimizer="muon+adamw",
-        muon_lr=0.02,
-        adamw_lr=0.01,
-        muon_momentum=0.95,
-        ns_steps=5,
-        weight_decay=0.01,
-        mup_enabled=True,
-        mup_base_dims=(8,),
-    )
-    opts = build_optimizer(net, cfg)
-    adamw = next(o for o in opts if isinstance(o, torch.optim.AdamW))
-    lrs = {round(g["lr"], 6) for g in adamw.param_groups}
-    assert 0.005 in lrs  # 0.01 * 0.5 for the muP-scaled ctc_head.weight

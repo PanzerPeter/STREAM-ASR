@@ -22,7 +22,3 @@ ilm_weight: 0.0
 # Per-token bonus offsetting RNN-T's un-normalised deletion bias. Try ~[0.0, 1.0] if deletions
 # dominate the error breakdown.
 length_bonus: 0.0
-
-# Capture the batched predictor+joiner beam step in a CUDA graph: one replay per symbol instead of
-# a fresh kernel-launch chain. Numerically identical to eager; CUDA-only.
-cuda_graph: false

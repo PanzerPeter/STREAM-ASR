@@ -348,8 +348,7 @@ def main() -> None:
     log(f"  device    {device} ({gpu})")
     log(
         f"  decode    beam={cfg.decode.beam_size} chunk={cfg.decode.chunk_size} "
-        f"max_symbols={cfg.decode.max_symbols} length_bonus={cfg.decode.length_bonus} "
-        f"cuda_graph={cfg.decode.cuda_graph}"
+        f"max_symbols={cfg.decode.max_symbols} length_bonus={cfg.decode.length_bonus}"
     )
     log(f"  stages    {', '.join(stages)} x {', '.join(_MODES)}")
     log(f"  passes    quality: {workers} worker process(es) | timing: serial, n={probe_n}")

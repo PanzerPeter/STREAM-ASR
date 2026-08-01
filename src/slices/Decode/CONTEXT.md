@@ -17,7 +17,7 @@ search.
 - Produces: nothing on disk.
 
 ## Shared Kernel
-- `Config_Adapter.get_config().decode`: chunk size, beam size, rescoring weights, `cuda_graph`.
+- `Config_Adapter.get_config().decode`: chunk size, beam size, rescoring weights.
 - `Checkpoint_Adapter`, `Tokenizer_Adapter`, `AudioIO_Adapter`: model load, detokenisation, audio.
 
 ## Notes
@@ -46,15 +46,6 @@ regime LODR argues is the right thing to subtract. `beta = 0` reproduces plain f
 **Streaming** feeds the encoder feature-rate chunks of `2·decode.chunk_size` through
 `streaming_forward` with a carried `StreamCache`; offline runs one full-context `forward`. Both
 funnel into the same beam search.
-
-**CUDA-graph step** (`decode.cuda_graph`, opt-in, default off, CUDA-only). When set, the handler
-hands `TransducerBeamSearch` a `CudaGraphedTransducerStep` that captures the batched
-`predictor.step` + `joiner.step` + `log_softmax` into a CUDA graph at a fixed batch = `beam_size`.
-Each symbol step is then one graph replay plus a few host copies instead of a fresh kernel-launch
-chain. The searcher pads its live hyps up to `beam_size` and reads back the valid rows, so the
-n-best is numerically identical to the eager path (`test_cuda_graph_decode`, GPU-gated). Off keeps
-the eager launch-per-step path. RTF is already ≪ 1, so this is latency polish rather than a
-correctness dependency.
 
 **Known tail approximation.** The streaming path pads the final feature chunk to an aligned size and
 trims the padding-derived output frames. The encoder is bit-exact vs `forward(chunk_size=B)` for

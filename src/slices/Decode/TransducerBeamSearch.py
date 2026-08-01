@@ -10,16 +10,12 @@
 # just-emitted token (that would duplicate the emitted token into its own context window). Both
 # greedy and search below make exactly ONE predictor.step call per hypothesis per emission attempt.
 import math
-from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
 
 from src.shared_kernel.Config_Adapter import get_config
 from src.slices.TrainAcousticModel.TransducerModel import TransducerModel
-
-if TYPE_CHECKING:
-    from src.slices.Decode.CudaGraphedTransducerStep import CudaGraphedTransducerStep
 
 # A search hypothesis: (label ids, path log-prob, predictor state BEFORE `last`, last token id).
 _Hyp = tuple[tuple[int, ...], float, torch.Tensor, int]
@@ -48,25 +44,11 @@ def _recombine(hyps: list[_Hyp]) -> list[_Hyp]:
 
 
 class TransducerBeamSearch:
-    def __init__(
-        self,
-        model: TransducerModel,
-        beam_size: int,
-        max_symbols: int,
-        graph_step: "CudaGraphedTransducerStep | None" = None,
-    ) -> None:
+    def __init__(self, model: TransducerModel, beam_size: int, max_symbols: int) -> None:
         self.model = model
         self.beam_size = beam_size
         self.max_symbols = max_symbols
         self.blank = get_config().model.blank_id
-        # Optional CUDA-graph-captured predictor+joiner step (decode.cuda_graph). None = eager, the
-        # default; when set, the per-symbol step is one graph replay, not a fresh launch chain.
-        self.graph_step = graph_step
-
-    def prime(self) -> None:
-        # Force CUDA-graph capture up front (see CudaGraphedTransducerStep.prime); eager path no-op.
-        if self.graph_step is not None:
-            self.graph_step.prime()
 
     @torch.no_grad()
     def greedy(self, memory: torch.Tensor) -> list[int]:
@@ -121,13 +103,8 @@ class TransducerBeamSearch:
                     break
                 states = torch.stack([h[2] for h in active])  # [n, context-1]
                 lasts = torch.tensor([h[3] for h in active], dtype=torch.long, device=device)
-                if self.graph_step is not None:
-                    logp, new_states = self.graph_step.run(states, lasts, enc_t)  # [n,V],[n,ctx-1]
-                else:
-                    pred_out, new_states = self.model.predictor.step(
-                        states, lasts
-                    )  # [n, D], [n, ctx-1]
-                    logp = F.log_softmax(self.model.joiner.step(enc_t, pred_out), dim=-1)  # [n, V]
+                pred_out, new_states = self.model.predictor.step(states, lasts)  # [n,D],[n,ctx-1]
+                logp = F.log_softmax(self.model.joiner.step(enc_t, pred_out), dim=-1)  # [n, V]
                 k = min(self.beam_size, logp.shape[-1])
                 top_lp, top_tok = torch.topk(logp, k, dim=-1)
                 # ONE device->host sync per symbol step instead of three: the blank column, the

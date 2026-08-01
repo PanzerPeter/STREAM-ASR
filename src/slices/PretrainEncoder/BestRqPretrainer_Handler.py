@@ -1,5 +1,5 @@
 # BEST-RQ pretrain loop: span-mask -> encoder -> masked-prediction CE, on the resumable
-# harness and the Muon+muP optimizer. Reads the fp16 mel cache (labels ignored). Emits a
+# harness and the Muon+AdamW optimizer. Reads the fp16 mel cache (labels ignored). Emits a
 # full-state checkpoint (bestrq_last.pt, for crash/interrupt resume) plus an encoder-only checkpoint
 # (bestrq_encoder.pt) that warm-starts the transducer trainer's encoder.
 import math
@@ -58,7 +58,7 @@ def run_pretrain(cmd: BestRqPretrainCommand) -> str:
     # build_optimizer sets each group's lr to its calibrated PEAK (Muon >> AdamW per
     # config/optim.yaml). Snapshot the peaks so the warmup+cosine schedule is applied as a
     # 0->1->0 SHAPE multiplier per group. A single absolute overwrite would clobber Muon's much
-    # larger base LR and any muP ratios, defeating the whole optimizer split.
+    # larger base LR, defeating the whole optimizer split.
     peak_lrs = [[g["lr"] for g in opt.param_groups] for opt in optimizers]
 
     last_ckpt = os.path.join(cmd.ckpt_dir, "bestrq_last.pt")

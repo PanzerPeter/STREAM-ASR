@@ -95,10 +95,9 @@ def build_decoder(
 ) -> StreamingDecoder_Handler:
     # The decoder loads the LM only when the stage's fuse_lm gate is set AND lm_weight > 0, so
     # non-LM stages (and alpha == 0) pay no LM cost; that same gate zeroes beta, keeping the
-    # acoustic-only stages byte-identical to a run without ILME. prime() forces CUDA-graph capture
-    # here rather than inside the first utterance, where it would land in a measured decode.
+    # acoustic-only stages byte-identical to a run without ILME.
     f = STAGES[stage]
-    dec = StreamingDecoder_Handler(
+    return StreamingDecoder_Handler(
         model,
         tok,
         beam_size=f.beam_size,
@@ -106,8 +105,6 @@ def build_decoder(
         lm_weight=lm_weight,
         ilm_weight=ilm_weight,
     )
-    dec.prime()
-    return dec
 
 
 def _decoder_for(job: DecodePassJob) -> StreamingDecoder_Handler:

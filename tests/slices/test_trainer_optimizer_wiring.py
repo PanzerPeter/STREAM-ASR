@@ -36,8 +36,6 @@ def test_shape_schedule_preserves_distinct_muon_and_adamw_peaks():
         muon_momentum=0.95,
         ns_steps=5,
         weight_decay=1.0e-2,
-        mup_enabled=False,
-        mup_base_dims=(8,),
     )
     optimizers = build_optimizer(_M(), cfg)
     peak_lrs = [[g["lr"] for g in o.param_groups] for o in optimizers]

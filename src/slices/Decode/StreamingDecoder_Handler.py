@@ -3,7 +3,7 @@
 # full-context encoder forward. Both funnel into the same TransducerBeamSearch so the only
 # difference between the two modes is how `memory` gets built.
 import time
-from typing import Protocol, TYPE_CHECKING
+from typing import Protocol
 
 import torch
 import torch.nn.functional as F
@@ -24,9 +24,6 @@ from src.slices.Decode.StreamingDecode_Response import (
     SegmentResult,
     StreamingDecode_Response,
 )
-
-if TYPE_CHECKING:
-    from src.slices.Decode.CudaGraphedTransducerStep import CudaGraphedTransducerStep
 
 
 class _Tokenizer(Protocol):
@@ -72,18 +69,7 @@ class StreamingDecoder_Handler:
         self.lm_scorer = self._load_lm() if needs_lm else None
         # The searcher is pure acoustic by construction; the LM (when present) re-ranks its n-best
         # in _search_rescore below rather than fusing per emission step.
-        self.searcher = TransducerBeamSearch(
-            model, self.beam_size, self.cfg.decode.max_symbols, graph_step=self._graph_step()
-        )
-
-    def _graph_step(self) -> "CudaGraphedTransducerStep | None":
-        # CUDA-graph capture is CUDA-only and opt-in; on CPU or with the flag off the searcher stays
-        # on the eager launch-per-step path. Imported lazily so a CPU-only decode never touches it.
-        if not self.cfg.decode.cuda_graph or self.model.ctc_head.weight.device.type != "cuda":
-            return None
-        from src.slices.Decode.CudaGraphedTransducerStep import CudaGraphedTransducerStep
-
-        return CudaGraphedTransducerStep(self.model, self.beam_size)
+        self.searcher = TransducerBeamSearch(model, self.beam_size, self.cfg.decode.max_symbols)
 
     def _load_lm(self) -> LmScorer:
         device = self.model.ctc_head.weight.device
@@ -91,13 +77,6 @@ class StreamingDecoder_Handler:
         load_checkpoint(self.cfg.decode.lm_checkpoint, lm)
         lm.to(device).eval()
         return LmScorer(lm, self.lm_weight)
-
-    def prime(self) -> None:
-        # Capture the CUDA graph (decode.cuda_graph) NOW, on the calling thread. Capture runs in
-        # CUDA's *global* mode: any other thread launching work on this device while it runs aborts
-        # the capture, so a corpus run with concurrent decode passes must prime every decoder before
-        # it starts its workers. No-op on the eager path.
-        self.searcher.prime()
 
     def decode(self, cmd: StreamingDecode_Command) -> StreamingDecode_Response:
         return self.decode_waveform(load_audio(cmd.audio_path), cmd.streaming)

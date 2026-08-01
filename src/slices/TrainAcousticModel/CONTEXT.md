@@ -31,7 +31,7 @@ before exiting rather than losing partial progress.
 ## Shared Kernel
 - `RnntLoss.rnnt_loss`: the RNN-T forward-backward (this repo's own Graves kernel).
 - `Config_Adapter.get_config()`: `training.transducer`, `transducer`, `model`, `optim`.
-- `Optimizer_Adapter.build_optimizer` / `Muon_Optimizer` / `mup`: Muon + AdamW partitioning.
+- `Optimizer_Adapter.build_optimizer` / `Muon_Optimizer`: Muon + AdamW partitioning.
 - `Checkpoint_Adapter`, `SignalGuard`: atomic checkpointing plus interrupt-safe resume.
 - `BiasNorm`, `SwiGluFfn`, `RoPE_Transform`, `MaskUtils`: encoder and predictor blocks.
 

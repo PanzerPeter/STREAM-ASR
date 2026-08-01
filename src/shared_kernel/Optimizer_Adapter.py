@@ -1,12 +1,10 @@
 # Builds the optimizer stack: 2D hidden weight matrices -> Muon (spectrally normalized updates),
-# everything else (embeddings, biases, norms, input frontend, output heads) -> AdamW. When muP is
-# on, per-parameter AdamW LRs are scaled by the _mup_lr_scale tags so a proxy-width LR transfers.
+# everything else (embeddings, biases, norms, input frontend, output heads) -> AdamW.
 import torch
 import torch.nn as nn
 
 from src.shared_kernel.Config_Adapter import OptimConfig
 from src.shared_kernel.Muon_Optimizer import Muon
-from src.shared_kernel.mup import mup_lr_scale
 
 # Output heads / readouts that must stay on AdamW, matched as substrings of the dotted module name.
 # `pred_head` is the BEST-RQ pretrain head (BestRqModel); `ctc_head`/`interctc` are the main and
@@ -49,8 +47,8 @@ def _lr_groups(
     params: list[nn.Parameter], base_lr: float, enc_ids: set[int], enc_scale: float
 ) -> list[dict]:
     # One group per *distinct peak LR*: encoder params get base_lr * enc_scale (warm-started encoder
-    # fine-tuned gently while fresh heads adapt at full LR); muP tags (no-op = 1.0 when muP is off)
-    # still multiply through. The trainer rescales every group's lr per step.
+    # fine-tuned gently while fresh heads adapt at full LR). The trainer rescales every group's lr
+    # per step.
     #
     # A param group carries only hyperparameters -- AdamW's update is per parameter -- so bucketing
     # params that share an LR is exactly equivalent to giving each its own group, and it is what
@@ -60,7 +58,7 @@ def _lr_groups(
     # across a checkpoint save/resume).
     buckets: dict[float, list[nn.Parameter]] = {}
     for p in params:
-        lr = base_lr * mup_lr_scale(p) * (enc_scale if id(p) in enc_ids else 1.0)
+        lr = base_lr * (enc_scale if id(p) in enc_ids else 1.0)
         buckets.setdefault(lr, []).append(p)
     return [{"params": group, "lr": lr} for lr, group in buckets.items()]
 

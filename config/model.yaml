@@ -15,4 +15,9 @@ vocab_size: 500
 # This is the INITIAL value of a *learnable per-block gate*, so 0.0 starts a fresh encoder identical
 # to a vanilla one and lets training introduce the residual only as far as it wants.
 # Keep at 0.0 — a fixed non-zero gate destabilises the early-training escape from CTC blank collapse.
+#
+# 0.0 here does NOT mean the feature is off. It is an init, and training moves it: the shipped v1.0
+# encoder learned gates from -1.40 (stack 4, block 2) to +0.47 (stack 3, block 2), so the value
+# residual is load-bearing in every checkpoint. Deleting the machinery is an architecture change,
+# not a cleanup, and it makes existing checkpoints fail load_state_dict on 16 missing keys.
 encoder_value_residual_lambda: 0.0

@@ -145,9 +145,6 @@ class DecodeConfig(BaseModel):
     # lowers the score -- a standing bias toward deletions. A small positive bonus offsets it. 0.0 =
     # off (regression lock); swept alongside lm_weight in the eval tuner.
     length_bonus: float = 0.0
-    # Capture the RNN-T beam's predictor+joiner step in a CUDA graph (opt-in, CUDA-only). Identical
-    # numerics to eager; false keeps the eager launch-per-step path (the default).
-    cuda_graph: bool = False
 
 
 class LmConfig(BaseModel):
@@ -193,8 +190,6 @@ class OptimConfig(BaseModel):
     muon_momentum: float
     ns_steps: int
     weight_decay: float
-    mup_enabled: bool
-    mup_base_dims: tuple[int, ...]
     encoder_lr_scale: float = 1.0
 
 

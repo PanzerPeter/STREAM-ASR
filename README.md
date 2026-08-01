@@ -20,7 +20,23 @@ dependency, no pretrained weights, and no external decoder.
 | Model | 55.3 M parameters (Zipformer encoder + RNN-T head) |
 | Real-time factor | 0.038 offline / 0.074 streaming, single GPU |
 | Streaming latency | 17 ms to first partial, 0.26 s to finalize |
-| Training cost | ~11 h for the 175k-step transducer run on one RTX 5070 |
+| Training cost | ~21 h wall for the whole pipeline on one RTX 5070 |
+
+Measured end to end, the pipeline is a single overnight run:
+
+| Stage | Wall clock |
+|---|---|
+| BEST-RQ encoder pretrain | 6 h 20 m |
+| Transducer (175k batches) | 6 h 15 m |
+| STREAM-LM (70k steps) | 5 h 40 m |
+| Feature extraction, CMVN, checkpoint averaging, both evals | ~2-3 h |
+| **Total** | **~21 h** |
+
+`training.transducer.total_steps` counts *loader batches*, not optimizer updates: at
+`grad_accum=4` the 175k figure is 43,750 updates, and at ≤18,000 frames (180 s of audio) per batch
+the run sees 8,750 h of audio — **9.1 passes over the 961 h corpus**. The reference icefall recipe
+trains 50 epochs on 3× speed-perturbed data, ~150 effective passes. That gap, not architecture, is
+the dominant term in the remaining WER.
 
 The design target was 6 to 8 % offline and 8 to 10 % streaming WER at RTF below 0.3. Both paths
 beat it.
@@ -180,7 +196,7 @@ below are the short form.
 
 <br>
 
-The fp16 log-mel cache is the one-time cost (~55 GB) that lets the training epoch loop run GPU-bound
+The fp16 log-mel cache is the one-time cost (~53 GB) that lets the training epoch loop run GPU-bound
 instead of re-decoding FLAC every epoch.
 
 ```bash
@@ -253,7 +269,7 @@ one.
   double count. Tuned optimum 0.2 offline and 0.3 streaming, because streaming's weaker acoustic
   scores want more of the prior removed.
 - `length_bonus` is a per-token re-ranking bonus that counters RNN-T's un-normalised deletion bias.
-- `chunk_size`, `beam_size`, `max_symbols`, `lm_checkpoint`, `cuda_graph`.
+- `chunk_size`, `beam_size`, `max_symbols`, `lm_checkpoint`.
 
 </details>
 
@@ -374,7 +390,7 @@ data/                 # LibriSpeech splits, manifests, tokenizer, cmvn, checkpoi
 | `BiasNorm.py`, `SwiGluFfn.py`, `RoPE_Transform.py` | blocks shared by encoder and LM |
 | `Checkpoint_Adapter.py` | atomic stateful save/load + `resume_if_available` |
 | `SignalGuard.py` | cooperative SIGINT/SIGTERM stop for training loops |
-| `Muon_Optimizer.py`, `Optimizer_Adapter.py`, `mup.py` | Muon + AdamW + muP optimizer stack |
+| `Muon_Optimizer.py`, `Optimizer_Adapter.py` | Muon + AdamW optimizer stack |
 | `RandomProjectionQuantizer.py` | frozen BEST-RQ target quantizer |
 | `MaskUtils.py`, `Logging_Adapter.py` | masking helpers, loguru sink |
 
@@ -439,8 +455,7 @@ gradient is exactly 0. Parameters stay 501-wide, which leaves checkpoints unaffe
 
 The whole live beam is evaluated in one predictor+joiner call per symbol step (batch dim = beam
 width), so a frame costs a few GPU launches and one host sync rather than one per hypothesis. LM and
-ILME rescoring are likewise one batched forward over the n-best. `decode.cuda_graph` optionally
-captures that step in a CUDA graph, giving one replay per symbol, numerically identical to eager.
+ILME rescoring are likewise one batched forward over the n-best.
 
 </details>
 

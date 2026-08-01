@@ -239,12 +239,9 @@ python -m src.slices.Decode.streaming_decode AUDIO.flac             # chunked st
 
 * Flags: `--checkpoint` (default `transducer_avg.pt`), `--tokenizer`, `--offline`. Everything else
   (`chunk_size`, `beam_size`, `max_symbols`, `lm_weight`, `ilm_weight`, `length_bonus`,
-  `lm_checkpoint`, `cuda_graph`) comes from `config/decode.yaml`.
+  `lm_checkpoint`) comes from `config/decode.yaml`.
 * The LM is off (`lm_weight: 0.0`) in the committed config until Step 6 has produced a checkpoint.
   The committed weights are the pure-acoustic regression lock.
-* `cuda_graph: true` (opt-in, CUDA-only) captures the beam's predictor+joiner step in a CUDA graph,
-  giving one replay per symbol instead of a launch chain, numerically identical to eager. RTF is
-  already ≪ 1, so this is latency polish; the default (`false`) is the eager path.
 
 ### Step 8: evaluation
 
@@ -352,10 +349,10 @@ the YAML is authoritative.
 | `config/model.yaml` | encoder dims/layers/heads, conv kernel, dropout, RoPE base, `encoder_value_residual_lambda`, vocab size |
 | `config/training.yaml` | `transducer`: batch budgets (`max_frames_per_batch`, `max_tokens_per_batch`, `max_lattice_per_batch`, `token_sort_window`), `grad_accum`, LR shape (`warmup_steps`, `total_steps`, `lr_schedule`, `lr_stable_ratio`, `lr_decay_frac`, `lr_min_ratio`), `chunk_sizes`, `warm_start`, `grad_checkpoint`, `spec_augment`, `dev_wer_utts`, `keep_last_n` |
 | `config/transducer.yaml` | `predictor_dim`, `predictor_context`, `joiner_dim`, `ctc_aux_weight`, `interctc_layers`/`interctc_weights`, `cr_ctc`/`cr_weight` |
-| `config/optim.yaml` | `optimizer` (`adamw`\|`muon+adamw`), `muon_lr`/`adamw_lr`, `muon_momentum`, `ns_steps`, `weight_decay`, `mup_enabled`/`mup_base_dims`, `encoder_lr_scale` |
+| `config/optim.yaml` | `optimizer` (`adamw`\|`muon+adamw`), `muon_lr`/`adamw_lr`, `muon_momentum`, `ns_steps`, `weight_decay`, `encoder_lr_scale` |
 | `config/pretrain.yaml` | BEST-RQ: `codebook_size`/`codebook_dim`, `mask_prob`/`mask_span`/`noise_std`, `stack_frames`, `warmup_steps`/`total_steps`, `grad_clip`/`log_every`/`save_every`, `seed` |
 | `config/lm.yaml` | STREAM-LM: `d_model`/`layers`/`heads`/`kv_groups`, `context_len`, `optimizer`/`muon_lr`/`lr_peak`/`z_loss`, schedule, `subset_words` |
-| `config/decode.yaml` | `chunk_size`, `beam_size`, `max_symbols`, `lm_weight` (α), `ilm_weight` (β), `lm_checkpoint`, `length_bonus`, `cuda_graph` |
+| `config/decode.yaml` | `chunk_size`, `beam_size`, `max_symbols`, `lm_weight` (α), `ilm_weight` (β), `lm_checkpoint`, `length_bonus` |
 | `config/eval.yaml` | `ablation_stages` (`greedy_transducer`/`beam`/`beam_lm`), `report_path` (`{split}` placeholder), `workers`, `rtf_probe_utts` |
 
 ```bash
