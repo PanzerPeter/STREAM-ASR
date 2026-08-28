@@ -1,6 +1,6 @@
 # Export a trainer checkpoint's weights as .safetensors for public release (HuggingFace Hub).
 # Training checkpoints are pickled payloads carrying optimizer state and RNG state, so they are both
-# ~2x larger than the weights and unloadable without `weights_only=False` — which nobody downloading
+# ~2x larger than the weights and unloadable without `weights_only=False`, which nobody downloading
 # a model should have to accept. This writes the bare `model` state_dict in safetensors' zero-copy,
 # no-pickle format, plus provenance in the file header.
 import argparse

@@ -8,7 +8,7 @@ from src.shared_kernel.RoPE_Transform import apply_rotary, rotary_tables
 
 
 def _rms_norm(x: torch.Tensor) -> torch.Tensor:
-    # QK-norm: normalize each head vector to unit RMS before the dot product (no affine — the
+    # QK-norm: normalize each head vector to unit RMS before the dot product (no affine, because the
     # subsequent 1/sqrt(head_dim) SDPA scale absorbs magnitude).
     return x / x.pow(2).mean(dim=-1, keepdim=True).add(1e-6).sqrt()
 

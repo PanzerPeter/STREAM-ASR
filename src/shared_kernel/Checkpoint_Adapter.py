@@ -27,7 +27,7 @@ def save_checkpoint(
     extra: dict | None = None,
 ) -> None:
     # Atomic write: torch.save to a sibling .tmp then os.replace (a same-dir rename is atomic on
-    # POSIX), so a process killed mid-write never truncates the live checkpoint — at worst it leaves
+    # POSIX), so a process killed mid-write never truncates the live checkpoint: at worst it leaves
     # an orphan .tmp. This is the core of the SIGINT-safe training harness.
     payload = {
         "model": model.state_dict(),
@@ -115,7 +115,7 @@ def resume_if_available(
 ) -> dict[str, Any]:
     # Pragmatic resume: restore weights/optimizer(s)/step/best_wer/RNG, and bump resume_count
     # so the caller can reseed a *fresh* shuffled epoch (base_seed + resume_count) rather than
-    # replay the exact pre-interrupt batch order — indistinguishable in final WER over a long run.
+    # replay the exact pre-interrupt batch order, indistinguishable in final WER over a long run.
     # `extra` rides along because not every trainer selects on WER: the LM's best-so-far metric is
     # validation perplexity, which lives there and must survive a restart or the first post-resume
     # eval overwrites lm_best.pt with a worse model.

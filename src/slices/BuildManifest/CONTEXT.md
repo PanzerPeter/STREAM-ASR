@@ -11,11 +11,12 @@ transcripts.
 - Tokenizer: `TrainTokenizerCommand` → `train_tokenizer` → `str` (model path); side effect:
   `data/tokenizer/bpe500.{model,vocab}`
 - Speed-perturb: `SpeedPerturbManifestCommand` → `build_speed_perturb_manifest` → `int` (row
-  count); side effect: `manifest_out` JSONL with a `speed` field per row (3-way 0.9/1.0/1.1)
+  count); side effect: `manifest_out` JSONL with a `speed` field per row (paired 2x: the
+  original plus one factor drawn per utterance from `speeds`, default 0.9/1.1)
 
 ## Data Ownership
-- Produces artifacts: `data/manifests/*.jsonl` (incl. `train_sp.jsonl`, the 3-way speed-perturbed
-  train set) and `data/tokenizer/bpe500.{model,vocab}`.
+- Produces artifacts: `data/manifests/*.jsonl` (incl. `train_sp2.jsonl`, the paired 2x
+  speed-perturbed train set) and `data/tokenizer/bpe500.{model,vocab}`.
 
 ## Notes
 VSA `FN-001` specifies `[Feature].[Role]` naming; files here spell that separator as an underscore
@@ -26,10 +27,14 @@ Frame counts come from `soundfile.info` rather than `torchaudio.info`, because t
 removed its metadata/decode backend.
 
 `SpeedPerturbManifest` is a pure manifest transform with no audio decode: it emits each utterance
-once per speed factor with a corrected `num_samples` (`round(orig / speed)`), so
-`FrameBucketSampler`'s frame budget stays accurate. The waveform itself is resampled at load time by
-`LibriSpeechDataset` (ExtractFeatures), keyed off the row's `speed`, which is incompatible with the
-precomputed mel cache.
+twice -- untouched, then at one factor drawn from `speeds` -- with a corrected `num_samples`
+(`round(orig / speed)`), so `FrameBucketSampler`'s frame budget stays accurate. 2x rather than
+icefall's 3x cross product because the binding constraint is disk: the fp16 mel cache is ~53 GB
+per copy of the corpus. The factor is `sha1(uttid, seed)`, never the builtin `hash()` (Python
+randomises string hashing per process), so a rebuild is byte-identical -- the feature cache is
+indexed by manifest row order, so a reshuffle would silently mispair every mel. The waveform is
+resampled at feature-extraction time and baked into the cache, which is therefore built per
+manifest and bound to it by a fingerprint (ExtractFeatures).
 
 The tokenizer is upstream of everything: changing `vocab_size` invalidates the CMVN statistics, the
 packed LM data and every existing checkpoint.

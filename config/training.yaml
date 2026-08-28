@@ -1,26 +1,156 @@
 transducer:
-  max_frames_per_batch: 18000    # frame budget (base of the frame×token bucket)
-  max_tokens_per_batch: 4000     # transcript-char budget (sum over the batch)
+  # ALL THREE budgets move together. Each is independently capable of pinning the batch, and one
+  # left behind silently becomes the binding one: raising frames 32k -> 45k -> 58k with tokens held
+  # at 4000 produced B = 18, 19, 19 and an identical 273 s of audio per step.
+  #
+  # MEASURED 2026-08-02 (scripts/profile_transducer_step.py, rnnt_loss: full, expandable_segments):
+  # B=20, 274 s audio/step, 190.6 ms/step = 1438x realtime, peak 7.41 GiB allocated / 7.51 GiB
+  # reserved of the ~10.2 GiB this card leaves a training process. The ~2.7 GiB left over is margin
+  # for the epoch's densest batch and for whatever else is on the desktop -- do not spend it without
+  # re-profiling, and note that the profiler's 20-step sample under-reads the worst batch.
+  max_frames_per_batch: 28000    # frame budget (base of the frame×token bucket)
+  max_tokens_per_batch: 4400     # transcript-char budget (sum over the batch)
   # Worst-case cap on the RNN-T joiner lattice, in units of B * max(frames) * max(chars). The two
   # budgets above are sums, so they bound the *average* batch and leave the tail free: the densest
-  # batch of a train_sp epoch ran 1.7x the p99.9 one, which is what produced periodic
-  # "CUDA OOM - batch dropped". 6.0e6 clips that tail for +14 batches in 60,347, mean batch size
-  # unchanged. Raise it if you raise max_frames_per_batch.
-  max_lattice_per_batch: 6000000
+  # batch of an epoch ran 1.7x the p99.9 one, which is what produced periodic
+  # "CUDA OOM - batch dropped". This is the *worst-batch* cap that peak VRAM actually tracks, so
+  # scale it with max_frames_per_batch.
+  max_lattice_per_batch: 11000000
   # Re-sort by transcript length inside a sliding window of the duration sort, so a batch is
-  # homogeneous in U as well as in T and the lattice is not charged for the spread. Measured over
-  # train.jsonl: lattice padding waste 21.6% -> 13.9% (-8.8% cells) at an unchanged batch count,
-  # frame padding still 0.2%, and end to end 138 -> 126 ms/step with peak VRAM 5.36 -> 5.06 GiB.
-  # 1 = off (plain duration sort); 256/1024/4096 measure 15.0/13.9/15.3% waste. Off by default
-  # because making every batch homogeneous in transcript length is a training-semantics change no
-  # run has isolated yet -- the recipe that shipped 3.55% test-clean did not have it.
+  # homogeneous in U as well as in T and the full lattice is not charged for the spread. Two
+  # utterances of equal duration can differ 2x in token count (speaking rate), and the lattice is
+  # charged at the batch's *max* U, not its mean.
+  #
+  # MEASURED on train_sp2 at the budgets above (scripts/measure_lattice_waste.py):
+  #
+  #   window   batches   mean B   cells/batch   waste   epoch lattice work
+  #        1    25,475    22.08         6.87M   22.9%              100.0%
+  #      256    25,992    21.64         5.51M    5.6%               81.7%
+  #     1024    26,125    21.53         5.27M    2.0%               78.7%
+  #     4096    26,169    21.49         5.21M    0.9%               77.8%
+  #
+  # The window must be much WIDER than a batch or it does nothing: the saving comes from a whole
+  # batch fitting inside one homogeneous run of the re-sort, and a window of the batch's own order
+  # just interleaves the two speaking rates again. Mean B here is ~22, hence candidates in the
+  # hundreds. Above ~1024 it starts trading frame padding back for token padding.
+  #
+  # Note the batch count RISES ~2.6%: homogeneous batches sit uniformly near max_lattice_per_batch
+  # instead of being closed early by the odd long transcript, so each holds slightly less audio.
+  # total_steps counts loader batches, so an epoch is 2.6% more steps -- the win is the 21% less
+  # lattice work per epoch, not a smaller step count. At the profiled split (lattice terms ~26% of
+  # a 192 ms step) that is ~6% off epoch wall time, and peak VRAM is unchanged because the
+  # worst-batch cap still binds.
+  #
+  # Only worth anything under `rnnt_loss: full`, where the lattice is charged at the batch's max U
+  # (the pruned lattice is [B,T,s_range,V] and does not depend on U at all).
+  #
+  # Off by default because making every batch homogeneous in transcript length -- i.e. in speaking
+  # rate -- is a training-semantics change no run has isolated, and the recipe that shipped 3.43%
+  # test-clean did not have it. It is the cheapest untried speed experiment on this stage: 256 buys
+  # four fifths of the win at a quarter of the correlation. Turn it on, then compare dev ctc-WER
+  # against a matched-STEP baseline before keeping it.
   token_sort_window: 1
-  grad_accum: 4
-  warmup_steps: 10000
-  total_steps: 175000
+  # RNN-T objective.
+  #
+  # "full" (default) materialises the whole [B,T,U+1,V] lattice. It is the reference implementation
+  # the equivalence tests lock against and the objective every published checkpoint was trained
+  # with. Its lattice is a large size-varying allocation, which fragments the default caching
+  # allocator badly -- 5.25 GiB allocated against 9.71 GiB reserved, which reads as a VRAM ceiling
+  # that is not there. The trainer sets expandable_segments (see TransducerTrainer_Handler), under
+  # which the same batch reserves 7.51 GiB against 7.41 allocated and the ceiling disappears.
+  #
+  # "pruned" evaluates the real joiner only on an s_range-wide band chosen by a linear simple
+  # joiner. It genuinely uses less memory (6.83 GiB at B=24 vs 7.41 at B=20) but is 30 % SLOWER end
+  # to end -- 1103x realtime vs 1438x, measured 2026-08-02 on the same card -- because it trades one
+  # big lattice GEMM for a 4x longer kernel launch stream: 82,937 launches/step at 5.4 us mean
+  # against full's 20,166 at 17.1 us. `rnnt_loss_pruned` scans frames in a Python loop through plain
+  # autograd, so backward retraces it. Keep it for a model whose lattice does not fit even
+  # unfragmented; fix its launch count (a custom Function with an analytic fused backward, as
+  # RnntLoss._scan already has) before choosing it for speed.
+  #
+  # This key is part of the ARCHITECTURE, not just the training loop: "pruned" adds simple_am_proj
+  # and simple_lm_proj, so a checkpoint saved under one value will not load under the other.
+  rnnt_loss: full
+  s_range: 5                     # band width; 5 is the reference recipe's value
+  # Loss weights ramp linearly over this many loader batches: simple 1.0 -> simple_loss_scale,
+  # pruned 0.1 -> 1.0. The joiner and both simple projections start fresh against a BEST-RQ
+  # encoder, so the bounds are meaningless for the first few thousand batches and the pruned term
+  # must not dominate while they are.
+  prune_warmup_steps: 4000
+  simple_loss_scale: 0.5
+  # 28,000 x 3 = 84,000 frames per optimizer update, 1.17x v1.0's proven 18,000 x 4 = 72,000.
+  # DO NOT move this together with muon_lr/adamw_lr: the one variable this run isolates against v1.0
+  # is how much audio the model sees, and changing batch size and LR together makes it unattributable.
+  grad_accum: 3
+  # 2,500 optimizer updates, as v1.0 had. Warmup protects the BEST-RQ-warm-started encoder from the
+  # fresh joiner's early gradient; that transient is measured in updates, so it does NOT scale with
+  # total_steps -- it is 2500 * grad_accum, not a fraction of the run.
+  warmup_steps: 7500
+  # total_steps counts LOADER BATCHES, not optimizer updates. This is the single most misread number
+  # in the repo: v1.0's 175,000 was 43,750 updates and only 8,750 h = 9.1 passes over the 961 h
+  # corpus, ~6 % of the icefall reference recipe, which is the dominant cause of its test-other gap.
+  # Convert to audio-hours before comparing any run to a published one.
+  #
+  # Derived, not chosen (both budgets computed, minimum taken):
+  #   seconds_per_batch  = 274                       measured, ~= max_frames_per_batch / 100
+  #   audio_budget_steps = 144000 * 3600 / 274       = 1,891,971   (reference parity: 50 ep x 2880 h)
+  #   wall_budget_steps  = 50 * 3600 / 0.1906        =   944,386   (50 h at the measured ms/step)
+  # Wall binds. Rounded down from 944k to leave room for ~90 full-dev validations and checkpointing.
+  #
+  # 900,000 x 274 s = 68,500 h = 35.4 passes over the 1,933 h train_sp2 corpus, in 300,000 optimizer
+  # updates and ~48 h of steps. That is 7.8x v1.0's audio.
+  #
+  # CUT 900,000 -> 600,000 at step 365k (2026-08-05). This does NOT shorten the recipe's intent; it
+  # moves the WSD decay window from 675k to 450k. Measured stable-phase full-dev greedy-CTC WER:
+  # 100k .1005, 200k .0858, 300k .0810, 360k .0809 -- mean(280..310k) .08095 vs mean(320..360k)
+  # .08044, i.e. -0.0005 over 80k steps (6,000 h of audio) against a per-eval sigma of ~.0011.
+  #
+  # That flatness is NOT proof of saturation: stable-phase loss is a known-bad predictor of the
+  # annealed endpoint, and this readout is the 0.2-weighted CTC head, not the transducer objective.
+  # The cut is a compute bet, not a diagnosis -- 235k steps (11 h) to a bankable annealed checkpoint
+  # instead of 535k (25 h, ~4 days at this run's ~24 % duty cycle) for an unmeasurable extra.
+  #
+  # The bet is REVERSIBLE, and staying reversible is a manual step: keep_last_n=5 x ckpt_every=5400
+  # spans only 27k steps, so a 150k-step anneal rolls the pre-anneal snapshot off the end. Before
+  # the LR leaves the stable level, copy data/checkpoints/transducer_step448200.pt (the last
+  # snapshot before decay_start=450,000) somewhere the rotation cannot reach. Rolling snapshots are
+  # byte copies of transducer_last.pt, so they carry optimizer moments and RNG and resume cleanly:
+  # `cp transducer_step448200.pt transducer_last.pt` re-enters the stable phase, and raising
+  # --total-steps then just pushes the decay window back out.
+  #
+  # CUT AGAIN 600,000 -> 525,000 (2026-08-05), then REVERTED to 600,000 the same day, because the
+  # reason for that second cut turned out not to exist. It was forced by an apparent gradient
+  # runaway around step 400k. Read back from the checkpoints' optimizer moments (AdamW
+  # sqrt(sum exp_avg_sq) per tensor, so proportional to each tensor's recent gradient scale):
+  #
+  #   checkpoint                        Muon (135 matrices)   AdamW total   stacks.3.bypass
+  #   step394200 (healthy resume)             0.7315            2.429           2.063
+  #   step410400 (the second abort)           0.7535            3.287           3.023
+  #   400k_predivergence (median 11.0)        0.7241            2.981           2.766
+  #   step415800 (deep in the first abort)    0.1743            4.994           4.987
+  #
+  # The encoder's gradient scale is FLAT across every point the guard called a runaway. ~95 % of
+  # train/grad_norm is one scalar -- encoder.stacks.3.bypass, whose gradient is a reduction over the
+  # whole [B,T,C] activation and is therefore sized by the batch, not by model health. Both aborts
+  # were false positives; the second fired at step 415,500 while dev ctc-WER was setting the run's
+  # record (0.0733 at 400k -> 0.0680 at 410k) and the loss was falling. The guard now reads
+  # train/grad_norm_guarded (weight matrices only) -- WATCH THAT, not train/grad_norm.
+  #
+  # What the checkpoints DO show is the encoder gradient COLLAPSING 4x (0.72 -> 0.17) between 400k
+  # and 415.8k of the first run, as dev ctc-WER regressed 0.0783 -> 0.0842. That is the real failure
+  # signature and this guard, being one-sided, does not catch it.
+  #
+  # So 600,000 stands on the 365k reasoning above and nothing else: decay_start = 450,000, ~32 h of
+  # steps, and the pre-anneal snapshot to preserve is still exactly transducer_step448200.pt.
+  #
+  # Still true, and still the reason nothing gradient-side is a safety net: Muon's update magnitude
+  # is lr * sqrt(max(1, m/n)) REGARDLESS of gradient size (Newton-Schulz renormalises), so
+  # clip_grad_norm_ is structurally inert for the 135 Muon matrices. The LR is the only lever on
+  # this loop that is live mid-run.
+  total_steps: 600000
   # LR shape after warmup: hold the stable level, then a 1-sqrt anneal over the last lr_decay_frac
-  # of the budget. Preferred over `cosine` because cosine's total_steps IS its curve — bumping it
-  # mid-run re-heats the LR at the resume step — whereas under WSD the same bump only moves the
+  # of the budget. Preferred over `cosine` because cosine's total_steps IS its curve, so bumping it
+  # mid-run re-heats the LR at the resume step, whereas under WSD the same bump only moves the
   # decay window. Full rationale in TrainAcousticModel/CONTEXT.md.
   lr_schedule: wsd
   # Stable-phase level as a fraction of the peak LRs in optim.yaml. 1.0 is the fresh-run recipe;
@@ -37,12 +167,64 @@ transducer:
   lr_stable_ratio: 1.0
   lr_decay_frac: 0.25            # last 25% of total_steps = the anneal window
   lr_min_ratio: 0.01             # floor: an LR reaching exactly 0 wastes the last few k steps
-  weight_decay: 1.0e-2
+  # NB: weight decay is NOT here -- it is `weight_decay` in config/optim.yaml, which is what
+  # build_optimizer reads for both Muon and AdamW. A duplicate key lived here and was never read.
+  # DIAGNOSTIC, not a safety bound. Newton-Schulz renormalises Muon's momentum buffer to unit
+  # spectral norm, so clipping p.grad beforehand changes neither the direction nor the magnitude of
+  # the update for any 2D hidden matrix -- i.e. for the whole encoder. It bounds only the AdamW
+  # params, and Adam is near scale-invariant too. Lowering it would not have caught the 2026-08-05
+  # runaway; nothing gradient-side can. See guard_* below.
+  #
+  # It is also not the bound it reads as: the global norm it clips on is dominated by the six scalar
+  # bypass gates, so at a measured norm of 7.27 every parameter's gradient was being scaled by
+  # 5/7.27 every step because ONE gate's gradient was large. Adam is near scale-invariant and Muon
+  # exactly so, which is why this was survivable, but the number here bounds a quantity that has
+  # little to do with the weights.
   grad_clip: 5.0
-  log_every: 50
-  val_every: 2000
-  ckpt_every: 2000
+  # Runaway detector (_train_utils.GradNormGuard), sampled at log_every where the norm is already
+  # synced to host, so it costs no extra device->host stall. Trips when the median over the last
+  # `guard_window` log windows exceeds `guard_trend_factor` x the run's QUIETEST such median (a
+  # running minimum, persisted through the checkpoint's `extra` so 16 resumes cannot re-arm it
+  # against a diverged regime), for `guard_patience` consecutive windows -- then aborts WITHOUT
+  # checkpointing, because transducer_last.pt is at most ckpt_every steps old and healthier than the
+  # moment of the trip.
+  #
+  # Reads train/grad_norm_guarded (weight matrices, ndim >= 2) and NOT the global train/grad_norm.
+  # Driving it from the global norm aborted two healthy runs, because that norm is ~95 % the
+  # gradient of one scalar gate -- see the total_steps note above for the measured table, and
+  # _train_utils.guarded_parameters for why a per-element parameter's gradient is sized by the batch
+  # rather than by the model.
+  #
+  # The window/factor/patience are unchanged from the sizing done against the old metric: the
+  # guarded norm sits in the same 1-2 range, so 20 windows at 4x with 3-window patience still puts
+  # the trip far above normal spikiness. They will want re-checking once a full run has logged
+  # train/grad_norm_guarded end to end -- no run has yet. 0 in guard_window disables.
+  #
+  # The guard is not armed until warmup_steps. guard_window * log_every = 5,000 < warmup 7,500, so
+  # otherwise the running-minimum floor -- the reference for the whole run -- would be latched from
+  # the LR ramp against a freshly initialised joiner rather than from training.
+  guard_window: 20
+  guard_trend_factor: 4.0
+  guard_patience: 3
+  # Cadence scales with total_steps, so a longer run does not drown in evals or leave hours
+  # unrecoverable: ~90 eval windows (as v1.0's 175000/2000 = 87), and keep_last_n=5 snapshots
+  # spanning ~3 % of the run so checkpoint averaging draws from a comparable tail.
+  log_every: 250                 # total_steps / 3500
+  val_every: 10000               # total_steps / 90
+  ckpt_every: 5400               # total_steps * 0.03 / keep_last_n
   grad_checkpoint: false
+  # Hand the elementwise leaf modules (BiasNorm, TransducerJoiner, ConvModule, SwiGluFfn) to
+  # inductor. MEASURED 2026-08-03 at the budgets above (profile_transducer_step.py, back-to-back on
+  # an idle card): 183.7 -> 160.5 ms/step (-12.6 %), peak 6.96 -> 5.98 GiB, 20,008 -> 14,683 kernel
+  # launches, 1491 -> 1704x realtime, for ~8 s of one-off warmup. Everything else -- SDPA, anything
+  # calling get_config() -- stays eager, which is why this works where `torch.compile(model)` does
+  # not: that path still hits this build's dynamic-shape tiling assert. See
+  # TrainAcousticModel/_train_utils.py for the per-module numbers and the numerics check.
+  #
+  # Weights are untouched (`nn.Module.compile` keeps state_dict keys), so a checkpoint written with
+  # this on loads into the eager decode/eval path unchanged, and this can be toggled across a
+  # resume. Set false to bisect an inductor problem or to profile against eager.
+  compile_modules: true
   seed: 42
   chunk_sizes: [0, 16, 32]       # 0 = full context; 16/32 = base-rate frames sampled per batch
   warm_start: data/checkpoints/bestrq_encoder.pt

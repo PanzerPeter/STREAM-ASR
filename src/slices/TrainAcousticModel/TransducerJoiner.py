@@ -28,16 +28,26 @@ class TransducerJoiner(nn.Module):
         # unaffected. Kept out of `step()`, which is one cell wide and GEMM-bound by nothing.
         self._pad = -model.logits_width % 8
 
-    def forward(self, enc: torch.Tensor, pred: torch.Tensor) -> torch.Tensor:
-        # enc [B, T, De], pred [B, U', Dp] -> [B, T, U', V] via broadcast over the (T, U') grid.
-        e = self.enc_proj(enc).unsqueeze(2)  # [B, T, 1, J]
-        p = self.pred_proj(pred).unsqueeze(1)  # [B, 1, U', J]
-        h = torch.tanh(e + p)
+    def _readout(self, h: torch.Tensor) -> torch.Tensor:
         return F.linear(
             h,
             F.pad(self.out.weight, (0, 0, 0, self._pad)),
             F.pad(self.out.bias, (0, self._pad), value=float("-inf")),
         )
+
+    def forward(self, enc: torch.Tensor, pred: torch.Tensor) -> torch.Tensor:
+        # enc [B, T, De], pred [B, U', Dp] -> [B, T, U', V] via broadcast over the (T, U') grid.
+        e = self.enc_proj(enc).unsqueeze(2)  # [B, T, 1, J]
+        p = self.pred_proj(pred).unsqueeze(1)  # [B, 1, U', J]
+        return self._readout(torch.tanh(e + p))
+
+    def band(self, enc: torch.Tensor, pred_band: torch.Tensor) -> torch.Tensor:
+        # Pruned objective: enc [B, T, De], pred_band [B, T, S, Dp] -> [B, T, S, V]. The predictor
+        # side is already gathered per frame, so unlike `forward` it does NOT broadcast over the
+        # symbol axis -- each frame sees its own S-wide slice of the prediction network.
+        e = self.enc_proj(enc).unsqueeze(2)  # [B, T, 1, J]
+        p = self.pred_proj(pred_band)  # [B, T, S, J]
+        return self._readout(torch.tanh(e + p))
 
     def step(self, enc_t: torch.Tensor, pred_u: torch.Tensor) -> torch.Tensor:
         # enc_t [B, De], pred_u [B, Dp] -> [B, V] for a single decode cell.

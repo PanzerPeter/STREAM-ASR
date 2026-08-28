@@ -102,29 +102,34 @@ def _prepare(cache: RescoreCache, tok: _Tok) -> _Prepared:
 
 
 def _sweep(
-    prepared: _Prepared, alpha_grid: list[float], beta_grid: list[float], length_bonus: float
-) -> dict[tuple[float, float], float]:
-    # Pure (alpha, beta) sweep over cached scores -- no decoding, no re-alignment. For each point,
-    # each utterance emits the n-best hypothesis maximising
+    prepared: _Prepared,
+    alpha_grid: list[float],
+    beta_grid: list[float],
+    lb_grid: list[float],
+) -> dict[tuple[float, float, float], float]:
+    # Pure (alpha, beta, length_bonus) sweep over cached scores -- no decoding, no re-alignment.
+    # For each point, each utterance emits the n-best hypothesis maximising
     #     acoustic + alpha*lm - beta*ilm + length_bonus*len
     # and the corpus WER over those picks scores the point. The ranking expression must match the
     # live decode one (StreamingDecoder_Handler._search_rescore) so the weights chosen here are the
-    # weights used there.
+    # weights used there. _prepare already aligned every hypothesis, so a point costs one argmax
+    # per utterance -- a 13x7x5 grid is seconds of CPU inside a pass that costs GPU hours.
     total_words = max(1, sum(p[2] for p in prepared))
-    wer_by_point: dict[tuple[float, float], float] = {}
+    wer_by_point: dict[tuple[float, float, float], float] = {}
     for alpha in alpha_grid:
         for beta in beta_grid:
-            errors = 0
-            for nb, errs, _ in prepared:
-                # First-max wins ties, matching the live rescorer: its sort is stable, so tied
-                # hypotheses keep the acoustic beam's order there too.
-                best_i, best_score = 0, float("-inf")
-                for i, h in enumerate(nb):
-                    score = h.acoustic + alpha * h.lm - beta * h.ilm + length_bonus * len(h.ids)
-                    if score > best_score:
-                        best_i, best_score = i, score
-                errors += errs[best_i]
-            wer_by_point[(alpha, beta)] = errors / total_words
+            for bonus in lb_grid:
+                errors = 0
+                for nb, errs, _ in prepared:
+                    # First-max wins ties, matching the live rescorer: its sort is stable, so tied
+                    # hypotheses keep the acoustic beam's order there too.
+                    best_i, best_score = 0, float("-inf")
+                    for i, h in enumerate(nb):
+                        score = h.acoustic + alpha * h.lm - beta * h.ilm + bonus * len(h.ids)
+                        if score > best_score:
+                            best_i, best_score = i, score
+                    errors += errs[best_i]
+                wer_by_point[(alpha, beta, bonus)] = errors / total_words
     return wer_by_point
 
 
@@ -140,10 +145,10 @@ def _pick_best_weights(
     cache: RescoreCache,
     alpha_grid: list[float],
     beta_grid: list[float],
+    lb_grid: list[float],
     tok: _Tok,
-    length_bonus: float = 0.0,
-) -> tuple[tuple[float, float], dict[tuple[float, float], float]]:
-    wer_by_point = _sweep(_prepare(cache, tok), alpha_grid, beta_grid, length_bonus)
+) -> tuple[tuple[float, float, float], dict[tuple[float, float, float], float]]:
+    wer_by_point = _sweep(_prepare(cache, tok), alpha_grid, beta_grid, lb_grid)
     return min(wer_by_point, key=lambda p: wer_by_point[p]), wer_by_point
 
 
@@ -158,6 +163,7 @@ def _tune_rescore_weights(
     dev_manifest: str,
     alpha_grid: list[float],
     beta_grid: list[float],
+    lb_grid: list[float],
     limit: int | None,
     workers: int,
 ) -> dict[str, dict[str, float | None]]:
@@ -167,10 +173,10 @@ def _tune_rescore_weights(
     # they run as two worker processes exactly like the quality pass.
     rows = subsample(load_manifest(dev_manifest), limit)
     log(
-        f"--- tuning (alpha, beta) on {dev_manifest}: n={len(rows)}, per mode, "
-        f"{len(alpha_grid)}x{len(beta_grid)} grid points swept over ONE cached decode each"
+        f"--- tuning (alpha, beta, length_bonus) on {dev_manifest}: n={len(rows)}, per mode, "
+        f"{len(alpha_grid)}x{len(beta_grid)}x{len(lb_grid)} grid points swept over ONE cached "
+        f"decode each"
     )
-    length_bonus = get_config().decode.length_bonus
     # lm_weight=1.0 only has to make the worker BUILD an LM: the job returns raw, unweighted LM and
     # ILM terms, so this weight never enters a score. The searcher is the full-beam one either way.
     jobs = [
@@ -184,6 +190,7 @@ def _tune_rescore_weights(
             limit=limit,
             lm_weight=1.0,
             ilm_weight=0.0,
+            length_bonus=0.0,
             measure_timing=False,
             label=f"tune-decode/{mode}",
         )
@@ -194,25 +201,40 @@ def _tune_rescore_weights(
     tuned: dict[str, dict[str, float | None]] = {}
     for mode, cache in zip(_MODES, caches):
         prepared = _prepare(cache, tok)
-        wer_by_point = _sweep(prepared, alpha_grid, beta_grid, length_bonus)
+        wer_by_point = _sweep(prepared, alpha_grid, beta_grid, lb_grid)
         best = min(wer_by_point, key=lambda p: wer_by_point[p])
-        acoustic = wer_by_point.get((0.0, 0.0))
-        log(f"--- {mode} dev sweep (n={len(rows)}) ---")
-        for point in sorted(wer_by_point):
+        acoustic = wer_by_point.get((0.0, 0.0, 0.0))
+        # v1.0 selected alpha at the top of its grid in all four sweeps and never noticed. A weight
+        # sitting on its own ceiling means the grid, not the data, chose it.
+        for name, value, grid in (
+            ("alpha", best[0], alpha_grid),
+            ("beta", best[1], beta_grid),
+            ("length_bonus", best[2], lb_grid),
+        ):
+            if len(grid) > 1 and value == max(grid):
+                log(
+                    f"WARNING: {name}={value} is the TOP of its grid -- widen it, "
+                    f"the optimum may lie beyond"
+                )
+        ranked = sorted(wer_by_point, key=lambda p: wer_by_point[p])
+        log(f"--- {mode} dev sweep (n={len(rows)}), {len(wer_by_point)} points, top 10 ---")
+        for point in ranked[:10]:
             mark = "  <- best" if point == best else ""
             log(
-                f"    alpha={point[0]:<5} beta={point[1]:<5} "
+                f"    alpha={point[0]:<5} beta={point[1]:<5} lb={point[2]:<5} "
                 f"dev WER={100 * wer_by_point[point]:6.2f}%{mark}"
             )
         oracle = _oracle_from(prepared)
         log(
-            f"    selected alpha={best[0]} beta={best[1]}  dev WER={100 * wer_by_point[best]:.2f}%"
+            f"    selected alpha={best[0]} beta={best[1]} lb={best[2]}"
+            f"  dev WER={100 * wer_by_point[best]:.2f}%"
             + (f" (acoustic-only {100 * acoustic:.2f}%)" if acoustic is not None else "")
             + f" | n-best oracle {100 * oracle:.2f}% -- the floor this beam can be rescored to"
         )
         tuned[mode] = {
             "lm_weight": best[0],
             "ilm_weight": best[1],
+            "length_bonus": best[2],
             "dev_wer": wer_by_point[best],
             "dev_wer_acoustic": acoustic,  # None unless (0, 0) was on the grid
             "dev_oracle_wer": oracle,
@@ -292,9 +314,18 @@ def main() -> None:
         help="skip the dev sweep entirely and use --lm-weight/--ilm-weight (or decode.yaml)",
     )
     ap.add_argument(
-        "--lm-grid", default="0.0,0.1,0.2,0.3,0.4,0.5,0.6", help="alpha grid for the dev sweep"
+        "--lm-grid",
+        default="0.0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0,1.1,1.2",
+        help="alpha grid for the dev sweep",
     )
-    ap.add_argument("--ilm-grid", default="0.0,0.1,0.2,0.3", help="beta grid for the dev sweep")
+    ap.add_argument(
+        "--ilm-grid", default="0.0,0.1,0.2,0.3,0.4,0.5,0.6", help="beta grid for the dev sweep"
+    )
+    ap.add_argument(
+        "--lb-grid",
+        default="0.0,0.25,0.5,0.75,1.0",
+        help="length_bonus grid for the dev sweep (per-token bonus offsetting RNN-T deletions)",
+    )
     ap.add_argument(
         "--tune-limit",
         type=int,
@@ -365,11 +396,16 @@ def main() -> None:
             sp.dev_manifest,
             [float(x) for x in args.lm_grid.split(",")],
             [float(x) for x in args.ilm_grid.split(",")],
+            [float(x) for x in args.lb_grid.split(",")],
             args.tune_limit,
             workers,
         )
         weights = {
-            m: (float(tuning[m]["lm_weight"] or 0.0), float(tuning[m]["ilm_weight"] or 0.0))
+            m: (
+                float(tuning[m]["lm_weight"] or 0.0),
+                float(tuning[m]["ilm_weight"] or 0.0),
+                float(tuning[m]["length_bonus"] or 0.0),
+            )
             for m in _MODES
         }
     else:
@@ -377,10 +413,11 @@ def main() -> None:
         # lm_weight=0.0 (the alpha=0 regression lock), so sweeps never mutate it.
         a = args.lm_weight if args.lm_weight is not None else cfg.decode.lm_weight
         b = args.ilm_weight if args.ilm_weight is not None else cfg.decode.ilm_weight
-        weights = {m: (a, b) for m in _MODES}
-        log(f"--- fixed weights (no dev sweep): alpha={a} beta={b}")
+        lb = cfg.decode.length_bonus
+        weights = {m: (a, b, lb) for m in _MODES}
+        log(f"--- fixed weights (no dev sweep): alpha={a} beta={b} lb={lb}")
     for m in _MODES:
-        log(f"    {m:<9} alpha={weights[m][0]} beta={weights[m][1]}")
+        log(f"    {m:<9} alpha={weights[m][0]} beta={weights[m][1]} lb={weights[m][2]}")
     for stage in stages:
         if stage_uses_lm(stage) and max(weights[m][0] for m in _MODES) <= 0:
             # Otherwise this stage silently equals the pure-acoustic beam and the report misleads.
@@ -402,6 +439,7 @@ def main() -> None:
             limit=limit,
             lm_weight=weights[mode][0],
             ilm_weight=weights[mode][1],
+            length_bonus=weights[mode][2],
             measure_timing=timed,
             label=tag,
         )
@@ -457,9 +495,13 @@ def main() -> None:
                 "tokenizer": args.tokenizer,
                 "beam_size": cfg.decode.beam_size,
                 "chunk_size": cfg.decode.chunk_size,
-                "length_bonus": cfg.decode.length_bonus,
                 "weights": {
-                    m: {"lm_weight": weights[m][0], "ilm_weight": weights[m][1]} for m in _MODES
+                    m: {
+                        "lm_weight": weights[m][0],
+                        "ilm_weight": weights[m][1],
+                        "length_bonus": weights[m][2],
+                    }
+                    for m in _MODES
                 },
                 "tuning": tuning,
                 "timing": {

@@ -29,41 +29,91 @@ def test_default_none_is_frame_only(tmp_path):
     assert len(list(s)) == 1  # all three fit the huge frame budget, no token cap
 
 
-def test_token_window_sort_groups_similar_transcript_lengths(tmp_path):
-    # 40 utterances of one duration with alternating transcript lengths. Sorting by duration alone
-    # leaves the long/short alternation intact, so every batch is charged at the long U; the window
-    # re-sort separates them, which is where the ~9% RNN-T lattice saving comes from.
-    rows = [{"num_samples": 16000 + i, "text": "A" * (400 if i % 2 else 40)} for i in range(40)]
+def _alternating_manifest(tmp_path, n=40, short=40, long=400):
+    # Equal-duration utterances whose transcripts alternate in length -- the speaking-rate spread
+    # the token sort exists to collapse.
+    rows = [{"num_samples": 16000 + i, "text": "A" * (long if i % 2 else short)} for i in range(n)]
     p = tmp_path / "m.jsonl"
     p.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
-    budgets = dict(max_frames_per_batch=400, max_tokens_per_batch=880)
-
-    unsorted_batches = FrameBucketSampler(str(p), token_sort_window=0, **budgets)._build_batches()
-    windowed = FrameBucketSampler(str(p), token_sort_window=64, **budgets)._build_batches()
-
-    def worst_u(batches):
-        return sum(len(b) * max(len(rows[i]["text"]) for i in b) for b in batches)
-
-    assert worst_u(windowed) < worst_u(unsorted_batches)
+    return str(p)
 
 
-def test_token_window_sort_is_off_without_a_token_budget(tmp_path):
-    # BEST-RQ pretraining passes no token budget and has no U dimension to pad, so the batch stream
-    # must stay in pure duration order.
-    m = _manifest(tmp_path)
-    frame_only = FrameBucketSampler(m, max_frames_per_batch=100, token_sort_window=2)
-    assert frame_only._order == sorted(range(3), key=lambda i: frame_only._frames[i])
+def _lattice_cells(sampler):
+    # What the full [B, T, U+1, V] objective is charged: B x max(frames) x max(transcript).
+    return sum(
+        len(b) * max(sampler._frames[i] for i in b) * max(sampler._tokens[i] for i in b)
+        for b in sampler._batch_list()
+    )
+
+
+def test_order_defaults_to_a_pure_duration_sort(tmp_path):
+    # token_sort_window defaults to 1 (off), and off must mean off: transcript length does not
+    # influence the order at all, so the batch stream is the one every measured recipe used.
+    p = _alternating_manifest(tmp_path)
+    s = FrameBucketSampler(p, max_frames_per_batch=400, max_tokens_per_batch=880)
+    assert s._order == sorted(range(40), key=lambda i: s._frames[i])
+
+
+def test_token_sort_window_cuts_lattice_padding(tmp_path):
+    # The full [B,T,U+1,V] lattice is charged at the batch's *max* transcript length, not its mean,
+    # so mixing a 120-char utterance with 40-char ones costs 3x on every one of them. Re-sorting by
+    # transcript length inside a duration window makes a batch homogeneous in U -- and every
+    # utterance must still be emitted exactly once.
+    p = _alternating_manifest(tmp_path, n=2000, short=40, long=120)
+    budgets = dict(max_frames_per_batch=10**9, max_tokens_per_batch=480)
+
+    off = FrameBucketSampler(p, token_sort_window=1, **budgets)
+    on = FrameBucketSampler(p, token_sort_window=500, **budgets)
+    assert _lattice_cells(on) < 0.75 * _lattice_cells(off)
+    assert sorted(i for b in on for i in b) == list(range(2000))  # nothing lost or duplicated
+
+
+def test_token_sort_window_must_exceed_the_batch_size_to_do_anything(tmp_path):
+    # The footgun. The re-sort only pays off where a whole batch fits inside one homogeneous run of
+    # the window; a window of the same order as the batch just interleaves the two lengths again and
+    # buys nothing. On train_sp2 the mean batch is ~22 utterances, which is why the candidate values
+    # are in the hundreds and 1 means off.
+    p = _alternating_manifest(tmp_path, n=2000, short=40, long=120)
+    budgets = dict(max_frames_per_batch=10**9, max_tokens_per_batch=480)  # ~6-12 utts per batch
+
+    off = _lattice_cells(FrameBucketSampler(p, token_sort_window=1, **budgets))
+    narrow = _lattice_cells(FrameBucketSampler(p, token_sort_window=8, **budgets))
+    wide = _lattice_cells(FrameBucketSampler(p, token_sort_window=500, **budgets))
+    assert narrow > 0.99 * off  # a window the size of a batch is inert
+    assert wide < 0.75 * off
+
+
+def test_token_sort_window_is_inert_without_a_token_budget(tmp_path):
+    # The window re-sorts by a quantity no budget is tracking, so without max_tokens_per_batch it
+    # would perturb the batch stream for nothing. Guard that it stays a plain duration sort.
+    p = _alternating_manifest(tmp_path)
+    s = FrameBucketSampler(p, max_frames_per_batch=400, token_sort_window=8)
+    assert s._order == sorted(range(40), key=lambda i: s._frames[i])
+
+
+def test_shuffle_permutes_without_mutating_the_cached_order(tmp_path):
+    # The batch list is built once and cached; shuffling must not consume it. Two epochs must give
+    # two different orders over the SAME batches, and epoch N's permutation must depend only on the
+    # seed and N -- not on how many times the sampler happened to be iterated before.
+    p = _alternating_manifest(tmp_path)
+    s = FrameBucketSampler(p, max_frames_per_batch=400, max_tokens_per_batch=880, shuffle=True)
+    canonical = [tuple(b) for b in s._batch_list()]
+    first, second = [tuple(b) for b in s], [tuple(b) for b in s]
+    assert sorted(first) == sorted(canonical) == sorted(second)
+    assert first != second
+    assert [tuple(b) for b in s._batch_list()] == canonical
 
 
 def test_lattice_budget_bounds_the_worst_case_batch(tmp_path):
-    # Two sum budgets never bound B * max(frames) * max(tokens), which is what the RNN-T lattice
-    # (and therefore peak VRAM) actually costs. One long-transcript utterance among short ones is
-    # enough to make a batch that fits both sums cost several times the typical one.
+    # Two sum budgets never bound B * max(frames) * max(tokens), which is what the alignment grid
+    # actually costs -- VRAM under the full objective, simple-loss bandwidth under the pruned one.
+    # One long-transcript utterance among short ones is enough to make a batch that fits both sums
+    # cost several times the typical one.
     rows = [{"num_samples": 16000, "text": "A" * 20} for _ in range(9)]
     rows.append({"num_samples": 16000, "text": "B" * 300})
     p = tmp_path / "m.jsonl"
     p.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
-    budgets = dict(max_frames_per_batch=10_000, max_tokens_per_batch=10_000, token_sort_window=0)
+    budgets = dict(max_frames_per_batch=10_000, max_tokens_per_batch=10_000)
 
     def worst(sampler):
         return max(

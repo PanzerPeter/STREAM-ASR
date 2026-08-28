@@ -1,4 +1,4 @@
-# BEST-RQ ignores transcripts, so pretraining reads only the cached fp16 log-mel mmap — the
+# BEST-RQ ignores transcripts, so pretraining reads only the cached fp16 log-mel mmap, the
 # lightest possible item path, keeping the pretrain loop GPU-bound.
 import json
 

@@ -61,8 +61,7 @@ waits on, and the GIL serialises exactly that. Measured over 6 passes × 40 utte
 Threads buy nothing here, processes do, and the gain flattens past 3 or 4 workers because the GPU is
 already at ~85 %. Each worker rebuilds its own model from the checkpoint and shares nothing but the
 read-only file, which is why the ceiling is VRAM rather than cores. The parent process holds no
-model at all until the timing pass, and CUDA-graph capture stops being a hazard since each process
-has one thread.
+model at all until the timing pass.
 
 *Timing* then re-runs the same configurations alone and serially over `eval.rtf_probe_utts` (200)
 evenly strided utterances. RTF, first-partial latency and finalize cost mean nothing under

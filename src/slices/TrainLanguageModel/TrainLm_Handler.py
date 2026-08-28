@@ -106,7 +106,7 @@ class TrainLm_Handler:
         win_loss = torch.zeros((), device=device)  # accumulate on-device; sync only at log_every
         it = iter(loader)
         step = start  # survives an already-finished budget, where the loop below never runs
-        log.info(f"Training loop started — step {start:,} → {steps:,}.")
+        log.info(f"Training loop started: step {start:,} -> {steps:,}.")
         with SignalGuard() as guard:
             for step in range(start + 1, steps + 1):
                 shape = self._lr_shape(step, lm)
@@ -150,7 +150,7 @@ class TrainLm_Handler:
                     now = time.perf_counter()
                     its = (step - win_step) / max(now - win_start, 1e-9)
                     avg_loss = (win_loss / max(step - win_step, 1)).item()  # one sync per window
-                    eta = _fmt_hms((steps - step) / its) if its > 0 else "—"
+                    eta = _fmt_hms((steps - step) / its) if its > 0 else "-"
                     pct = 100.0 * step / steps
                     log.info(
                         f"step {step:>7,}/{steps:,} ({pct:4.1f}%) │ "
@@ -179,7 +179,7 @@ class TrainLm_Handler:
                     self._save(last_ckpt, model, optimizers, step, resume_count, best)
                 if guard.stop_requested:
                     self._save(last_ckpt, model, optimizers, step, resume_count, best)
-                    log.warning(f"interrupt received — checkpointed @ step {step:,}; exiting.")
+                    log.warning(f"interrupt received; checkpointed @ step {step:,}, exiting.")
                     writer.close()
                     return best
 
@@ -221,10 +221,11 @@ class TrainLm_Handler:
     ) -> DataLoader[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         # replacement=True is load-bearing at corpus scale: the whole LibriSpeech-LM corpus packs
         # to ~1.6e9 windows, and shuffle=True (replacement=False) would make RandomSampler
-        # materialize torch.randperm(1.6e9).tolist() — a ~13 GB tensor plus a billion-element
-        # Python list — which OOM-swaps before step 1 (RAM pinned, GPU idle). Sampling with
+        # materialize torch.randperm(1.6e9).tolist(), a ~13 GB tensor plus a billion-element
+        # Python list, which OOM-swaps before step 1 (RAM pinned, GPU idle). Sampling with
         # replacement draws lazy torch.randint chunks instead (flat memory), and at 1.6e9 windows
-        # the collision rate over a run is negligible — the nanoGPT-style sampling this file wants.
+        # the collision rate over a run is negligible. This is the nanoGPT-style sampling this
+        # file wants.
         ds = LmDataset(bin_path, ctx)
         # Explicit generator rather than the global RNG: resume_if_available restores the RNG state
         # the interrupted run was at, which would make the restart replay the same windows. Seeding

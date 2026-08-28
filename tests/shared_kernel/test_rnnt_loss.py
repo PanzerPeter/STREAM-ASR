@@ -151,3 +151,41 @@ def test_frame_slabbing_does_not_change_the_result(monkeypatch):
 
     assert torch.equal(whole, slabbed)
     assert torch.equal(whole_in.grad, slabbed_in.grad)
+
+
+def test_alignment_loss_matches_the_logit_entry_point():
+    # alignment_loss is the same recursion as rnnt_loss, entered one level lower: the caller
+    # supplies the alignment-grid log-probs instead of a lattice. Driving both from the same logits
+    # must give the same cost, or the pruned path (which only has the lower entry) is scoring a
+    # different model.
+    import torch
+    import torch.nn.functional as F
+    from src.shared_kernel.RnntLoss import alignment_loss, rnnt_loss
+
+    torch.manual_seed(0)
+    b, t, u, v, blank = 2, 6, 3, 7, 6
+    logits = torch.randn(b, t, u + 1, v, dtype=torch.float64)
+    targets = torch.randint(0, blank, (b, u), dtype=torch.int32)
+    frames = torch.tensor([6, 5], dtype=torch.int32)
+    labels = torch.tensor([3, 2], dtype=torch.int32)
+
+    log_probs = F.log_softmax(logits, dim=-1)
+    blank_lp = log_probs[..., blank].clone()
+    label_lp = (
+        log_probs[:, :, :u, :]
+        .gather(3, targets.long().view(b, 1, u, 1).expand(b, t, u, 1))
+        .squeeze(3)
+    )
+
+    cost, alpha, beta = alignment_loss(blank_lp, label_lp, frames.long(), labels.long())
+    reference = rnnt_loss(logits, targets, frames, labels, blank=blank, reduction="none")
+
+    assert torch.allclose(cost, reference, atol=1e-9)
+    assert alpha.shape == (b, t, u + 1)
+    assert beta.shape == (b, t, u + 1)
+    # alpha[0,0] is the empty prefix: probability 1, log 0.
+    assert torch.allclose(alpha[:, 0, 0], torch.zeros(b, dtype=torch.float64), atol=1e-12)
+    # beta[0,0] is the same total probability read backwards. Row 1 is ragged in BOTH axes, so this
+    # only holds if alignment_loss masked the padding itself -- an unmasked beta sees a padded
+    # neighbour's arcs and leaks probability in.
+    assert torch.allclose(beta[:, 0, 0], -cost, atol=1e-9)

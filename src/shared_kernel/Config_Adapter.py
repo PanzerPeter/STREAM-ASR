@@ -42,6 +42,13 @@ class ModelConfig(BaseModel):
     final_downsample: int
     rope_base: float
     encoder_value_residual_lambda: float
+    biasnorm_log_scale_min: float
+    biasnorm_log_scale_max: float
+    biasnorm_max_amplification: float
+    stack_bypass_min: float
+    stack_in_proj_max_sigma: float
+    trunk_norm: bool
+    trunk_norm_log_scale_max: float
     vocab_size: int
 
     @computed_field  # type: ignore[prop-decorator]
@@ -98,8 +105,16 @@ class TransducerTrainConfig(BaseModel):
     max_frames_per_batch: int
     max_tokens_per_batch: int
     max_lattice_per_batch: int
-    # Width of the transcript-length re-sort inside the duration sort (FrameBucketSampler). 1 = off.
+    # Width of the sliding window the duration sort is re-sorted by transcript length inside, so a
+    # batch is homogeneous in U as well as in T. 1 = off (plain duration sort).
     token_sort_window: int = 1
+    # "full" materialises the whole [B,T,U+1,V] lattice; "pruned" evaluates the real joiner only on
+    # an s_range-wide band chosen by a linear simple joiner. Literal, not str: a typo here would
+    # otherwise silently fall through to the full objective for a whole run.
+    rnnt_loss: Literal["full", "pruned"] = "full"
+    s_range: int = 5
+    prune_warmup_steps: int = 4000
+    simple_loss_scale: float = 0.5
     grad_accum: int
     warmup_steps: int
     total_steps: int
@@ -110,12 +125,23 @@ class TransducerTrainConfig(BaseModel):
     lr_stable_ratio: float = 1.0
     lr_decay_frac: float = 0.25
     lr_min_ratio: float = 0.0
-    weight_decay: float
     grad_clip: float
+    # Runaway detector (see _train_utils.GradNormGuard). grad_clip cannot serve as one:
+    # Newton-Schulz
+    # renormalises Muon's update, so clipping the gradient does not bound the step for any of the
+    # encoder's 2D matrices. Sampled at log_every, where the grad norm is already synced to host.
+    guard_window: int = 20  # log windows in the trend median; 0 disables the guard entirely
+    guard_trend_factor: float = (
+        4.0  # trip when that median exceeds this x the run's quietest median
+    )
+    guard_patience: int = 3  # consecutive tripped windows before the run aborts
     log_every: int
     val_every: int
     ckpt_every: int
     grad_checkpoint: bool = False
+    # Selective torch.compile of the elementwise leaf modules (see
+    # _train_utils.compile_hot_modules). NOT whole-model compilation, which this build cannot do.
+    compile_modules: bool = True
     seed: int = 42
     chunk_sizes: tuple[int, ...]
     warm_start: str
@@ -194,18 +220,26 @@ class OptimConfig(BaseModel):
 
 
 class PretrainConfig(BaseModel):
+    lr_scale: float
     codebook_size: int
     codebook_dim: int
+    num_codebooks: int
     mask_prob: float
     mask_span: int
     noise_std: float
     stack_frames: int
+    chunk_sizes: list[int]
     warmup_steps: int
     total_steps: int
+    lr_schedule: str
+    lr_decay_frac: float
+    lr_min_ratio: float
     seed: int
     grad_clip: float
     log_every: int
     save_every: int
+    dev_every: int
+    dev_batches: int
     max_frames_per_batch: int
 
 

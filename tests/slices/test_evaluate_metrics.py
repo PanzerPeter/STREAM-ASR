@@ -28,3 +28,23 @@ def test_reference_length_survives_an_empty_hypothesis():
     # An empty hypothesis must still contribute its reference length to the divisor, or dropping a
     # decode would look like an improvement.
     assert word_errors("ONE TWO THREE", "") == (3, 3)
+
+
+def test_sweep_selects_a_length_bonus_that_fixes_deletions():
+    # RNN-T acoustic scores are un-normalised sums, so a short hypothesis wins on score even when
+    # it deletes words. A positive length_bonus must be selectable, and the sweep must key its
+    # results by all three weights.
+    from src.slices.Decode.StreamingDecode_Response import NbestEntry
+    from src.slices.Evaluate.evaluate import _sweep
+
+    # hyp 0: 1 token, best acoustic, 2 deletions. hyp 1: 3 tokens, worse acoustic, correct.
+    nbest = [
+        NbestEntry(ids=[1], acoustic=-1.0, lm=0.0, ilm=0.0),
+        NbestEntry(ids=[1, 2, 3], acoustic=-2.0, lm=0.0, ilm=0.0),
+    ]
+    prepared = [(nbest, [2, 0], 3)]
+
+    wer = _sweep(prepared, [0.0], [0.0], [0.0, 1.0])
+    assert set(wer) == {(0.0, 0.0, 0.0), (0.0, 0.0, 1.0)}
+    assert wer[(0.0, 0.0, 0.0)] == 2 / 3  # no bonus -> the short hypothesis wins
+    assert wer[(0.0, 0.0, 1.0)] == 0.0  # +1.0/token -> -2+3 = 1.0 beats -1+1 = 0.0

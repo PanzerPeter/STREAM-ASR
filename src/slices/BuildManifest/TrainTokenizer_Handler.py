@@ -21,7 +21,7 @@ def train_tokenizer(cmd: TrainTokenizerCommand) -> str:
             text_file.write(json.loads(line)["text"] + "\n")
         corpus_path = text_file.name
 
-    spm.SentencePieceTrainer.train(
+    spm.SentencePieceTrainer.Train(
         input=corpus_path,
         model_prefix=cmd.model_prefix,
         vocab_size=cmd.vocab_size,

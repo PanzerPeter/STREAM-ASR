@@ -5,7 +5,7 @@ EXPECTED_CAPABILITY = (12, 0)  # RTX 5070 Blackwell sm_120
 
 def main() -> None:
     if not torch.cuda.is_available():
-        raise SystemExit("CUDA not available — check the cu128 install.")
+        raise SystemExit("CUDA not available. Check the cu128 install.")
 
     cap = torch.cuda.get_device_capability()
     if cap != EXPECTED_CAPABILITY:

@@ -9,16 +9,18 @@ lm_checkpoint: data/checkpoints/lm_best.pt
 # n-best re-ranking: acoustic + lm_weight*lm - ilm_weight*ilm + length_bonus*len. All three weights
 # default to 0.0, which reproduces the pure-acoustic decoder exactly (the regression lock), and all
 # three are swept together by evaluate.py's dev sweep (automatic unless --no-tune).
-# alpha: external STREAM-LM sequence score. Dev-tuned optimum 0.6 in both modes and on both acoustic
-# conditions (2026-08-01) -- but 0.6 is the TOP of evaluate.py's default --lm-grid and it was
-# selected in all four sweeps, so the true optimum may be higher. Widen the grid before trusting it.
+# alpha: external STREAM-LM sequence score. Dev-tuned 2026-08-28 on the 600k model: 0.5 offline /
+# 0.7 streaming on clean, 0.7 / 1.1 on other -- all interior to the grid, so the v1.0 "alpha is
+# pinned at the top of --lm-grid" caveat is discharged. The harder the acoustics, the more external
+# LM the beam wants.
 lm_weight: 0.0
 # beta: subtracts the language prior the transducer's own predictor+joiner already carries, so the
-# external LM is not counted on top of it. Useful range ~[0.0, 0.5] — it must stay below alpha, or
-# the net prior flips sign. Dev-tuned optimum 0.2 offline / 0.3 streaming: streaming's acoustic
-# scores are weaker, so more of the internal prior has to come off before the external LM lands. On
-# test-other the tuned pair is 0.3 in BOTH modes.
+# external LM is not counted on top of it. Useful range ~[0.0, 0.6], and it must stay below
+# alpha, or the net prior flips sign. Dev-tuned 2026-08-28: clean 0.3 offline / 0.2 streaming,
+# other 0.4 offline / 0.5 streaming.
+# It tracks alpha, since both scale with how much of the score the beam wants from the LM.
 ilm_weight: 0.0
-# Per-token bonus offsetting RNN-T's un-normalised deletion bias. Try ~[0.0, 1.0] if deletions
-# dominate the error breakdown.
+# Per-token bonus offsetting RNN-T's un-normalised deletion bias. Dev-tuned 2026-08-28: clean 0.25
+# offline / 0.5 streaming, other 0.25 / 1.0. dev-other streaming selected 1.0, which is the TOP of
+# evaluate.py's 5-point grid, and the sweep warned about it -- widen that axis before trusting it.
 length_bonus: 0.0

@@ -41,7 +41,7 @@ class RotaryAttention(nn.Module):
         self, v: torch.Tensor, value_residual: torch.Tensor | None
     ) -> torch.Tensor:
         # Add the stack's layer-0 values before attention (and before caching in streaming), so a
-        # cached value already carries the residual — exactly what the chunked forward computes.
+        # cached value already carries the residual, exactly what the chunked forward computes.
         if value_residual is not None:
             v = v + self.res_lambda * value_residual
         return v

@@ -4,6 +4,7 @@ import torch.nn.functional as F
 
 from src.shared_kernel.Config_Adapter import get_config
 from src.shared_kernel.RnntLoss import rnnt_loss
+from src.shared_kernel.RnntLossPruned import prune_ranges, rnnt_loss_pruned, rnnt_loss_simple
 from src.slices.ExtractFeatures.FeatureBatch_Response import FeatureBatch
 from src.slices.ExtractFeatures.SpecAugmentBatch import apply_spec_augment_batch
 from src.slices.TrainAcousticModel.StatelessPredictor import StatelessPredictor
@@ -29,6 +30,18 @@ class TransducerModel(nn.Module):
         )
         self.predictor = StatelessPredictor()
         self.joiner = TransducerJoiner()
+        t_cfg = get_config().training.transducer
+        self._rnnt_objective = t_cfg.rnnt_loss
+        self._s_range = t_cfg.s_range
+        self._prune_warmup_steps = t_cfg.prune_warmup_steps
+        self._simple_loss_scale = t_cfg.simple_loss_scale
+        if self._rnnt_objective == "pruned":
+            # Linear in both inputs on purpose: a *sum* of two vocab-width projections makes the
+            # log-normaliser separable, so the [B,T,U+1,V] tensor it implies is a transient inside
+            # the loss rather than a stored activation. Any non-linearity here (a tanh, as the real
+            # joiner has) would put the lattice back on the VRAM budget.
+            self.simple_am_proj = nn.Linear(self.encoder.output_dim, model.logits_width)
+            self.simple_lm_proj = nn.Linear(t.predictor_dim, model.logits_width)
         self._blank = model.blank_id
         self._ctc_aux_weight = t.ctc_aux_weight
         self._spec_augment = get_config().training.transducer.spec_augment
@@ -130,33 +143,89 @@ class TransducerModel(nn.Module):
             total = total + w * term
         return total
 
+    def _ramp(self, step: int) -> tuple[float, float]:
+        # Linear over prune_warmup_steps loader batches, constant after. The bounds come from a
+        # freshly-initialised simple joiner, so they are noise early: weight the pruned term down
+        # until the projections mean something, and keep the simple term at full strength while
+        # they are learning.
+        frac = min(1.0, step / max(1, self._prune_warmup_steps))
+        simple = 1.0 + frac * (self._simple_loss_scale - 1.0)
+        pruned = 0.1 + frac * 0.9
+        return simple, pruned
+
     def rnnt_loss(
         self,
         memory: torch.Tensor,
         out_lengths: torch.Tensor,
         tokens: torch.Tensor,
         token_lengths: torch.Tensor,
-    ) -> torch.Tensor:
-        # Blank-prefixed prediction inputs -> predictor -> full joiner lattice [B, T, U+1, V].
+        step: int = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Returns ``(weighted_total, simple_term, pruned_term)``, all per-token.
+
+        Under the ``full`` objective there is no simple term and the three are the same number, so
+        callers can log and weight one shape regardless of which objective is configured.
+        """
+        # Blank-prefixed prediction inputs -> predictor -> joiner lattice.
         batch_size = tokens.shape[0]
         blanks = torch.full((batch_size, 1), self._blank, dtype=torch.long, device=tokens.device)
         pred_in = torch.cat([blanks, tokens], dim=1)  # [B, U+1]
         pred = self.predictor(pred_in)  # [B, U+1, Dp]
-        # Training runs this under bf16 autocast, so the joiner's Linear emits bf16 logits. They go
-        # to the loss as-is: it promotes to fp32 inside its own log-softmax, so the bf16 lattice is
-        # the only [B, T, U+1, V] tensor that has to survive until backward. Materialising an fp32
-        # copy here instead would double that, on the step's largest allocation.
-        logits = self.joiner(memory, pred)  # [B, T, U+1, V]
-        loss_sum: torch.Tensor = rnnt_loss(
+        # Per-token mean -> same O(1) scale as the CTC aux (see RNNTLoss note in __init__).
+        norm = token_lengths.sum().clamp(min=1)
+        if self._rnnt_objective == "full":
+            # Training runs this under bf16 autocast, so the joiner's Linear emits bf16 logits.
+            # They go to the loss as-is: it promotes to fp32 inside its own log-softmax, so the
+            # bf16 lattice is the only [B, T, U+1, V] tensor that has to survive until backward.
+            # Materialising an fp32 copy here instead would double that, on the step's largest
+            # allocation.
+            logits = self.joiner(memory, pred)  # [B, T, U+1, V]
+            full = (
+                rnnt_loss(
+                    logits,
+                    tokens.int(),
+                    out_lengths.int(),
+                    token_lengths.int(),
+                    blank=self._blank,
+                    reduction=self._rnnt_reduction,
+                )
+                / norm
+            )
+            return full, full, full
+
+        # The simple joiner runs at fp32: it is two [B, ., V] projections rather than a lattice, so
+        # the precision is nearly free, and the bounds it produces are integers that a bf16 rounding
+        # wobble could shift by a whole symbol.
+        am = self.simple_am_proj(memory).float()  # [B, T, V]
+        lm_proj = self.simple_lm_proj(pred).float()  # [B, U+1, V]
+        simple_sum, occupancy = rnnt_loss_simple(
+            am, lm_proj, tokens.int(), out_lengths.int(), token_lengths.int(), blank=self._blank
+        )
+        # Clamp the band to the padded transcript width. Reading token_lengths.max() instead would
+        # be one device->host sync per step for a strictly narrower band; pred.shape[1] bounds the
+        # gather below just as tightly, since s_begin <= max(0, labels+1-s_range).
+        s_range = min(self._s_range, pred.shape[1])
+        s_begin = prune_ranges(occupancy, out_lengths.long(), token_lengths.long(), s_range)
+        # Gather the predictor output on the band: [B, T, s_range, Dp]. The encoder memory
+        # broadcasts over the band axis, so only the predictor side is gathered.
+        idx = s_begin.unsqueeze(-1) + torch.arange(s_range, device=pred.device)  # [B, T, S]
+        pred_band = pred.gather(
+            1, idx.reshape(batch_size, -1, 1).expand(-1, -1, pred.shape[-1])
+        ).view(batch_size, memory.shape[1], s_range, pred.shape[-1])
+        logits = self.joiner.band(memory, pred_band)  # [B, T, s_range, V]
+        pruned_sum = rnnt_loss_pruned(
             logits,
             tokens.int(),
+            s_begin,
             out_lengths.int(),
             token_lengths.int(),
             blank=self._blank,
-            reduction=self._rnnt_reduction,
+            reduction="sum",
         )
-        # Per-token mean -> same O(1) scale as the CTC aux (see RNNTLoss note in __init__).
-        return loss_sum / token_lengths.sum().clamp(min=1)
+        simple_term = simple_sum.sum() / norm
+        pruned_term = pruned_sum / norm
+        simple_scale, pruned_scale = self._ramp(step)
+        return simple_scale * simple_term + pruned_scale * pruned_term, simple_term, pruned_term
 
     def _interctc_weighted(self, ictc_terms: list[torch.Tensor]) -> torch.Tensor:
         total = ictc_terms[0].new_zeros(())
@@ -181,8 +250,8 @@ class TransducerModel(nn.Module):
         return (per_frame * mask).sum() / mask.sum().clamp(min=1)
 
     def joint_loss(
-        self, batch: FeatureBatch, chunk_size: int
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        self, batch: FeatureBatch, chunk_size: int, step: int = 0
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         device = self.ctc_head.weight.device
         # non_blocking pairs with the loader's pin_memory: the four H2D copies are issued async and
         # overlap with the tail of the previous step instead of blocking the launch thread on each.
@@ -191,7 +260,7 @@ class TransducerModel(nn.Module):
         tokens = batch.tokens.to(device, non_blocking=True)
         tlens = batch.token_lengths.to(device, non_blocking=True)
         if self._cr_ctc and self.training:
-            return self._joint_loss_cr(feats, flens, tokens, tlens, chunk_size)
+            return self._joint_loss_cr(feats, flens, tokens, tlens, chunk_size, step)
         # SpecAugment is a train-only input regulariser; joint_loss is only ever the training path,
         # but gate on self.training anyway so an eval-mode caller can never mask its own inputs.
         if self._spec_augment and self.training:
@@ -199,14 +268,17 @@ class TransducerModel(nn.Module):
         memory, out_len, ctc_logits, interctc_logits, base_len = self.forward(
             feats, flens, chunk_size
         )
-        rnnt = self.rnnt_loss(memory, out_len, tokens, tlens)
+        rnnt, simple, pruned = self.rnnt_loss(memory, out_len, tokens, tlens, step)
         ctc = self.ctc_loss(ctc_logits, out_len, tokens, tlens)
         ictc_terms = self.interctc_terms(interctc_logits, base_len, tokens, tlens)
         total = rnnt + self._ctc_aux_weight * ctc + self._interctc_weighted(ictc_terms)
         # Return the RAW mean interctc (not the weighted sum) for logging -- it tracks the actual
         # CTC-decodability of the tapped stacks, the signal that flags encoder erosion.
         ictc_raw = torch.stack(ictc_terms).mean()
-        return total, rnnt, ctc, ictc_raw, rnnt.new_zeros(())
+        # `pruned` occupies the rnnt slot the trainer already logs: it is the term the WER tracks.
+        # `simple` rides alongside because a diverging simple loss silently corrupts the bounds --
+        # the pruned term would stay finite while the band drifted off the real alignment.
+        return total, pruned, ctc, ictc_raw, rnnt.new_zeros(()), simple
 
     def _joint_loss_cr(
         self,
@@ -215,7 +287,8 @@ class TransducerModel(nn.Module):
         tokens: torch.Tensor,
         tlens: torch.Tensor,
         chunk_size: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        step: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # Two independently masked SpecAugment views. View 1 carries the whole objective; view 2 is
         # a second CTC-only forward whose head is tied to view 1's by the consistency KL. RNN-T runs
         # on view 1 ONLY -- its [B,T,U+1,V] lattice is the memory hog and CR-CTC's gain lives in the
@@ -228,7 +301,7 @@ class TransducerModel(nn.Module):
         # their [B, T_base, V] logits, all of which this path discards.
         mem2, _ = self.encoder(view2, flens, chunk_size)
         ctc2 = self.ctc_head(mem2)
-        rnnt = self.rnnt_loss(memory, out_len, tokens, tlens)
+        rnnt, simple, pruned = self.rnnt_loss(memory, out_len, tokens, tlens, step)
         # log_softmax each view once and reuse it for both the CTC alignment term and the KL;
         # passing raw logits to each would softmax every view twice.
         log_p1 = F.log_softmax(ctc1, dim=-1)
@@ -247,4 +320,4 @@ class TransducerModel(nn.Module):
             + self._cr_weight * cr
         )
         ictc_raw = torch.stack(ictc_terms).mean()
-        return total, rnnt, ctc, ictc_raw, cr
+        return total, pruned, ctc, ictc_raw, cr, simple

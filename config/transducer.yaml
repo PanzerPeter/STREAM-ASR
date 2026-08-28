@@ -13,7 +13,7 @@ interctc_weights: [0.15, 0.15]
 # lower max_frames_per_batch. The RNN-T lattice is computed on view 1 ONLY.
 #
 # OFF: a full 164k-step run reached dev transducer-WER 0.0674 vs the shipped recipe's 0.0553, with
-# InterCTC and grad-norm climbing through the tail — it over-regularises this model at this budget.
+# InterCTC and grad-norm climbing through the tail: it over-regularises this model at this budget.
 # Re-enable only alongside a retune of cr_weight / ctc_aux_weight.
 cr_ctc: false
 cr_weight: 0.2            # weight on the consistency KL term; 0 disables even with cr_ctc on

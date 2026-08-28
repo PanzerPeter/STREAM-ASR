@@ -66,6 +66,7 @@ class DecodePassJob:
     limit: int | None
     lm_weight: float
     ilm_weight: float
+    length_bonus: float
     measure_timing: bool
     label: str
 
@@ -73,7 +74,7 @@ class DecodePassJob:
 # Per-process caches: a worker that handles two jobs must not reload a 220 MB checkpoint or a
 # 350 MB LM to do it, and the parent reuses the same entries for its serial timing pass.
 _MODELS: dict[tuple[str, str], tuple[TransducerModel, SentencePieceTokenizer]] = {}
-_DECODERS: dict[tuple[str, str, str, float, float], StreamingDecoder_Handler] = {}
+_DECODERS: dict[tuple[str, str, str, float, float, float], StreamingDecoder_Handler] = {}
 
 
 def _model_and_tok(job: DecodePassJob) -> tuple[TransducerModel, SentencePieceTokenizer]:
@@ -92,6 +93,7 @@ def build_decoder(
     stage: str,
     lm_weight: float,
     ilm_weight: float,
+    length_bonus: float,
 ) -> StreamingDecoder_Handler:
     # The decoder loads the LM only when the stage's fuse_lm gate is set AND lm_weight > 0, so
     # non-LM stages (and alpha == 0) pay no LM cost; that same gate zeroes beta, keeping the
@@ -104,14 +106,24 @@ def build_decoder(
         fuse_lm=f.fuse_lm,
         lm_weight=lm_weight,
         ilm_weight=ilm_weight,
+        length_bonus=length_bonus,
     )
 
 
 def _decoder_for(job: DecodePassJob) -> StreamingDecoder_Handler:
-    key = (job.checkpoint, job.tokenizer, job.stage, job.lm_weight, job.ilm_weight)
+    key = (
+        job.checkpoint,
+        job.tokenizer,
+        job.stage,
+        job.lm_weight,
+        job.ilm_weight,
+        job.length_bonus,
+    )
     if key not in _DECODERS:
         model, tok = _model_and_tok(job)
-        _DECODERS[key] = build_decoder(model, tok, job.stage, job.lm_weight, job.ilm_weight)
+        _DECODERS[key] = build_decoder(
+            model, tok, job.stage, job.lm_weight, job.ilm_weight, job.length_bonus
+        )
     return _DECODERS[key]
 
 

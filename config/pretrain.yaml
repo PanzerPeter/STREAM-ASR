@@ -1,26 +1,113 @@
 # BEST-RQ self-supervised pretrain. Optimizer LRs come from optim.yaml; this file owns only the
-# BEST-RQ knobs and the schedule length.
+# BEST-RQ knobs and the schedule.
+#
+# NOTE on optim.yaml's `encoder_lr_scale`: it does NOT apply here. It exists to fine-tune a
+# warm-started encoder gently while fresh heads adapt, which is a transducer-stage concern -- in
+# this stage the encoder IS the thing being trained and there is nothing to preserve. See
+# BestRqPretrainer_Handler, which overrides it to 1.0 and applies `lr_scale` below instead.
+
+# Uniform multiplier on every optimizer group's peak LR, this stage only.
+#
+# 0.5 restores the LR the encoder actually trained at in the pretrain that produced the only model
+# this project has shipped (3.43 % test-clean). That run predates the `encoder_lr_scale` fix above,
+# so `encoder.*` -- 53.8 M of 62.2 M trainable parameters -- silently ran at 0.5x peak. Removing that
+# accident DOUBLED the encoder's LR, which was never a measured choice, and it inflated the trunk
+# the transducer stage inherits. MEASURED on the two pretrains, both 180k steps, same everything
+# else:
+#
+#   in_proj gain, ||W||_F/sqrt(n_out)   stack1  stack2  stack3  stack4  stack5   product
+#   old pretrain (0.5x, -> 3.43 %)        1.90    1.60    0.68    0.65    0.92       1.2
+#   new pretrain (1.0x, 2026-08-20)       3.10    1.31    1.02    1.01    1.30       5.4
+#   ratio                                 1.63    0.82    1.50    1.55    1.41
+#
+# ratio ~ sqrt(2) per stack, which is what a doubled LR predicts for a norm set by a
+# diffusion/weight-decay balance. In realized amplitude on dev audio the handoff went from trunk
+# RMS 2.2-3.6 to 5.7-17.0, against 1.5-2.7 for the trained model that works -- i.e. the transducer
+# stage now starts ~5x louder than where a healthy run ENDS. It reached bypass_2 = 0.20 at handoff
+# (old: 0.42), and stack 2 is the one that collapsed in both 2026-08-2x runs.
+#
+# Applied uniformly, to `pred_head` as well as the encoder, which is the part of the old behaviour
+# that WAS a bug: an LR split between the two was never a design choice, just the transducer's knob
+# leaking in. This does not bound anything -- `model.stack_in_proj_max_sigma` does that, and is
+# projected in this stage too -- it sets where the stage starts from.
+lr_scale: 0.5
 codebook_size: 8192
 codebook_dim: 16
-# Per-frame span-START probability (wav2vec2 convention): apply_span_mask draws
-# int(mask_prob*valid) starts, each extended by mask_span, so the masked fraction is
-# ~mask_prob*mask_span before overlap. 0.05 x span 10 measures ~39% masked, the designed difficulty
-# — well inside the 40-50% BEST-RQ/wav2vec2 rely on. At 0.01 only ~10% is masked, which makes the
-# infill task trivial and the learned features weak. Raise toward 0.065 (~48%) if the loss stays low.
-mask_prob: 0.05
-mask_span: 10
+# Number of INDEPENDENT random-projection quantizers, each with its own seed, its own slice of the
+# prediction head, and its own cross-entropy term (the loss is their mean). USM's multi-softmax.
+#
+# One codebook makes the entire pretraining signal a single frozen random draw, and that draw is a
+# lottery. MEASURED on 300 dev utterances, code entropy of the target distribution at K=8192, D=16
+# across 20 seeds: min 7.64 bits, mean 8.21, max 8.90 -- and this repo's seed 42 lands at 7.93,
+# below the mean. Averaging N independent draws replaces one sample of that distribution with its
+# mean, which is what the literature reports as "stabilises pre-training and reduces run-to-run
+# variance" (Google USM uses 16; arXiv 2501.16131 reports up to 23.8 %/30.6 % relative WER on
+# LibriSpeech test-clean/other with 6).
+#
+# Cost is pretrain-only: the head is 256 x (N * 8192) and is discarded at warm start. It is not
+# free in compute either, so head and quantizer are both evaluated ONLY on the masked positions
+# that enter the loss (~45 %) rather than on the full grid.
+num_codebooks: 4
+# Per-frame span-START probability, then each start is extended by mask_span frames, so the masked
+# fraction is 1-(1-p)^span before edge effects: 0.02 x 30 measures 0.455.
+#
+# 30 frames = 300 ms, which is the BEST-RQ paper's STREAMING recipe (p=0.02, 300 ms; its
+# non-streaming one is p=0.01, 400 ms). The previous 0.05 x 10 gave a similar masked FRACTION
+# (0.478 measured, per the table below) but a completely different task. MEASURED on the 25 Hz target grid, B=32, T=1500:
+#
+#   p      span          target masked   run-len median   masked frames touching an unmasked one
+#   0.05   10 (100 ms)       0.478              4                       39.9 %
+#   0.025  20 (200 ms)       0.438              6                       24.4 %
+#   0.02   30 (300 ms)       0.455              9                      ~17   %
+#   0.015  40 (400 ms)       0.466             11                       12.7 %
+#
+# At 100 ms spans two fifths of the masked encoder frames sit next to an unmasked one, so the
+# infill is local interpolation and the encoder is never forced to use long-range phonetic context.
+# A 300 ms span is ~one chunk at training.transducer.chunk_sizes = 16 (320 ms base-rate).
+#
+# The masked fraction is the single hyperparameter reproductions find matters most (arXiv
+# 2405.04296 measures ~15 % relative WER improvement taking it from 1 % to 12 %), and 0.455 is at
+# the low end of what that work runs. Raise mask_prob toward 0.025 (0.54) before touching span.
+mask_prob: 0.02
+mask_span: 30
+# Std of the noise masked frames are replaced with, IN CMVN-NORMALIZED SPACE, matching the paper's
+# "normal distribution with 0 mean and 0.1 standard deviation" applied after its "input data is
+# normalized to have 0 mean and standard deviation of 1". The mask is applied to raw log-mel
+# (CMVN lives inside the encoder), so the fill is de-normalized to cmvn_mean + cmvn_std * N(0, s).
+# Filling raw log-mel with N(0, 0.1) directly -- what this used to do -- put masked frames at
+# +1.46 sigma with 0.024 sigma of variance, i.e. a constant high-energy plateau in a region of
+# input space the encoder never sees again at fine-tune time.
 noise_std: 0.1
 stack_frames: 0                # 0 = derive from encoder net subsampling (targets on its output grid)
+# Base-rate chunk sizes sampled per batch, 0 = full context. Mirrors
+# training.transducer.chunk_sizes so the encoder meets limited right-context during pretraining
+# rather than first meeting it in the supervised stage on a fifth of the data. The streaming gap is
+# this model's worst axis (1.02 abs pts on test-clean, 3.07 on test-other).
+chunk_sizes: [0, 16, 32]
 warmup_steps: 10000
-# BEST-RQ pretrains normally run 100k-400k steps. A 40k run plateaus only in the LOSS curve —
-# random-projection targets have an irreducible entropy floor that understates progress — nowhere
-# near a representation floor. total_steps is also the cosine anchor, so the LR reaches 0 exactly
-# here and an early stop still lands on a partially-annealed encoder rather than one near peak LR.
+# BEST-RQ pretrains normally run 100k-400k steps. A 40k run plateaus only in the LOSS curve --
+# random-projection targets have an irreducible entropy floor that understates progress -- nowhere
+# near a representation floor. Watch pretrain/acc and dev/acc, not the loss.
+#
+# 180k x 20k frames = 10,000 h = 5.2 passes over the 1,933 h train_sp2 corpus, ~6 h 20 m measured.
+# The SpeechBrain reproduction runs ~44,000 h, so this is ~1/4 of reference SSL compute.
 total_steps: 180000
+# WSD, as the transducer uses: hold the peak, then a 1-sqrt anneal over the last lr_decay_frac of
+# the budget. Under cosine, total_steps IS the curve, so extending a finished run re-heats the LR
+# at the resume step; under WSD it only moves the decay window. `cosine` remains available.
+lr_schedule: wsd
+lr_decay_frac: 0.25
+lr_min_ratio: 0.01
 seed: 42
 grad_clip: 5.0
 log_every: 50
 save_every: 2000
-# Looser than transducer.max_frames_per_batch (18k): the BEST-RQ forward is encoder + pred_head
+# Held-out masked-prediction probe: dev_batches batches from the dev cache under a fixed mask seed,
+# so dev/loss and dev/acc are comparable across steps and across runs. Nothing else in this stage
+# measures generalisation -- the train loss is over targets the quantizer draws from the same
+# utterances the encoder just saw.
+dev_every: 2000
+dev_batches: 16
+# Looser than transducer.max_frames_per_batch (28k): the BEST-RQ forward is encoder + pred_head
 # only, with no RNN-T joiner lattice (B*T*(U+1)) to bound.
 max_frames_per_batch: 20000

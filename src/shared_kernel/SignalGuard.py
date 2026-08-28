@@ -1,5 +1,5 @@
 # Cooperative interrupt handling for long training loops: catch SIGINT/SIGTERM, flip a flag, and let
-# the loop reach its next safe point to checkpoint and exit — rather than tearing down mid-step and
+# the loop reach its next safe point to checkpoint and exit, rather than tearing down mid-step and
 # corrupting state. Pairs with the atomic Checkpoint_Adapter to make Ctrl-C safe.
 import signal
 import types

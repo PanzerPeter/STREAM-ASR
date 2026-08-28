@@ -172,3 +172,14 @@ def test_streaming_greedy_equals_chunked_forward_greedy():
         mem_chunked, out_len = model.encoder(feats, lengths, chunk_size=chunk)
         ref_ids = handler.searcher.search(mem_chunked[:, : int(out_len[0])])[0][0]
     assert s.text == handler.tok.decode(ref_ids)
+
+
+def test_length_bonus_override_beats_config():
+    # The eval tuner picks length_bonus on dev; it must reach the live rescorer, not be silently
+    # overridden by the decode.yaml value (which stays 0.0 as the regression lock).
+    from src.shared_kernel.Config_Adapter import get_config
+
+    model = TransducerModel(cmvn_path=None).eval()
+    assert get_config().decode.length_bonus == 0.0
+    assert StreamingDecoder_Handler(model, _StubTok()).length_bonus == 0.0
+    assert StreamingDecoder_Handler(model, _StubTok(), length_bonus=0.75).length_bonus == 0.75

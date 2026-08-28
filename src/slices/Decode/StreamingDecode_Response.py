@@ -29,7 +29,7 @@ class StreamingDecode_Response:
     # the same as a 30 s one and LibriSpeech durations span more than an order of magnitude.
     decode_s: float
     audio_s: float
-    # Search + rescoring, i.e. everything after the encoder consumed the last chunk — what a live
+    # Search + rescoring, i.e. everything after the encoder consumed the last chunk: what a live
     # session still owes the user once the audio stops. LM n-best rescoring lands here, so this is
     # where the rescorer's latency cost shows up as itself.
     finalize_s: float

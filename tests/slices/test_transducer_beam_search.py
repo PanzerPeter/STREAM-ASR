@@ -1,4 +1,4 @@
-# TDD lock for TransducerBeamSearch (pure acoustic — the LM rescores the n-best in
+# TDD lock for TransducerBeamSearch (pure acoustic: the LM rescores the n-best in
 # StreamingDecoder_Handler, not per step): greedy must match the trainer's reference decode, and
 # the time-synchronous A/B beam must return a well-formed, best-first, duplicate-free n-best.
 #

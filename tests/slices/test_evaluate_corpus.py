@@ -129,9 +129,9 @@ def test_pick_best_weights_selects_lm_favoured_hypothesis():
             ],
         )
     ]
-    best, wer = _pick_best_weights(cache, [0.0, 0.5], [0.0], tok)
-    assert best == (0.5, 0.0)
-    assert wer[(0.0, 0.0)] == 0.5 and wer[(0.5, 0.0)] == 0.0
+    best, wer = _pick_best_weights(cache, [0.0, 0.5], [0.0], [0.0], tok)
+    assert best == (0.5, 0.0, 0.0)
+    assert wer[(0.0, 0.0, 0.0)] == 0.5 and wer[(0.5, 0.0, 0.0)] == 0.0
 
 
 def test_pick_best_weights_uses_ilm_subtraction_to_break_a_tie():
@@ -151,9 +151,9 @@ def test_pick_best_weights_uses_ilm_subtraction_to_break_a_tie():
             ],
         )
     ]
-    best, wer = _pick_best_weights(cache, [0.0], [0.0, 0.5], tok)
-    assert best == (0.0, 0.5)
-    assert wer[(0.0, 0.5)] == 0.0
+    best, wer = _pick_best_weights(cache, [0.0], [0.0, 0.5], [0.0], tok)
+    assert best == (0.0, 0.5, 0.0)
+    assert wer[(0.0, 0.5, 0.0)] == 0.0
 
 
 def test_oracle_wer_is_the_best_reachable_hypothesis_in_the_nbest():

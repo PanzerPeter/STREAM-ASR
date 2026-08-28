@@ -1,9 +1,9 @@
-# STREAM ASR v1.0
+# STREAM ASR v1.5
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.11%20%2B%20CUDA%2012.8-ee4c2c.svg)](https://pytorch.org/)
-[![WER](https://img.shields.io/badge/test--clean%20WER-3.43%25%20offline%20%7C%204.45%25%20streaming-brightgreen.svg)](#results)
+[![WER](https://img.shields.io/badge/test--clean%20WER-2.57%25%20offline%20%7C%203.43%25%20streaming-brightgreen.svg)](#results)
 
 **S**peech **T**ranscription via **R**egularized **E**ncoder-**A**coustic **M**odeling, a
 from-scratch, streaming-capable automatic speech recognition system.
@@ -15,28 +15,45 @@ dependency, no pretrained weights, and no external decoder.
 
 | Metric | Value |
 |---|---|
-| WER, test-clean | **3.43 %** offline / **4.45 %** streaming |
-| WER, test-other | **9.17 %** offline / **12.24 %** streaming |
+| WER, test-clean | **2.57 %** offline / **3.43 %** streaming |
+| WER, test-other | **6.57 %** offline / **9.01 %** streaming |
 | Model | 55.3 M parameters (Zipformer encoder + RNN-T head) |
-| Real-time factor | 0.038 offline / 0.074 streaming, single GPU |
-| Streaming latency | 17 ms to first partial, 0.26 s to finalize |
-| Training cost | ~21 h wall for the whole pipeline on one RTX 5070 |
+| Real-time factor | 0.037 offline / 0.072 streaming, single GPU |
+| Streaming latency | 17 ms to first partial, 0.25 s to finalize |
+| Training cost | ~42 h wall for the whole pipeline on one RTX 5070 |
+
+**What v1.5 changed.** One thing: the transducer trained 600,000 batches over the paired 2×
+speed-perturbed corpus instead of v1.0's 175,000 over the clean one. The architecture, the
+tokenizer and the STREAM-LM checkpoint are all unchanged: v1.5 decodes with the *same* language
+model file as v1.0. Everything below is therefore an acoustic-model result: greedy decoding alone,
+which touches neither the beam nor the LM, improved by 1.32 / 1.55 abs on `test-clean` and
+**3.56 / 4.17 on `test-other`**. The seven amplitude bounds added between the two releases
+(`trunk_norm` last among them) are what made a run of that length survive at all; three earlier
+attempts collapsed before step 100k.
 
 Measured end to end, the pipeline is a single overnight run:
 
 | Stage | Wall clock |
 |---|---|
 | BEST-RQ encoder pretrain | 6 h 20 m |
-| Transducer (175k batches) | 6 h 15 m |
+| Transducer (600k batches) | ~27 h |
 | STREAM-LM (70k steps) | 5 h 40 m |
-| Feature extraction, CMVN, checkpoint averaging, both evals | ~2-3 h |
-| **Total** | **~21 h** |
+| Feature extraction, CMVN, checkpoint averaging, both evals | ~3 h |
+| **Total** | **~42 h** |
 
 `training.transducer.total_steps` counts *loader batches*, not optimizer updates: at
-`grad_accum=4` the 175k figure is 43,750 updates, and at ≤18,000 frames (180 s of audio) per batch
-the run sees 8,750 h of audio — **9.1 passes over the 961 h corpus**. The reference icefall recipe
-trains 50 epochs on 3× speed-perturbed data, ~150 effective passes. That gap, not architecture, is
-the dominant term in the remaining WER.
+`grad_accum=3` the 600k figure is 200,000 updates, and at ≤28,000 frames (280 s of audio) per batch
+the run sees up to 46,667 h of audio, or **24.1 passes over the 1,933 h paired 2× speed-perturbed
+corpus**. v1.0 trained 9.1 passes over 961 h, and closing that gap, not any architecture change,
+is what moved greedy `test-other` from 11.44 % to 7.88 %. The reference icefall recipe trains 50
+epochs on 3× speed-perturbed data, ~150 effective passes, so headroom of the same kind remains.
+
+> **The LR anneal is where this run landed, and the stable phase lies about it.** Under
+> `lr_schedule: wsd` with `lr_decay_frac: 0.25` the dev ctc-WER sat at 0.0833 → 0.0787 across steps
+> 250k to 450k, flat to within noise and easy to read as converged, then fell to **0.0408** across
+> the 150k-step anneal. Judging a WSD run before its decay window would have discarded 48 % of the
+> final quality. The run took ~27 h of GPU across 9 resumes, two of which rolled back to step 81k
+> for the `trunk_norm` migration.
 
 The design target was 6 to 8 % offline and 8 to 10 % streaming WER at RTF below 0.3. Both paths
 beat it.
@@ -52,29 +69,36 @@ beat it.
 Both LibriSpeech conditions, decoded with `transducer_avg.pt`, rescoring weights tuned on the
 matching dev split and never on test. RTF and latency come from a contention-free timing pass.
 
-**test-clean**, n = 2,620 (52,576 reference words), α = 0.6, β = 0.2 offline / 0.3 streaming:
+**test-clean**, n = 2,620 (52,576 reference words). Tuned α = 0.5, β = 0.3, length bonus 0.25
+offline; α = 0.7, β = 0.2, length bonus 0.5 streaming:
 
 | Stage | Offline WER / CER | Streaming WER / CER | RTF (offline / streaming) |
 |---|---|---|---|
-| `greedy_transducer` | 4.55 % / 1.58 % | 6.15 % / 2.25 % | 0.009 / 0.042 |
-| `beam` | 4.38 % / 1.49 % | 5.84 % / 2.09 % | 0.035 / 0.071 |
-| `beam_lm` | **3.43 % / 1.19 %** | **4.45 % / 1.62 %** | 0.038 / 0.074 |
+| `greedy_transducer` | 3.23 % / 1.06 % | 4.60 % / 1.61 % | 0.009 / 0.045 |
+| `beam` | 3.13 % / 1.00 % | 4.49 % / 1.55 % | 0.036 / 0.072 |
+| `beam_lm` | **2.57 % / 0.85 %** | **3.43 % / 1.23 %** | 0.037 / 0.072 |
 
-**test-other**, n = 2,939 (52,343 reference words), α = 0.6, β = 0.3 in both modes:
+**test-other**, n = 2,939 (52,343 reference words). Tuned α = 0.7, β = 0.4, length bonus 0.25
+offline; α = 1.1, β = 0.5, length bonus 1.0 streaming:
 
 | Stage | Offline WER / CER | Streaming WER / CER | RTF (offline / streaming) |
 |---|---|---|---|
-| `greedy_transducer` | 11.44 % / 5.04 % | 15.29 % / 6.92 % | 0.008 / 0.041 |
-| `beam` | 10.90 % / 4.76 % | 14.35 % / 6.44 % | 0.034 / 0.066 |
-| `beam_lm` | **9.17 % / 4.10 %** | **12.24 % / 5.64 %** | 0.035 / 0.067 |
+| `greedy_transducer` | 7.88 % / 3.39 % | 11.12 % / 4.96 % | 0.008 / 0.043 |
+| `beam` | 7.58 % / 3.22 % | 10.83 % / 4.73 % | 0.034 / 0.067 |
+| `beam_lm` | **6.57 % / 2.84 %** | **9.01 % / 4.11 %** | 0.035 / 0.068 |
 
-Search, the LM, and the ILME subtraction all contribute in both conditions, and the LM earns more on
-the harder one. Beam over greedy is worth -0.17 / -0.31 abs on clean and -0.54 / -0.94 on other,
-with LM+ILME a further -0.95 / -1.39 and -1.73 / -2.11. The streaming-to-offline gap widens from
-1.02 abs points on clean to 3.07 on other: the chunked causal encoder costs three times as much when
-the acoustics are hard. Streaming holds 14 to 17 ms to first partial. Finalize, meaning the
-post-audio search and rescore a live session still owes, takes 0.21 to 0.26 s with the LM and about
-0.04 s without it.
+Search, the LM, and the ILME subtraction all still contribute, and the LM still earns more on the
+harder split, but every margin is smaller than in v1.0 because the acoustic model absorbed the work.
+Beam over greedy is worth -0.10 / -0.11 abs on clean and -0.30 / -0.29 on other, with LM+ILME a
+further -0.56 / -1.07 and -1.01 / -1.82. The streaming-to-offline gap is 0.86 abs points on clean
+and 2.44 on other: the chunked causal encoder still costs about three times as much when the
+acoustics are hard, though both gaps narrowed (from 1.02 and 3.07). Streaming holds 17 ms to first
+partial. Finalize, meaning the post-audio search and rescore a live session still owes, takes 0.21
+to 0.25 s with the LM and about 0.04 s without it.
+
+Against v1.0 the whole gain is acoustic, since the STREAM-LM checkpoint is unchanged. Greedy
+decoding alone, which touches neither the beam nor the LM, moved -1.32 / -1.55 on clean and **-3.56
+/ -4.17 on other**.
 
 <details>
 <summary><b>Oracle floors and remaining headroom</b>: how much is left in the beam</summary>
@@ -86,19 +110,23 @@ headroom* from *insufficient search coverage*. Measured on each dev split:
 
 | | dev acoustic-only | dev tuned | dev n-best oracle |
 |---|---|---|---|
-| dev-clean offline / streaming | 4.46 % / 5.94 % | 3.43 % / 4.44 % | 2.47 % / 3.45 % |
-| dev-other offline / streaming | 10.74 % / 14.22 % | 8.92 % / 11.95 % | 7.62 % / 10.49 % |
+| dev-clean offline / streaming | 2.93 % / 3.96 % | 2.37 % / 3.05 % | 1.39 % / 2.06 % |
+| dev-other offline / streaming | 7.79 % / 10.93 % | 6.58 % / 9.16 % | 5.24 % / 7.70 % |
 
-Roughly a point of in-beam headroom on clean, and 1.3 to 1.5 on other, goes unextracted by the
-rescorer. That is LM headroom rather than search coverage.
+Roughly a point of in-beam headroom on clean, and 1.3 to 1.5 on other, still goes unextracted by the
+rescorer. That is LM headroom rather than search coverage, and it did not shrink as the acoustic
+model improved.
 
-> α landed on 0.6 in every one of the four sweeps, which is the top of the default `--lm-grid`. The
-> optimum may lie beyond it, so widening the grid is the cheapest untried experiment in the repo.
+> v1.0's open question is closed: α now lands interior to the grid in all four sweeps (0.5 / 0.7 on
+> clean, 0.7 / 1.1 on other) rather than pinned at its top. A new one takes its place: dev-other
+> streaming selected `length_bonus` = 1.0, the top of that axis's five points, and `evaluate.py`
+> warned about it. Widening the length-bonus grid is now the cheapest untried experiment.
 
 </details>
 
-The design target (6 to 8 % offline, 8 to 10 % streaming) was set against `test-clean`, which both
-paths beat. `test-other` sits above that band in every configuration.
+The design target (6 to 8 % offline, 8 to 10 % streaming) was set against `test-clean`. Both paths
+beat it on `test-clean` by a wide margin, and `test-other`, which sat above the band in every
+configuration in v1.0, now falls inside it as well.
 
 ## How it compares
 
@@ -108,33 +136,36 @@ Against large speech foundation models, the point is cost. These are general-pur
 systems, they are not streaming, and they reach their accuracy through data and compute that a
 single consumer GPU cannot touch:
 
-| | Whisper large-v3 | Parakeet TDT 0.6B v2 | STREAM ASR v1.0 |
+| | Whisper large-v3 | Parakeet TDT 0.6B v2 | STREAM ASR v1.5 |
 |---|---|---|---|
 | Parameters | 1.55 B | 600 M | 55.3 M |
 | Training audio | ~1 M h weak + ~4 M h pseudo-labeled | ~120 k h (~10 k human-transcribed) | 960 h (LibriSpeech only) |
 | Training hardware | undisclosed large-scale cluster | 64 × A100 (stage 1) | 1 × RTX 5070, 12 GB |
 | Streaming | no (30 s windows) | no | yes, one set of weights |
-| test-clean WER | 2.7 % | not reported | 3.43 % offline / 4.45 % streaming |
+| test-clean WER | 2.7 % | not reported | 2.57 % offline / 3.43 % streaming |
 
 Against LibriSpeech-specialized streaming transducers, the point is that this is a from-scratch
 reimplementation, and it is honestly behind the reference recipe. icefall's
 `pruned_transducer_stateless7_streaming` is the same architecture family on the same 960 h at the
 same 320 ms chunk (STREAM ASR's `chunk_size: 16` base-rate frames = 320 ms of audio):
 
-| | icefall streaming Zipformer | Zipformer-L (non-streaming) | STREAM ASR v1.0 |
+| | icefall streaming Zipformer | Zipformer-L (non-streaming) | STREAM ASR v1.5 |
 |---|---|---|---|
 | Parameters | 70.4 M | 148 M | 55.3 M |
-| Streaming @ 320 ms, clean / other | 3.11 % / 7.93 % | not applicable | 4.45 % / 12.24 % |
-| Offline, clean / other | not reported | 2.00 % / 4.38 % | 3.43 % / 9.17 % |
+| Streaming @ 320 ms, clean / other | 3.11 % / 7.93 % | not applicable | 3.43 % / 9.01 % |
+| Offline, clean / other | not reported | 2.00 % / 4.38 % | 2.57 % / 6.57 % |
 
-That puts STREAM ASR about 1.3 abs points behind the streaming reference on `test-clean`, at a
-smaller parameter count and without a k2/icefall dependency. On `test-other` it is 4.3 points
-behind, and 4.8 behind the offline reference. The clean-only comparison flatters this model
-considerably. That widening gap is the honest cost of building every block (encoder, RNN-T loss,
-beam search, LM) from scratch on one 12 GB card, and it says where the remaining work is: robustness
-on noisy and accented speech rather than clean read speech.
+That puts STREAM ASR 0.32 abs points behind the streaming reference on `test-clean` and 1.08 behind
+on `test-other`, at a smaller parameter count and without a k2/icefall dependency. Against the
+2.6× larger non-streaming Zipformer-L our offline path is 0.57 and 2.19 behind. In v1.0 those
+streaming gaps were 1.3 and 4.3, so training the recipe out to 24 passes closed roughly three
+quarters of the deficit on both splits without touching the architecture.
 
-The 14 to 17 ms first-partial figure above is compute time, not algorithmic latency. The algorithmic
+`test-other` remains the honest weak spot: the residual gap there is still triple the one on clean,
+and the streaming-to-offline penalty is still 2.8× larger. Robustness on noisy and accented speech,
+not clean read speech, is where the remaining work is.
+
+The 17 ms first-partial figure above is compute time, not algorithmic latency. The algorithmic
 latency is the 320 ms chunk, the same as the icefall column.
 
 <details>
@@ -147,7 +178,7 @@ The accuracy tables above are the fair comparison. This one is the interesting o
 | | STREAM ASR | icefall Zipformer | Parakeet TDT 0.6B v2 | Whisper large-v3 |
 |---|---|---|---|---|
 | Team | 1 person | k2-fsa/Xiaomi + academic collaborators | NVIDIA NeMo ASR team | OpenAI research + infra org |
-| Calendar time | ~1 month | recipe: days. Toolkit behind it: years | months, atop years of NeMo | v1 to v3 across more than a year |
+| Calendar time | ~2 months | recipe: days. Toolkit behind it: years | months, atop years of NeMo | v1 to v3 across more than a year |
 | Training hardware | 1 consumer GPU (12 GB) | typically 4 to 8 datacenter GPUs | 64 × A100 + 4 × A100 | undisclosed cluster |
 | Audio data | 960 h, free (CC BY 4.0) | same 960 h, free | ~120 k h incl. ~10 k h human-transcribed | ~5 M h scraped + weak/pseudo-labeled |
 | Compute bill | electricity on hardware already owned | one run is cheap to rerun, expensive to have invented | tens of thousands of A100-hours | undisclosed, at the top of this scale |
@@ -157,7 +188,7 @@ Only the STREAM ASR column and the published model-card facts (GPU counts, data 
 are sourced. Team sizes, calendar time and anything about money are order-of-magnitude inference
 from public information, not disclosed figures. Read them as which power of ten, not as quotes.
 
-The takeaway is not that this model is better. It is that a single-GPU, one-person, one-month build
+The takeaway is not that this model is better. It is that a single-GPU, one-person, two-month build
 on free data lands within a couple of WER points of a research toolkit's reference recipe on clean
 speech, and that the gap that remains is concentrated somewhere specific and measurable.
 
@@ -178,7 +209,7 @@ uv venv .venv --python 3.12
 uv pip install -r requirements.txt
 .venv/bin/python scripts/verify_env.py   # expect: OK: ... cap=(12, 0)
 
-PYTHONPATH=. .venv/bin/python -m pytest -q   # 213 passed, 2 deselected (slow GPU gates)
+PYTHONPATH=. .venv/bin/python -m pytest -q   # 317 passed, 2 deselected (slow GPU gates)
 ```
 
 Then decode a file with a trained checkpoint:
@@ -188,22 +219,26 @@ PYTHONPATH=. .venv/bin/python -m src.slices.Decode.streaming_decode AUDIO.flac -
 PYTHONPATH=. .venv/bin/python -m src.slices.Decode.streaming_decode AUDIO.flac   # streaming
 ```
 
-Every flag, tuning knob and failure mode is documented in [COMMANDS.md](COMMANDS.md). The stages
+Every flag, tuning knob and failure mode is documented in [COMMANDS.md](COMMANDS.md), and every
+operator, shape and amplitude bound in [MODEL_ARCHITECTURE.md](MODEL_ARCHITECTURE.md). The stages
 below are the short form.
 
 <details>
-<summary><b>Data preparation</b>: four ordered scripts</summary>
+<summary><b>Data preparation</b>: five ordered scripts</summary>
 
 <br>
 
-The fp16 log-mel cache is the one-time cost (~53 GB) that lets the training epoch loop run GPU-bound
-instead of re-decoding FLAC every epoch.
+The fp16 log-mel cache is the one-time cost that lets the training epoch loop run GPU-bound instead
+of re-decoding FLAC every epoch. Measured: 52 GiB for the clean 961 h `train` split and 104 GiB for
+the paired 2× speed-perturbed `train_sp2` split (1,933 h, the transducer's default), plus ~1.1 GiB
+for the four dev/test splits, so **157 GiB total**. Check `df -h` before starting.
 
 ```bash
-PYTHONPATH=. .venv/bin/python scripts/build_manifests.py      # 5-split manifests (train 281,241 utts)
-PYTHONPATH=. .venv/bin/python scripts/train_tokenizer.py      # BPE-500 on 960 h transcripts
-PYTHONPATH=. .venv/bin/python scripts/compute_cmvn.py         # global CMVN over a 15 % sample
-PYTHONPATH=. .venv/bin/python scripts/precompute_features.py  # fp16 log-mel mmap cache
+PYTHONPATH=. .venv/bin/python scripts/build_manifests.py               # 5-split manifests (train 281,241 utts)
+PYTHONPATH=. .venv/bin/python scripts/train_tokenizer.py               # BPE-500 on 960 h transcripts
+PYTHONPATH=. .venv/bin/python scripts/compute_cmvn.py                  # global CMVN over a 15 % sample
+PYTHONPATH=. .venv/bin/python scripts/build_speed_perturb_manifest.py  # train_sp2.jsonl, 562,482 rows
+PYTHONPATH=. .venv/bin/python scripts/precompute_features.py           # fp16 log-mel mmap cache
 ```
 
 </details>
@@ -217,6 +252,7 @@ Both models train against the same 960 h tokenizer.
 
 ```bash
 # BEST-RQ self-supervised encoder pretrain -> data/checkpoints/bestrq_encoder.pt
+# Multi-codebook masked prediction on the train_sp2 mel cache; watch pretrain/acc and dev/acc.
 .venv/bin/python -m src.slices.PretrainEncoder.pretrain_bestrq
 
 # Transducer: encoder + predictor + joiner trained jointly under rnnt + ctc_aux + interctc losses.
@@ -234,8 +270,7 @@ Both models train against the same 960 h tokenizer.
 Every trainer is resumable and interrupt-safe. It atomically checkpoints `*_last.pt` (model, all
 optimizers, RNG state, step) and auto-resumes from it, so you re-launch the same command after a
 crash or interrupt. Ctrl-C is caught cooperatively: the loop finishes its step, checkpoints, and
-exits cleanly. To force a fresh run, pass `--fresh` on the transducer and LM trainers, or
-`resume=False` on the BEST-RQ command.
+exits cleanly. To force a fresh run, pass `--fresh`; every trainer takes it, BEST-RQ included.
 
 Checkpoint averaging is a required post-training step. The transducer trainer keeps a rolling window
 of `transducer_step{N}.pt` snapshots (`training.transducer.keep_last_n`). Mean the tail into the one
@@ -263,12 +298,15 @@ The beam is a time-synchronous Graves A/B search with equal-prefix recombination
 at every prune, so beam width buys distinct transcripts rather than duplicate alignments of the same
 one.
 
-- `lm_weight` (α) turns on STREAM-LM n-best rescoring of the acoustic beam. Tuned optimum 0.6. The
-  shipped default `0.0` is byte-identical to the pure-acoustic decoder.
+- `lm_weight` (α) turns on STREAM-LM n-best rescoring of the acoustic beam. The shipped default
+  `0.0` is byte-identical to the pure-acoustic decoder.
 - `ilm_weight` (β) subtracts the transducer's internal language prior (ILME) so α is not fighting a
-  double count. Tuned optimum 0.2 offline and 0.3 streaming, because streaming's weaker acoustic
-  scores want more of the prior removed.
+  double count.
 - `length_bonus` is a per-token re-ranking bonus that counters RNN-T's un-normalised deletion bias.
+- All three are tuned per condition and per mode by `evaluate.py` on dev, never on test. The v1.5
+  values are α/β/bonus = 0.5/0.3/0.25 offline and 0.7/0.2/0.5 streaming on `test-clean`, and
+  0.7/0.4/0.25 offline and 1.1/0.5/1.0 streaming on `test-other`. Re-sweep after any LM or
+  acoustic retrain rather than copying them.
 - `chunk_size`, `beam_size`, `max_symbols`, `lm_checkpoint`.
 
 </details>
@@ -370,7 +408,8 @@ src/
     Decode/             # streaming/offline RNN-T beam search + LM n-best rescoring + ILME
     Evaluate/           # corpus WER/CER/RTF/latency + ablation table + dev weight tuning
     Demo/               # local FastAPI web UI: file upload + live-mic streaming transcription
-scripts/              # env check, 960 h data build, LM corpus download, ckpt averaging, profiler
+scripts/              # env check, 960 h data build, LM corpus download, ckpt averaging,
+                      #   safetensors export, step profiler, trunk-norm checkpoint migration
 tests/                # shape / round-trip / equivalence / count sanity tests
 data/                 # LibriSpeech splits, manifests, tokenizer, cmvn, checkpoints (gitignored)
 ```
@@ -387,10 +426,13 @@ data/                 # LibriSpeech splits, manifests, tokenizer, cmvn, checkpoi
 | `LogMel_Transform.py` | 80-bin log-mel frontend |
 | `Tokenizer_Adapter.py` | SentencePiece BPE-500 wrapper |
 | `RnntLoss.py` | RNN-T forward-backward (own kernel, replaces torchaudio's) |
+| `RnntLossPruned.py` | icefall's two-stage pruned RNN-T objective, implemented and locked by test, off by default |
 | `BiasNorm.py`, `SwiGluFfn.py`, `RoPE_Transform.py` | blocks shared by encoder and LM |
 | `Checkpoint_Adapter.py` | atomic stateful save/load + `resume_if_available` |
 | `SignalGuard.py` | cooperative SIGINT/SIGTERM stop for training loops |
 | `Muon_Optimizer.py`, `Optimizer_Adapter.py` | Muon + AdamW optimizer stack |
+| `LrSchedule.py`, `GradientClipping.py` | warmup + cosine/WSD shape, and the matrices/scalars split clip, shared by both acoustic trainers |
+| `ParameterProjection.py` | re-projects the bounded parameters (`BiasNorm.log_scale`, stack `bypass`, `in_proj` σ₁) onto their ranges after every optimizer step |
 | `RandomProjectionQuantizer.py` | frozen BEST-RQ target quantizer |
 | `MaskUtils.py`, `Logging_Adapter.py` | masking helpers, loguru sink |
 
@@ -404,13 +446,13 @@ drives the `Decode` slice, so an upload runs an offline beam, while the live mic
 partials that a full-context final replaces on endpoint.
 
 ```bash
-PYTHONPATH=. .venv/bin/python -m src.slices.Demo.serve_demo --lm-weight 0.6 --ilm-weight 0.2
+PYTHONPATH=. .venv/bin/python -m src.slices.Demo.serve_demo --lm-weight 0.5 --ilm-weight 0.3
 # then open http://127.0.0.1:8000
 ```
 
-The two weights are the dev-tuned offline pair; omit them for the faster acoustic-only decoder.
-`--beam-size`, `--checkpoint`, `--tokenizer`, `--host` and `--port` are also available. The server
-binds `127.0.0.1` only and has no authentication. The browser captures 16 kHz raw PCM over a
+The two weights are the dev-clean-tuned offline pair; omit them for the faster acoustic-only
+decoder. `--beam-size`, `--checkpoint`, `--tokenizer`, `--host` and `--port` are also available. The
+server binds `127.0.0.1` only and has no authentication. The browser captures 16 kHz raw PCM over a
 WebSocket, which avoids any dependency on FFmpeg or external assets.
 
 Transcripts are sentence-cased on the display path only, since the model is trained on LibriSpeech's
@@ -470,8 +512,11 @@ ILME rescoring are likewise one batched forward over the n-best.
 - Features are precomputed once into an fp16 log-mel mmap cache. SpecAugment is a GPU batch op
   (`SpecAugmentBatch.py`) applied inside `TransducerModel.joint_loss` on the train path only, gated
   by `training.spec_augment`.
-- Training runs eager (`compile_model=False`), because `torch.compile` hits inductor bugs on this
-  torch 2.11 + Blackwell build.
+- Training runs eager at the model level, because `torch.compile` over the whole model hits a
+  dynamic-shape assert on this torch 2.11 + Blackwell build. The four elementwise leaf modules
+  (`BiasNorm`, `TransducerJoiner`, `ConvModule`, `SwiGluFfn`) do compile cleanly at `dynamic=True`
+  and are worth 12.6 % of the step and 1 GiB of peak VRAM, so `training.transducer.compile_modules`
+  turns them on by default.
 
 </details>
 

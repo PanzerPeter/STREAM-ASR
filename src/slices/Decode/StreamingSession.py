@@ -2,10 +2,10 @@
 # Audio arrives incrementally (PCM chunks over a WebSocket); this drives the causal encoder
 # chunk-by-chunk and returns a running greedy-transducer hypothesis as a *partial*. When the
 # speaker stops, finalize() re-decodes the fully buffered waveform through the handler's verified
-# offline path (full context, single-pass RNN-T beam search) — the authoritative result.
+# offline path (full context, single-pass RNN-T beam search), the authoritative result.
 #
 # Why two paths: the log-mel front end is center-padded, so a partial recomputed on a growing
-# buffer is only exact away from its trailing edge — perfect for a live caption, wrong for a final
+# buffer is only exact away from its trailing edge: perfect for a live caption, wrong for a final
 # number. Offline decode over the whole utterance both removes that edge effect and yields the
 # best WER, so the endpointed result replaces the partials verbatim.
 import torch

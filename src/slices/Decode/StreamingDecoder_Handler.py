@@ -41,6 +41,7 @@ class StreamingDecoder_Handler:
         fuse_lm: bool = True,
         lm_weight: float | None = None,
         ilm_weight: float | None = None,
+        length_bonus: float | None = None,
     ) -> None:
         # Decode is a single pass, so there is exactly one place the LM can attach and one gate
         # (fuse_lm) controlling it. lm_weight == 0 forces the LM off regardless of fuse_lm.
@@ -51,8 +52,11 @@ class StreamingDecoder_Handler:
         # lm_weight override lets Evaluate sweep alpha on dev without mutating the authoritative
         # decode.yaml (whose lm_weight=0.0 is the alpha=0 regression lock); None = configured value.
         self.lm_weight = lm_weight if lm_weight is not None else self.cfg.decode.lm_weight
-        # Per-token bonus applied at n-best re-ranking to offset RNN-T's deletion bias.
-        self.length_bonus = self.cfg.decode.length_bonus
+        # Per-token bonus applied at n-best re-ranking to offset RNN-T's deletion bias. Overridable
+        # for the same reason lm_weight is: Evaluate tunes it on dev without mutating decode.yaml.
+        self.length_bonus = (
+            length_bonus if length_bonus is not None else self.cfg.decode.length_bonus
+        )
         # ILME subtraction weight (beta). Only meaningful alongside an external LM -- with fuse_lm
         # off there is no double count to remove, so the stage stays byte-identical to pure
         # acoustic decoding.

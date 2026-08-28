@@ -36,7 +36,7 @@ def test_loader_samples_with_replacement(tmp_path):
 def test_lm_overfits_tiny_corpus(tmp_path, monkeypatch):
     # Shrink the model + schedule to a CPU-seconds smoke that still genuinely trains: a tiny
     # deep-narrow LM must memorize a period-10 token pattern, so val perplexity collapses toward 1.
-    # Production config is untouched — monkeypatch reverts these fields after the test.
+    # Production config is untouched; monkeypatch reverts these fields after the test.
     lm = get_config().lm
     for field, value in _TINY_LM.items():
         monkeypatch.setattr(lm, field, value)

@@ -1,4 +1,4 @@
-# Zero-pads a batch of ragged [T, 80] log-mel tensors to [B, Tmax, 80] — BEST-RQ masks/quantizes
+# Zero-pads a batch of ragged [T, 80] log-mel tensors to [B, Tmax, 80]. BEST-RQ masks/quantizes
 # on the padded grid, so lengths travel alongside to exclude pad frames from the pretrain loss.
 import torch
 

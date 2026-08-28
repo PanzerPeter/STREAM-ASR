@@ -42,7 +42,7 @@ ckpt_every: 1000
 
 # data (PrepareLmData). subset_words caps train words; >= corpus size (LibriSpeech-LM ~803M) packs
 # the WHOLE corpus, and the training DataLoader shuffles the memmap for uniform coverage. Lower it
-# only for a quick smoke/dev run — train.bin is then just the corpus head.
+# only for a quick smoke/dev run; train.bin is then just the corpus head.
 subset_words: 1000000000
 val_words: 200000
 seed: 1234

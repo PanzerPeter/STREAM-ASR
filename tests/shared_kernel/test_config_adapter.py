@@ -14,9 +14,11 @@ def test_loads_representative_values():
     assert cfg.audio.n_mels == 80
     assert cfg.model.encoder_dims == (192, 256, 384, 512, 384, 256)
     assert cfg.model.vocab_size == 500
-    assert cfg.training.transducer.total_steps == 175000
+    assert cfg.training.transducer.total_steps == 600000
     # lr_peak lives solely in optim.yaml (adamw_lr/muon_lr), not per-stage.
-    assert cfg.training.transducer.warmup_steps == 10000
+    # warmup is 2500 optimizer updates expressed in loader batches, so it tracks grad_accum rather
+    # than total_steps -- the transient it covers is measured in updates, not in run length.
+    assert cfg.training.transducer.warmup_steps == 2500 * cfg.training.transducer.grad_accum
 
 
 def test_derived_values():
@@ -54,7 +56,7 @@ def test_validation_rejects_bad_type(tmp_path):
 
 
 def test_bos_eos_decoder_vocab_ids():
-    # These label-space ids back no acoustic decoder — the acoustic model is a transducer — but
+    # These label-space ids back no acoustic decoder (the acoustic model is a transducer), but
     # STREAM-LM (TrainLanguageModel slice) consumes them for BOS-conditioned next-token
     # prediction, so they stay live on ModelConfig. BOS == EOS
     # because the packed corpus separates lines with EOS and has no other start symbol.

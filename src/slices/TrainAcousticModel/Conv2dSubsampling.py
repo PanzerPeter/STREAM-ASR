@@ -6,7 +6,7 @@ from src.shared_kernel.Config_Adapter import get_config
 
 
 class Conv2dSubsampling(nn.Module):
-    """×2 time subsampling conv frontend: [B,T,80] -> [B, (T-1)//2+1, out_dim]. Causal in time —
+    """×2 time subsampling conv frontend: [B,T,80] -> [B, (T-1)//2+1, out_dim]. Causal in time:
     the time dimension is left-padded only, so an output frame reads no future input. Frequency
     padding stays symmetric (frequency is not streamed). conv1 strides time ×2 + freq ×2; conv2
     strides frequency ×2 only (time stride 1)."""

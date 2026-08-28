@@ -14,10 +14,238 @@ vocab_size: 500
 # stack's deeper blocks, a gradient shortcut through attention that keeps the stack stable at depth.
 # This is the INITIAL value of a *learnable per-block gate*, so 0.0 starts a fresh encoder identical
 # to a vanilla one and lets training introduce the residual only as far as it wants.
-# Keep at 0.0 — a fixed non-zero gate destabilises the early-training escape from CTC blank collapse.
+# Keep at 0.0: a fixed non-zero gate destabilises the early-training escape from CTC blank collapse.
 #
 # 0.0 here does NOT mean the feature is off. It is an init, and training moves it: the shipped v1.0
 # encoder learned gates from -1.40 (stack 4, block 2) to +0.47 (stack 3, block 2), so the value
 # residual is load-bearing in every checkpoint. Deleting the machinery is an architecture change,
 # not a cleanup, and it makes existing checkpoints fail load_state_dict on 16 missing keys.
 encoder_value_residual_lambda: 0.0
+# Window every BiasNorm's branch gain is confined to, imposed both in `forward` (on the value
+# used) and by projection after each optimizer step (BiasNorm.project, reached from
+# shared_kernel.ParameterProjection.project_constraints). The module's output RMS is
+# exp(log_scale), so these are gains of exp(-2.0) = 0.14 and exp(1.0) = 2.72. ASYMMETRIC, because
+# the mechanism below is: only amplification silences the stack downstream.
+#
+# THE CEILING IS LOAD-BEARING, and a one-sided 2.5 was not enough. What a stack emits is
+# `(1 - b) * residual + (b * g) * x_hat` with `b` the bypass gate and `g` this gain, and the NEXT
+# stack's blocks are all pre-normed -- their branches produce an O(1) correction regardless of how
+# large their input is. So the amplitude a stack emits sets how much work every stack after it can
+# do. MEASURED on a fresh ZipformerBlock, cos(input, output) against input RMS:
+#
+#     input RMS   1.00    1.65    2.72    7.39   12.18   29.96
+#     1 - cos    0.060   0.023   0.009   0.0012  0.0004  0.00007
+#
+# i.e. the work a block does falls off as 1/RMS^2, and a stack emitting RMS 12 has silenced every
+# stack downstream of it.
+#
+# That is exactly what the 600k run did, TWICE, and the one-sided 2.5 cap only delayed it.
+#
+#   run                          280k     290k     300k     310k
+#   uncapped gain               0.0833   0.0848   0.1101      --      aborted, rolled back to 275.5k
+#   capped at 2.5 (re-run)      0.0835   0.0827   0.0818   0.1136
+#
+# (full-dev greedy-CTC WER, runs/transducer). The cap bought ~25k good steps -- 0.0818 at 300k was
+# the run's best -- and then the same collapse happened anyway. `train/branch_gain_max` hit
+# exp(2.5) = 12.18 at ~290k and stayed PINNED there for the remaining 20k steps, so the cap was
+# binding continuously rather than clipping an excursion, and the pressure simply migrated: one
+# log_scale at the ceiling in step291600, three in step307800.
+#
+# What the collapse looks like in `stack_mix/*` (capped run, 298k -> 310k): stack 1's processed
+# share `b*g` went 4.5 -> 12.18 while its residual share `1-b` went 0.25 -> 0.00, so it fed RMS 12
+# into stack 2, whose own mix then collapsed 7.0 -> 1.18. train/grad_norm went 1.95 -> 201 with
+# train/grad_norm_guarded only 0.82 -> 1.60, i.e. ~99 % of the explosion was the scalar gates,
+# whose gradient is proportional to `g`.
+#
+# The mechanism is a sign-consistent gradient met by Adam, which normalises it away: measured off
+# transducer_last.pt's AdamW moments, |exp_avg|/sqrt(exp_avg_sq) is 0.93/0.91/0.73 for the three
+# runaway gains against a median of 0.14 over all 98. A ~0.9-coherent scalar marches at nearly the
+# full LR every step no matter how small its gradient is, so nothing short of a bound stops it
+# (weight decay's equilibrium at coherence 0.93 is |log_scale| ~ 93).
+#
+# +1.0 is chosen so no single stack's PROCESSED branch can amplify by more than e: at that
+# amplitude the next stack still does 1/7th of its full-RMS work rather than 1/136th. It is still a
+# wider ceiling than the reference recipe's (icefall bounds log_scale to a 1.0-wide window around
+# its init).
+#
+# This bounds the processed branch and NOTHING ELSE, and an earlier version of this comment claimed
+# otherwise -- that "a convex mix of two things bounded by 2.72 is bounded by 2.72", so the
+# compounding was capped. Only one of the two things is bounded. A stack emits
+# `(1 - b) * residual + b * x`, `x` is a block output and so is bounded by this window, but
+# `residual` is `in_proj(input)` and passes through no normaliser at all. That false premise is why
+# the 2026-08-22 run was read as healthy while its trunk went to RMS 570; see
+# `stack_in_proj_max_sigma` below, which is the bound the other half of the mix was missing.
+#
+# The FLOOR is not the same quantity and was never measured to be a failure. Attenuation has no
+# 1/RMS^2 argument against it -- a stack that emits a small amplitude leaves the next one free to
+# do all of its work -- and the healthy distribution genuinely lives down there: over 97 encoder
+# BiasNorms at BEST-RQ warm start, p05 -1.54, median -0.46, p95 +0.77. A symmetric -1.0 therefore
+# clipped the normal population rather than a pathology, and MEASURED on the encoder the 600k run
+# warm-starts from (data/checkpoints/bestrq_encoder.pt, 2026-08-21), it bound 15 of 97 gains --
+# every one of them in stacks 2-4, the widest ones -- against 6 on the ceiling. -2.0 is set below
+# that tail with room to spare while still bounding the parameter, which is what keeps it off
+# clamp's dead zone (see BiasNorm.project).
+#
+# If a fresh run rests a gain against +1.0, tighten the OTHER free amplitude (the bypass gate's
+# floor) rather than widening this. `GainCeilingWatch` warns when the population on the ceiling
+# GROWS past what the warm start shipped; a level test there is useless, because a warm-started
+# run starts with gains already on it.
+biasnorm_log_scale_min: -2.0
+biasnorm_log_scale_max: 1.0
+# Ceiling on how far a BiasNorm may amplify PAST that gain, i.e. a bound on its output RMS at
+# `biasnorm_max_amplification * exp(log_scale)`. The window above bounds `log_scale`, which is only
+# one of the two factors in this module's output amplitude: it divides by `rms(x - bias)` and
+# scales `x`, so the other factor is `rms(x)/rms(x - bias)` -- a free parameter's distance from the
+# data, with nothing bounding it. That is the route the 2026-08-21 run's collapse took, with
+# `log_scale` sitting inside its bound the whole time; see the measurements in BiasNorm.forward.
+# 4.0 is chosen to be inert in the trained regime (99.99 % of frames amplify under 2x on the
+# healthy step43200 checkpoint; a 4x cap moves its encoder output by 3.4e-4 relative) while
+# bounding the escape 17x below the 68.7x that run reached.
+biasnorm_max_amplification: 4.0
+
+# --- the inter-stack trunk -------------------------------------------------------------------
+#
+# A stack emits `(1 - b) * in_proj(input) + b * blocks(in_proj(input))`. Every one of the 97
+# BiasNorms sits on a branch or at a block's exit, so `blocks(...)` is bounded by the window above.
+# `in_proj` is on the TRUNK -- the only path whose amplitude compounds from one stack to the next --
+# and until 2026-08-22 nothing bounded it. These two keys are that bound.
+#
+# Floor on the stack's residual<->processed gate, projected after every optimizer step
+# (ZipformerStack.project) and clamped on the value `forward` uses.
+#
+# 0 IS AN ABSORBING STATE, which is how the 2026-08-22 run lost a sixth of its encoder. At b = 0 the
+# stack is `out = in_proj(input)`, a bare unnormalised Linear, and every parameter inside its blocks
+# receives EXACTLY zero gradient -- measured on transducer_step81000.pt, 0 of stack 2's 105 block
+# parameters had a nonzero grad, i.e. 10.6 M of 53.8 M encoder parameters frozen. The gate cannot
+# climb back out either: `d(loss)/d(bypass)` there was +0.91, i.e. descent pushes it further into
+# the floor, and the blocks it would re-admit are frozen at whatever they were when it arrived.
+# `bypass` reached exactly 0.0 at step ~48k and dev ctc-WER turned at that step, in two independent
+# runs from the same rollback.
+#
+# 0.1 keeps a bounded block output in the mix at all times, so a stack can never become a pure
+# amplifier, and keeps every block's gradient alive. The ceiling stays 1.0: b = 1 drops the skip
+# connection but freezes nothing, and it makes the stack's output bounded rather than less so.
+stack_bypass_min: 0.1
+# Ceiling on `in_proj`'s isotropic RMS gain, `||W||_F / sqrt(n_out)`, projected after every
+# optimizer step. This is the quantity the trunk's amplitude is the product of, and the one that
+# diffused away: MEASURED across this model's five surviving checkpoints it never once plateaued.
+#
+#   in_proj RMS gain            stack1  stack2  stack3  stack4  stack5   trunk RMS into stack 3
+#   fresh init                   0.578   0.578   0.578   0.576   0.577
+#   bestrq_encoder.pt (warm)      3.10    1.31    1.02    1.01    1.30
+#   transducer_best.pt  (50k)     3.19    4.17    3.55    2.67    3.38                      ~700
+#   transducer_step81000.pt       6.72    9.83    8.62    5.57    4.36                     8,193
+#
+# Why nothing stopped it: Muon's Newton-Schulz sets every singular value of the update to 1, so a
+# direction the loss cannot feel takes the same size step as one it can. Measured at step 81k on the
+# full joint loss, stacks.3.in_proj's raw gradient has condition number 61,148 and its radial
+# component (d loss / d scale) is 2.5e-5, against a Muon step of 0.226 -- four orders of magnitude
+# too small to steer the norm either way. Weight decay is the only restoring force and its
+# equilibrium is `sqrt(min(m,n)) * sqrt(max(1, m/n)) / weight_decay` = 1960 at wd 1e-2, i.e. 175x
+# the init it would have to bind at. Scaling in_proj x2 at step 81k moved dev CTC by -0.015 and x0.5
+# by +0.081 -- flat upward, restoring downward, which is a diffusion that only goes one way.
+#
+# THE NORM MATTERS, and the first version of this bound used the wrong one. `||W||_F/sqrt(n_out)`
+# is the gain against ISOTROPIC input, and the inflation is not isotropic. MEASURED 2026-08-22 at
+# step 43,200 of the fresh 600k run, on real dev audio:
+#
+#   stack                          1       2       3       4       5
+#   sigma_max(W)                9.85   11.36    9.79    5.01    6.04
+#   ||W||_F / sqrt(n_out)       3.08    3.11    2.76    2.38    3.24
+#   ratio                       3.20    3.65    3.54    2.11    1.87     (fresh init: 1.8-2.2)
+#
+# so the isotropic reading of 2.76 at stack 3 was a realized 6.5x on the data (trunk RMS 43.19 out
+# of a stack-2 output of 6.61). Under a bound of 4.0 on that reading, the projection clipped
+# NOTHING in 43,200 steps -- the run reproduced the unbounded one's dev curve to within noise
+# (ctc-WER 0.1624 vs 0.1673 at 40k) while its realized trunk amplitude grew 6.11 -> 43.19, x2.95 in
+# the last 5,400 steps alone. sigma_max is the gain against the worst-case direction and therefore
+# an upper bound on the realized one, whatever the data does.
+#
+# 10.0 is calibrated on the only model this project has shipped: release/stream-asr-v1.0 (3.43 %
+# test-clean) peaks at sigma_max 9.73, so the bound is inert on it, and on both BEST-RQ pretrains
+# (3.53 old, 5.63 new). The diverging run passed it at stack 2 by step 43k. Read as "the trunk may
+# not become louder than the trained model that works", not as a measured optimum -- TIGHTEN IT if
+# a healthy annealed run stays well under 10.
+#
+# It is a ceiling on the escalation and not a substitute for watching the thing itself: sigma_max
+# bounds the worst case, but realized amplitude also compounds through the stack inputs, and the
+# v1.0 model reaches sigma_max 9.73 while holding realized trunk RMS at 1.5-2.7. `stack_mix/*_trunk`
+# logs the realized number per stack; that is the axis to read.
+#
+# HOW the bound is enforced is not a detail, and getting it wrong was the 2026-08-24 failure. The
+# projection was a uniform rescale, `W *= 10/sigma_1`, which trims every singular direction by the
+# same factor while the gradient re-inflates only the top one -- harmless while it fires rarely, and
+# this run made it fire on 99.2 % of steps from 71,000 on. MEASURED on stacks.3.in_proj with
+# sigma_1 reading exactly 10.00 at every checkpoint, stable rank ||W||_F^2/sigma_1^2 went 64.4 (warm
+# start) -> 48.9 (75.6k) -> 32.6 (86.4k) -> 21.7 (97.2k) out of 384 directions, while the realized
+# trunk RMS doubled on the same clock, 4.45 -> 12.34 against 1.51 for the shipped model: a trunk
+# collapsing toward rank 1 drags its own input into the one direction it has left. `project` now
+# deflates the top direction instead (`W -= (sigma_1 - c) * u_1 v_1^T`, the Frobenius-nearest
+# projection onto the ball), and `train/trunk_stable_rank_min` logs the half of the spectrum this
+# bound structurally cannot see. Do not read a pinned `train/trunk_gain_max` as informative: while
+# the projection binds, that number is constant by construction.
+#
+# `in_proj.bias` is left alone -- it is an offset, not a gain, and it measured rms 0.21-0.70
+# against a trunk at 25-570.
+stack_in_proj_max_sigma: 10.0
+
+# --- the trunk NORMALISER --------------------------------------------------------------------
+#
+# The bound that ends the family, rather than the seventh member of it. Everything above -- the
+# BiasNorm gain window, the amplification cap, the bypass floor, the sigma_1 ceiling -- bounds a
+# PARAMETER, and six times running the inflation moved into whichever summary of the matrix was
+# left free. The last of those is the clearest: with sigma_1 pinned at 10.0 and the projection
+# fixed to clip only the offending direction, stacks.3.in_proj grew ||W||_F by 29 % in 16k steps
+# (sigma_2/sigma_1 0.796 -> 0.994, stable rank 38 -> 62), i.e. it stopped inflating in GAIN and
+# started inflating in RANK, and the realized trunk RMS went 5.85 -> 21.94 anyway.
+#
+# `trunk_norm` puts a `BiasNorm` on `in_proj`'s output, so the residual stream's amplitude is
+# bounded by construction instead of inferred from the parameters that produce it. Cost: 5 norms,
+# ~1,800 params, one bandwidth-bound pass each against the 96 BiasNorms already in the forward.
+# Stack 0 is skipped -- its `in_proj` is an `Identity` and it has no preceding stack to compound
+# from, so `stack_mix/0_trunk` remains the frontend's output and `frontend.linear` remains the one
+# unnormalised trunk operator.
+#
+# WHY THE DECOMPOSITION SAYS THIS AND NOT A TIGHTER PARAMETER BOUND. Realized trunk RMS factors as
+# `input RMS x isotropic gain x alignment`. MEASURED at stack 3, this run at step 97.2k against
+# release/stream-asr-v1.0: the isotropic gain is 3.54 vs 2.76, a factor of 1.28 -- but
+# `input x alignment` is 6.19 vs 0.55, a factor of 11.3. The per-matrix gain is a tenth of the
+# problem; the compounding through the stack inputs is the rest, and no per-stack parameter bound
+# reaches it, because five bounds of 10.0 multiply to 10^5.
+trunk_norm: true
+# Ceiling on the trunk norms' `log_scale`, i.e. on the RMS each one nominally emits (the
+# amplification cap above still applies on top, per frame).
+#
+# SEPARATE FROM `biasnorm_log_scale_max` because the two normalise different things. exp(1.0) =
+# 2.72 is sized so no processed BRANCH amplifies by more than e. The trunk carries the residual
+# stream itself, and the model that shipped 3.43 % test-clean runs its five inter-stack trunks at
+# RMS 2.68 / 2.24 / 1.51 / 2.69 / 2.25 -- the entire healthy population sits just UNDER the branch
+# ceiling, so reusing it would start three of the five trunk norms resting on their bound, which
+# is the regime `GainCeilingWatch` exists to warn about.
+#
+# MEASURED on `transducer_step81000.pt`, 8 dev utterances, eval mode, sweeping this ceiling and
+# reading the joint loss (stack 3's trunk is the one that clips; its blocks' relative work is the
+# measured 1/RMS^2 law):
+#
+#   ceiling exp()   trunk3   stack-3 block work   rnnt      ctc
+#   off              5.24          3.6 %            --       --
+#   4.06             4.05          6.1 %        +25.9 %   +7.6 %
+#   3.32             3.32          9.1 %        +26.4 %   +7.5 %
+#   2.72             2.72         13.5 %        +34.6 %  +15.1 %
+#   2.23             2.23         20.2 %        +63.6 %  +40.8 %
+#   1.51 (v1.0)      1.51         44.1 %       +600.1 % +452.8 %
+#
+# The main-path cost is FLAT from 4.06 to 3.32, so all of it is the normalisation itself -- a
+# per-frame normaliser removes the frame-to-frame amplitude variation the downstream biases were
+# calibrated against -- and none of it is the clamp. The clamp only starts to bite below 3.32, and
+# goes non-linear below 2.23. exp(1.2) = 3.32 is that knee: 1.5x the block effectiveness of 4.06
+# for no marginal cost, and it brackets the whole v1.0 ledger (2.68/2.24/1.51/2.69/2.25) with 23 %
+# headroom over its loudest. Read as "the trunk may not be louder than the trained model that
+# works", the same calibration rule as `stack_in_proj_max_sigma`. Tighten toward 1.0 if an annealed
+# run stays well under; going below ~0.8 costs main-path accuracy outright.
+#
+# 82 % of the insertion cost is InterCTC (0.685 -> 2.751 raw), whose taps read stacks 3 and 4
+# directly through a linear head calibrated to the old amplitude. That head is ~0.29 M params and
+# re-fits in a few hundred steps; rnnt +26 % and ctc +7.5 % are the part that has to be trained
+# back, roughly the 20-25k steps of progress this run had made past step 55k.
+trunk_norm_log_scale_max: 1.2

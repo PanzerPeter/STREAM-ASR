@@ -161,6 +161,49 @@ def _scan(
     return buf[:batch, :, 1:], buf[batch:, :, 1:].flip((1, 2))
 
 
+def alignment_loss(
+    blank_lp: torch.Tensor,
+    label_lp: torch.Tensor,
+    frames: torch.Tensor,
+    labels: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Graves forward-backward on the alignment grid, one level below `rnnt_loss`.
+
+    `rnnt_loss` owns the lattice: it log-softmaxes ``[B, T, U+1, V]`` and gathers the two arcs that
+    leave each cell. This entry point takes those two arcs directly, which is what the pruned path
+    needs -- its arcs come from a *linear* joiner whose lattice is never materialised. Returns the
+    per-utterance cost plus both scan variables, because the pruning bounds are read off the
+    occupancy ``exp(alpha + beta - Z)`` rather than from a second backward pass.
+
+    ``blank_lp`` is ``[B, T, U+1]``, ``label_lp`` is ``[B, T, U]``, both masked IN PLACE to each
+    utterance's own rectangle. The mask lives here rather than in the callers because forgetting it
+    is silent: alpha (and therefore the cost) only ever reads inside the rectangle, so a run with
+    ragged padding returns the right number with a beta that has leaked probability in from a
+    padded neighbour -- and beta is exactly what the bounds are derived from.
+    """
+    batch, num_frames, num_states = blank_lp.shape
+    num_labels = num_states - 1
+    device = blank_lp.device
+
+    outside = ~(
+        (torch.arange(num_frames, device=device).view(1, -1, 1) < frames.view(-1, 1, 1))
+        & (torch.arange(num_states, device=device).view(1, 1, -1) <= labels.view(-1, 1, 1))
+    )
+    blank_lp.masked_fill_(outside, _NEG)
+    label_lp.masked_fill_(outside[:, :, :num_labels], _NEG)
+
+    t_idx, u_idx, valid = _shear_map(num_frames, num_states, device)
+    back_d, back_u = _unshear_map(num_frames, num_states, device)
+    alpha_s, beta_s = _scan(blank_lp, label_lp, t_idx, u_idx, valid, frames, labels)
+    alpha = _unshear(alpha_s, back_d, back_u)
+    beta = _unshear(beta_s, back_d, back_u)
+    # Total log-probability read off the last real cell, matching Graves' definition:
+    # log Z = alpha[T-1, U] + log P(blank | T-1, U). beta[0, 0] equals it (locked by test).
+    rows = torch.arange(batch, device=device)
+    log_partition = alpha[rows, frames - 1, labels] + blank_lp[rows, frames - 1, labels]
+    return -log_partition, alpha, beta
+
+
 class _RnntLoss(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -173,7 +216,6 @@ class _RnntLoss(torch.autograd.Function):
     ) -> torch.Tensor:
         batch, num_frames, num_states, vocab = logits.shape
         num_labels = num_states - 1
-        device = logits.device
         frames = logit_lengths.long()
         labels = target_lengths.long()
 
@@ -199,36 +241,26 @@ class _RnntLoss(torch.autograd.Function):
                 .squeeze(3)
             )
 
-        # Mask both to the utterance's own T x U rectangle. Required for beta, which is read at
-        # (0, 0) and so sees the whole padded grid; also required for the arc posteriors in
-        # backward, where an unmasked label log-prob at t == logit_length would otherwise pair with
-        # the virtual accepting state and manufacture gradient on a padded frame.
-        outside = ~(
-            (torch.arange(num_frames, device=device).view(1, -1, 1) < frames.view(-1, 1, 1))
-            & (torch.arange(num_states, device=device).view(1, 1, -1) <= labels.view(-1, 1, 1))
-        )
-        blank_lp.masked_fill_(outside, _NEG)
-        label_lp.masked_fill_(outside[:, :, :num_labels], _NEG)
-
-        t_idx, u_idx, valid = _shear_map(num_frames, num_states, device)
-        back_d, back_u = _unshear_map(num_frames, num_states, device)
-        alpha_s, beta_s = _scan(blank_lp, label_lp, t_idx, u_idx, valid, frames, labels)
-        alpha = _unshear(alpha_s, back_d, back_u)
-        beta = _unshear(beta_s, back_d, back_u)
-        # Total log-probability read off the last real cell, matching Graves' definition:
-        # log Z = alpha[T-1, U] + log P(blank | T-1, U). beta[0, 0] equals it (locked by test).
-        rows = torch.arange(batch, device=device)
-        log_partition = alpha[rows, frames - 1, labels] + blank_lp[rows, frames - 1, labels]
+        # alignment_loss masks blank_lp/label_lp in place, which backward relies on too: an unmasked
+        # label log-prob at t == logit_length would pair with the virtual accepting state in the arc
+        # posteriors and manufacture gradient on a padded frame.
+        cost, alpha, beta = alignment_loss(blank_lp, label_lp, frames, labels)
 
         ctx.save_for_backward(
-            logits, targets, blank_lp, label_lp, alpha, beta, frames, labels, log_partition
+            logits, targets, blank_lp, label_lp, alpha, beta, frames, labels, -cost
         )
         ctx.blank = blank
-        return -log_partition
+        return cost
 
     @staticmethod
     @torch.autograd.function.once_differentiable
-    def backward(ctx, grad_output: torch.Tensor):
+    # `once_differentiable` wraps this in a `(*args, **kwargs)` function, which no longer
+    # matches the base declaration's named `ctx`. The decorator is load-bearing (it runs the
+    # analytic backward under no_grad and rejects double-backward), so the check gives.
+    def backward(  # pyright: ignore[reportIncompatibleMethodOverride]
+        ctx, *grad_outputs: torch.Tensor
+    ):
+        (grad_output,) = grad_outputs
         (
             logits,
             targets,

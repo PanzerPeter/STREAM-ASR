@@ -1,3 +1,7 @@
+# pyright: reportPrivateImportUsage=false
+#   torch's `_foreach_*` multi-tensor ops are documented public API with private-looking
+#   names -- torch's own optimizers call them -- but they are not in `torch.__all__`, so a
+#   strict checker flags every use. mypy accepts them; only this rule needs the exemption.
 # Muon (Jordan): replace each 2D weight's momentum with its orthogonal polar factor (approximated by
 # a fixed Newton-Schulz quintic) before the step, so every weight matrix receives a spectrally
 # normalized update. Only 2D hidden weights are passed here; everything else uses AdamW. The NS
@@ -9,6 +13,8 @@
 # step into ~440 -- the same arithmetic, issued in bulk. (Running the iteration in bf16 would be
 # faster still and is what Jordan's reference does, but measured on this model it moves the update
 # direction by ~7% relative to fp64 where fp32/TF32 moves it by 0.09%, so it stays in fp32.)
+from typing import Callable, overload
+
 import torch
 
 # Jordan's quintic coefficients.
@@ -45,8 +51,16 @@ class Muon(torch.optim.Optimizer):
         defaults = dict(lr=lr, momentum=momentum, ns_steps=ns_steps, weight_decay=weight_decay)
         super().__init__(params, defaults)
 
+    # `Optimizer.step` is declared with these two overloads, and an override has to repeat them
+    # or it reads as returning `float | None` where the base promises `float`.
+    @overload
+    def step(self, closure: None = None) -> None: ...
+
+    @overload
+    def step(self, closure: Callable[[], float]) -> float: ...
+
     @torch.no_grad()
-    def step(self, closure=None):
+    def step(self, closure: Callable[[], float] | None = None) -> float | None:
         loss = closure() if closure is not None else None
         # Bucket by (shape, ns_steps) -- everything the Newton-Schulz iteration depends on. The
         # per-parameter lr/weight-decay ride along and are applied after, grouped so the writes go
