@@ -48,7 +48,7 @@ python -m src.slices.Evaluate.evaluate --clean
 python -m src.slices.Evaluate.evaluate --other
 
 # Step 9: local web demo at http://127.0.0.1:8000
-python -m src.slices.Demo.serve_demo --lm-weight 0.5 --ilm-weight 0.3
+python -m src.slices.Demo.serve_demo --lm-weight 0.7 --ilm-weight 0.4
 ```
 
 ---
