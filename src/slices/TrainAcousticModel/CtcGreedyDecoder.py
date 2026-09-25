@@ -9,12 +9,8 @@ def ctc_greedy_decode(best: torch.Tensor, out_lengths: torch.Tensor, tokenizer) 
     blank_id = get_config().model.blank_id
     texts = []
     for b in range(best.shape[0]):
-        prev = -1
-        ids = []
-        for t in range(int(out_lengths[b])):
-            idx = int(best[b, t])
-            if idx != prev and idx != blank_id:  # CTC collapse: drop repeats and blanks
-                ids.append(idx)
-            prev = idx
-        texts.append(tokenizer.decode(ids))
+        # CTC collapse: merge repeats first, THEN drop blanks, so a blank between two equal ids
+        # keeps both.
+        ids = torch.unique_consecutive(best[b, : int(out_lengths[b])])
+        texts.append(tokenizer.decode(ids[ids != blank_id].tolist()))
     return texts

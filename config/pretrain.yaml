@@ -93,9 +93,7 @@ warmup_steps: 10000
 # The SpeechBrain reproduction runs ~44,000 h, so this is ~1/4 of reference SSL compute.
 total_steps: 180000
 # WSD, as the transducer uses: hold the peak, then a 1-sqrt anneal over the last lr_decay_frac of
-# the budget. Under cosine, total_steps IS the curve, so extending a finished run re-heats the LR
-# at the resume step; under WSD it only moves the decay window. `cosine` remains available.
-lr_schedule: wsd
+# the budget. Extending a finished run only moves the decay window rather than re-heating the LR.
 lr_decay_frac: 0.25
 lr_min_ratio: 0.01
 seed: 42

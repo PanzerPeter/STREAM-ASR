@@ -14,10 +14,11 @@ def test_interctc_head_widths_match_tapped_stacks():
         assert head.out_features == get_config().model.logits_width
 
 
-def test_interctc_loss_is_finite_and_positive():
+def test_interctc_terms_are_finite_and_positive():
     torch.manual_seed(0)
     model = TransducerModel(cmvn_path=None).train()
     b = collate_features([(torch.randn(160, 80), [3, 4, 5, 6, 7])])
     _, _, _, interctc, base_len = model(b.features, b.feature_lengths)
-    loss = model.interctc_loss(interctc, base_len, b.tokens, b.token_lengths)
-    assert torch.isfinite(loss) and loss > 0
+    terms = model.interctc_terms(interctc, base_len, b.tokens, b.token_lengths)
+    assert len(terms) == len(model.interctc_heads)
+    assert all(torch.isfinite(t) and t > 0 for t in terms)

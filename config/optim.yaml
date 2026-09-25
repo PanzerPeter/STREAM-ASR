@@ -1,6 +1,5 @@
-# Optimizer settings, shared by every trainer. muon+adamw routes 2D hidden weights to Muon and
-# everything else to AdamW.
-optimizer: muon+adamw     # adamw | muon+adamw
+# Optimizer settings, shared by every trainer: 2D hidden weights go to Muon, everything else to
+# AdamW.
 muon_lr: 2.0e-2
 adamw_lr: 1.5e-3
 muon_momentum: 0.95

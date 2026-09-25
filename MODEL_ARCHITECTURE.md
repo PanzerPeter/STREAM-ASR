@@ -33,7 +33,7 @@ right-hand column is the section with the mechanism.
 | streaming WER ≫ offline WER | `dev/ctc_wer_stream_gap` through the anneal | The WSD anneal sharpens against whatever context it is given. A widening gap while `dev/ctc_wer` falls means the schedule is buying offline accuracy at streaming's expense | §11, §4 |
 | dev/transducer_wer moved a lot | ignore it; read `dev/ctc_wer` | ~1k words, σ ≈ 0.008, and its sampling has changed between runs. Never compare it across runs | §11 |
 | loss NaN / inf | `train/rnnt` vs `train/ctc` vs `train/interctc` separately | CTC uses `zero_infinity=True` so it cannot produce inf; RNN-T on an empty transcript returns `−Σ log p(blank)`, not 0 (unlike torchaudio's CUDA kernel) | §6.3 |
-| checkpoint won't load | `rnnt_loss` value in `config/training.yaml`; `lm.d_model` for the LM | `pruned` adds `simple_am_proj`/`simple_lm_proj`, so a checkpoint saved under one objective does not load under the other. The LM's `d_model` is load-bearing at inference | §13 |
+| checkpoint won't load | `lm.d_model` for the LM | The LM's `d_model` is load-bearing at inference | §13 |
 | step time regressed hours into a run | log for a dynamo recompile-limit warning | Exceeding the per-code-object recompile limit does not raise; dynamo silently demotes that function to eager **for the rest of the process**. `_RECOMPILE_LIMIT = 32` exists for this | §9.5 |
 | a metric contradicts another | §11's "blind to" column | `stack_mix/*_residual` and `*_processed` both describe the PROCESSED half and read *healthier* at the 2026-08-22 collapse than 20k steps before it | §11 |
 
@@ -242,7 +242,7 @@ routes `nn.Linear.weight` with `ndim == 2` to Muon; these are `nn.Conv1d` weight
 `[out, in, 1]`, so all **6,807,552** of them (12 % of the model) sit on **AdamW** and take weight
 decay, on `ndim` alone. Re-declaring them as `nn.Linear`, the obvious cleanup once they are already
 called through `F.linear`, would silently move an eighth of the model onto the optimizer §5.2 names
-as the trunk-inflation mechanism. See §8.1 and invariant 13.
+as the trunk-inflation mechanism. See §8.1 and invariant 12.
 
 ### 3.7 `SimpleDownsample` / `SimpleUpsample`
 Downsample: softmax over a learnable `[factor]` weight vector, weighted sum over each window,
@@ -407,7 +407,7 @@ head calibrated to the old amplitude that re-fits in a few hundred steps.
 Two of the three objections above survive and are simply accepted: `b` now interpolates against a
 *normalised* residual, which is no longer Zipformer's bypass, and `frontend.linear` is still
 unbounded. The third, that adopting it costs a fresh pretrain, did not hold: a mid-run insertion
-is a checkpoint migration (`scripts/migrate_trunk_norm.py`), and a warm start from a pretrain that
+is a checkpoint migration (the one-off script that did it for the 600k run is in git history), and a warm start from a pretrain that
 predates the norms simply starts them at gain 1.0.
 
 ### 5.5 The fifth failure: the projection ate the matrix (2026-08-24)
@@ -515,7 +515,6 @@ by calling `step` again with the just-emitted token.
 ### 6.2 `TransducerJoiner`
 ```
 forward: readout(tanh(enc_proj(enc)[:, :, None] + pred_proj(pred)[:, None]))   # [B,T,U+1,501]
-band:    readout(tanh(enc_proj(enc)[:, :, None] + pred_proj(pred_band)))       # [B,T,s_range,501]
 step:    out(tanh(enc_proj(enc_t) + pred_proj(pred_u)))                        # one (t,u) cell
 ```
 `readout` pads the output width to a multiple of 8 with a **−inf bias** on the pad columns:
@@ -553,15 +552,9 @@ Reduction is `"sum"` at the loss and divided by `token_lengths.sum()` in
 `TransducerModel.rnnt_loss` is normalised **per token**, matching CTC. A per-utterance mean under-weighted the
 aux CTC terms ~30× and was the first run's divergence.
 
-`RnntLossPruned` implements icefall's two-stage objective and is **off** (`rnnt_loss: full`): it is
-bit-identical to the reference at full band width in fp64 but 30 % slower end to end, because its
-frame loop runs through plain autograd (82,937 launches/step at 5.4 µs against 20,166 at 17.1 µs).
-Under `pruned` the model gains `simple_am_proj`/`simple_lm_proj` (both linear on purpose, because a *sum*
-of two vocab-width projections keeps the log-normaliser separable, so the implied lattice is a
-transient inside the loss rather than a stored activation), the loss weights ramp over
-`prune_warmup_steps = 4000` (simple 1.0 → 0.5, pruned 0.1 → 1.0), and `train/rnnt_simple` becomes a
-live metric. **This key is part of the architecture**: a checkpoint saved under one value will not
-load under the other.
+A pruned objective (icefall's two-stage, band-only joiner) was built, locked bit-identical to this
+at full band width in fp64, and removed: 30 % slower end to end, because its frame loop ran through
+plain autograd (82,937 launches/step at 5.4 µs against 20,166 at 17.1 µs). See git history.
 
 ### 6.4 Total loss
 ```
@@ -579,11 +572,6 @@ SpecAugment (`apply_spec_augment_batch`) is a train-only GPU batch op applied to
 `U{0..27}`, up to 10 time masks with count and span both scaled by the utterance's own valid length
 at ratio 0.05. Fully vectorised as `[B,K]` geometry reduced into one boolean mask, so it costs a
 fixed handful of kernels and never `.item()`s a length.
-
-CR-CTC exists, is off, and requires SpecAugment (its signal is the disagreement between two masked
-views; with masking off the KL is identically zero and the second encoder forward teaches nothing,
-the constructor raises rather than let that happen silently). Under CR-CTC the RNN-T lattice is
-computed on view 1 only.
 
 ---
 
@@ -700,7 +688,7 @@ pipeline.
 
 ### 8.1 Parameter partition (`Optimizer_Adapter.partition_params`)
 2-D `nn.Linear.weight` that is **not** in a head pattern (`frontend, ctc_head, pred_head, interctc,
-joiner.out, simple_am_proj, simple_lm_proj`) → **Muon**, everything else → **AdamW**.
+joiner.out`) → **Muon**, everything else → **AdamW**.
 Verified: **135 tensors / 46,481,408 params on Muon, 472 tensors / 8,785,698 on AdamW**.
 The partition keys on the **declared module type**, not on what the forward pass does: 6.81 M of
 that AdamW total is `ConvModule.pointwise1/2`, `nn.Conv1d` weights executed as `F.linear` (§3.6),
@@ -736,11 +724,11 @@ shape classes, ~2700 launches → ~440. fp32 and not bf16, because bf16 moves th
 against fp64 where fp32/TF32 moves it 0.09 %. Rejects any non-2-D parameter outright.
 
 ### 8.3 LR (`LrSchedule.lr_at`)
-Linear warmup to `peak * stable_ratio`, then WSD: hold, then anneal over the last `decay_frac`
-(0.25) of the budget with a `1 − √frac` profile down to `peak * min_ratio` (0.01). Cosine is the
-other option. Under WSD, raising `total_steps` mid-run only moves the decay window; under cosine
-`total` *is* the curve, so bumping it re-heats the LR at the resume step, which is how the
-120k → 175k bump that produced the shipped checkpoint accidentally became a two-cycle schedule.
+Linear warmup to `peak`, then WSD: hold, then anneal over the last `decay_frac` (0.25) of the
+budget with a `1 − √frac` profile down to `peak * min_ratio` (0.01). Raising `total_steps` mid-run
+only moves the decay window. Under the cosine schedule WSD replaced, `total` *was* the curve, so
+bumping it re-heated the LR at the resume step, which is how the 120k → 175k bump that produced the
+v1.0 checkpoint accidentally became a two-cycle schedule.
 
 The function returns a **shape multiplier**; each trainer snapshots every group's calibrated peak at
 build time and applies the shape per group per step, so Muon's much larger base LR is never
@@ -791,8 +779,7 @@ still trains. MEASURED 2026-08-05: `stacks.5.bypass` sat at 1.0020-1.0049 across
 with AdamW `exp_avg` at −2.3e-22, frozen out of training.
 
 It is deliberately **not** done inside `forward`: an in-place write to a leaf between two forwards
-that share one backward invalidates the first forward's saved tensor, exactly what the CR-CTC
-two-view path does.
+that share one backward invalidates the first forward's saved tensor.
 
 * `BiasNorm.project`: `log_scale.clamp_(-2.0, 1.0)`
 * `BiasNorm.project` on each stack's `trunk_norm`: the same clamp against the wider trunk window,
@@ -955,8 +942,8 @@ recipe that shipped 3.43 % did not have it.
 ### 10.3 Batch and collation
 `FeatureCollator` pads to the batch max and yields a `FeatureBatch` of
 `(features, feature_lengths, tokens, token_lengths)`, pinned; the four H2D copies in `joint_loss` are
-`non_blocking=True` so they overlap the tail of the previous step. The pretrain stage uses
-`MelOnlyDataset` + `collate_mels` (labels ignored).
+`non_blocking=True` so they overlap the tail of the previous step. The pretrain stage uses the
+`FeatureCacheReader` itself as its dataset, with `collate_mels` (labels ignored).
 
 Measured supply: the loader delivers 15,627× realtime against 1,426× needed, so **never chase the
 loader**.
@@ -966,15 +953,13 @@ loader**.
 ## 11. Observability: what each scalar can and cannot see
 
 ### 11.1 Transducer stage
-All `train/*` are emitted every `log_every = 250` steps from a **single** device→host sync: 12
+All `train/*` are emitted every `log_every = 250` steps from a **single** device→host sync: 11
 scalars plus 3×`n_stacks` mix values are concatenated and `.tolist()`ed once, because every `.item()`
 drains the CUDA queue.
 
 | Tag | Quantity | Blind to |
 |---|---|---|
 | `train/loss,rnnt,ctc,interctc` | loss terms, per token (`interctc` is the RAW mean over taps) | everything structural |
-| `train/rnnt_simple` | simple-joiner term, only under `rnnt_loss: pruned` | n/a (a diverging simple loss silently corrupts the pruning band while the pruned term stays finite) |
-| `train/cr_ctc` | consistency KL, only with CR-CTC on | n/a |
 | `train/lr` | AdamW group 0's LR (`optimizers[-1]` is always AdamW) | Muon's LR, which is 13× larger |
 | `train/grad_norm` | the **scalars'** group pre-clip norm (`ndim < 2`), not the old global | **it is ~95-99 % one scalar gate.** The old global is `√(1/share)` larger (+0.5 % at a 99 % share, +2.6 % at 95 %), so the two agree to 2-3 figures, not exactly. Two runs were aborted on this as false positives |
 | `train/grad_norm_guarded` | norm over `ndim ≥ 2` only, read **pre-clip** | the gates, by design; this is the health signal |
@@ -1079,15 +1064,13 @@ contention-free; audio IO sits outside the timer. Report goes to `runs/eval/repo
    never the model. The dividing line is `get_config()`, SDPA and data-dependent control flow.
 9. `project_constraints` runs after **every** optimizer step in both acoustic trainers. A bound
    enforced only in `forward` leaves the parameter in `clamp`'s dead zone permanently.
-10. `training.transducer.rnnt_loss` is an architecture key, not a loop setting: `pruned` adds
-    `simple_am_proj`/`simple_lm_proj`, so checkpoints do not cross between the two values.
-11. `total_steps` counts loader batches in the transducer stage and optimizer updates in the BEST-RQ
+10. `total_steps` counts loader batches in the transducer stage and optimizer updates in the BEST-RQ
     stage. Convert to audio-hours before comparing any run to a published one.
-12. Any stage that names a submodule `encoder` inherits `optim.encoder_lr_scale`. Override it
+11. Any stage that names a submodule `encoder` inherits `optim.encoder_lr_scale`. Override it
     deliberately or it silently halves that stage's LR (§7.4).
-13. `ConvModule`'s two kernel-1 convs stay `nn.Conv1d`. They are *called* as `F.linear`, but their
+12. `ConvModule`'s two kernel-1 convs stay `nn.Conv1d`. They are *called* as `F.linear`, but their
     `ndim == 3` is what keeps 6.81 M params on AdamW; declaring them `nn.Linear` moves them to
     Muon without touching a checkpoint key (§3.6, §8.1).
-14. A trainer refuses to start without `cmvn.pt` unless `cmvn_path=""` says so explicitly. The
+13. A trainer refuses to start without `cmvn.pt` unless `cmvn_path=""` says so explicitly. The
     encoder's mean 0 / std 1 fallback exists for tests and for inference, where the checkpoint
     carries the real buffers (§2.2).

@@ -28,7 +28,6 @@ from src.slices.ExtractFeatures.FrameBucketSampler import FrameBucketSampler
 from src.slices.PretrainEncoder.BestRqModel import BestRqModel
 from src.slices.PretrainEncoder.BestRqPretrain_Command import BestRqPretrainCommand
 from src.slices.PretrainEncoder.MelOnlyCollator import collate_mels
-from src.slices.PretrainEncoder.MelOnlyDataset import MelOnlyDataset
 
 _DEV_MASK_SEED = 1234
 
@@ -40,12 +39,13 @@ def _dev_batches(cmd: BestRqPretrainCommand, count: int) -> list[tuple[torch.Ten
     ~16 batches of the dev cache this is ~100 MB of pinnable host memory against a second
     DataLoader that would re-shuffle every time it was iterated.
     """
+    # BEST-RQ ignores transcripts, so the mel cache itself is the dataset: row i of the manifest is
+    # entry i of the cache.
     cache = FeatureCacheReader(cmd.cache_dir, cmd.dev_cache_split)
-    ds = MelOnlyDataset(cmd.dev_manifest, cache)
     sampler = FrameBucketSampler(
         cmd.dev_manifest, get_config().pretrain.max_frames_per_batch, shuffle=False
     )
-    loader = DataLoader(ds, batch_sampler=sampler, collate_fn=collate_mels, num_workers=0)
+    loader = DataLoader(cache, batch_sampler=sampler, collate_fn=collate_mels, num_workers=0)
     batches: list[tuple[torch.Tensor, torch.Tensor]] = []
     for batch in loader:
         batches.append(batch)
@@ -118,7 +118,6 @@ def run_pretrain(cmd: BestRqPretrainCommand) -> str:
     p = get_config().pretrain
 
     cache = FeatureCacheReader(cmd.cache_dir, cmd.cache_split)
-    ds = MelOnlyDataset(cmd.train_manifest, cache)
     sampler = FrameBucketSampler(
         cmd.train_manifest,
         # BEST-RQ's own budget (config/pretrain.yaml): encoder + pred_head only, no
@@ -129,7 +128,7 @@ def run_pretrain(cmd: BestRqPretrainCommand) -> str:
         seed=p.seed,
     )
     loader = DataLoader(
-        ds, batch_sampler=sampler, collate_fn=collate_mels, num_workers=cmd.num_workers
+        cache, batch_sampler=sampler, collate_fn=collate_mels, num_workers=cmd.num_workers
     )
 
     model = BestRqModel(cmvn_path=cmvn).to(device)
@@ -184,7 +183,6 @@ def run_pretrain(cmd: BestRqPretrainCommand) -> str:
                     1.0,
                     p.warmup_steps,
                     cmd.total_steps,
-                    schedule=p.lr_schedule,
                     decay_frac=p.lr_decay_frac,
                     min_ratio=p.lr_min_ratio,
                 )

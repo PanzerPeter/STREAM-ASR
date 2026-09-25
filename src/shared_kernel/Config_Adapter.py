@@ -1,7 +1,6 @@
 # YAML-backed, pydantic-validated run config (infra)
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
 
 import yaml
 from pydantic import BaseModel, computed_field
@@ -27,7 +26,6 @@ class AugmentConfig(BaseModel):
 
 class FeaturesConfig(BaseModel):
     cache_dir: str
-    enabled: bool
 
 
 class ModelConfig(BaseModel):
@@ -97,8 +95,6 @@ class TransducerConfig(BaseModel):
     ctc_aux_weight: float
     interctc_layers: tuple[int, ...]
     interctc_weights: tuple[float, ...]
-    cr_ctc: bool = False
-    cr_weight: float = 0.2
 
 
 class TransducerTrainConfig(BaseModel):
@@ -108,21 +104,11 @@ class TransducerTrainConfig(BaseModel):
     # Width of the sliding window the duration sort is re-sorted by transcript length inside, so a
     # batch is homogeneous in U as well as in T. 1 = off (plain duration sort).
     token_sort_window: int = 1
-    # "full" materialises the whole [B,T,U+1,V] lattice; "pruned" evaluates the real joiner only on
-    # an s_range-wide band chosen by a linear simple joiner. Literal, not str: a typo here would
-    # otherwise silently fall through to the full objective for a whole run.
-    rnnt_loss: Literal["full", "pruned"] = "full"
-    s_range: int = 5
-    prune_warmup_steps: int = 4000
-    simple_loss_scale: float = 0.5
     grad_accum: int
     warmup_steps: int
     total_steps: int
-    # LR shape after warmup. "wsd" = hold lr_stable_ratio * peak until the last lr_decay_frac of
-    # total_steps, then 1-sqrt anneal to lr_min_ratio * peak; "cosine" = anneal from step
-    # warmup_steps to lr_min_ratio * peak at total_steps. Both land at total_steps exactly.
-    lr_schedule: Literal["cosine", "wsd"] = "cosine"
-    lr_stable_ratio: float = 1.0
+    # LR shape after warmup (WSD): hold peak until the last lr_decay_frac of total_steps, then a
+    # 1-sqrt anneal to lr_min_ratio * peak, landing at total_steps exactly.
     lr_decay_frac: float = 0.25
     lr_min_ratio: float = 0.0
     grad_clip: float
@@ -182,7 +168,6 @@ class LmConfig(BaseModel):
     dropout: float
     context_len: int
     value_residual_lambda: float
-    optimizer: str
     muon_lr: float
     z_loss: float
     lr_peak: float
@@ -210,7 +195,6 @@ class EvalConfig(BaseModel):
 
 
 class OptimConfig(BaseModel):
-    optimizer: str
     muon_lr: float
     adamw_lr: float
     muon_momentum: float
@@ -231,7 +215,6 @@ class PretrainConfig(BaseModel):
     chunk_sizes: list[int]
     warmup_steps: int
     total_steps: int
-    lr_schedule: str
     lr_decay_frac: float
     lr_min_ratio: float
     seed: int
@@ -260,17 +243,7 @@ class StreamConfig(BaseModel):
 @lru_cache(maxsize=None)
 def get_config(config_dir: str | None = None) -> StreamConfig:
     root = Path(config_dir) if config_dir else _CONFIG_DIR
-    data = {
-        "audio": yaml.safe_load((root / "audio.yaml").read_text()),
-        "augment": yaml.safe_load((root / "augment.yaml").read_text()),
-        "features": yaml.safe_load((root / "features.yaml").read_text()),
-        "model": yaml.safe_load((root / "model.yaml").read_text()),
-        "training": yaml.safe_load((root / "training.yaml").read_text()),
-        "decode": yaml.safe_load((root / "decode.yaml").read_text()),
-        "lm": yaml.safe_load((root / "lm.yaml").read_text()),
-        "eval": yaml.safe_load((root / "eval.yaml").read_text()),
-        "optim": yaml.safe_load((root / "optim.yaml").read_text()),
-        "pretrain": yaml.safe_load((root / "pretrain.yaml").read_text()),
-        "transducer": yaml.safe_load((root / "transducer.yaml").read_text()),
-    }
-    return StreamConfig(**data)
+    # One YAML per top-level section, named after it.
+    return StreamConfig(
+        **{k: yaml.safe_load((root / f"{k}.yaml").read_text()) for k in StreamConfig.model_fields}
+    )

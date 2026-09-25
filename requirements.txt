@@ -5,7 +5,6 @@ sentencepiece
 jiwer
 soundfile
 numpy
-tqdm
 tensorboard
 # local demo server (Demo slice): FastAPI app + uvicorn, multipart uploads, mic WebSocket
 fastapi
@@ -13,7 +12,6 @@ uvicorn
 python-multipart
 websockets
 loguru
-rich
 # release packaging: pickle-free weight export for the public HuggingFace artifacts
 safetensors
 pydantic

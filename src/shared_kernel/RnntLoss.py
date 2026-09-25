@@ -170,16 +170,15 @@ def alignment_loss(
     """Graves forward-backward on the alignment grid, one level below `rnnt_loss`.
 
     `rnnt_loss` owns the lattice: it log-softmaxes ``[B, T, U+1, V]`` and gathers the two arcs that
-    leave each cell. This entry point takes those two arcs directly, which is what the pruned path
-    needs -- its arcs come from a *linear* joiner whose lattice is never materialised. Returns the
-    per-utterance cost plus both scan variables, because the pruning bounds are read off the
-    occupancy ``exp(alpha + beta - Z)`` rather than from a second backward pass.
+    leave each cell. This takes those two arcs directly and returns the per-utterance cost plus
+    both scan variables, which the analytic backward reads as the occupancy
+    ``exp(alpha + beta - Z)``.
 
     ``blank_lp`` is ``[B, T, U+1]``, ``label_lp`` is ``[B, T, U]``, both masked IN PLACE to each
     utterance's own rectangle. The mask lives here rather than in the callers because forgetting it
     is silent: alpha (and therefore the cost) only ever reads inside the rectangle, so a run with
     ragged padding returns the right number with a beta that has leaked probability in from a
-    padded neighbour -- and beta is exactly what the bounds are derived from.
+    padded neighbour -- and beta is exactly what the gradient is built from.
     """
     batch, num_frames, num_states = blank_lp.shape
     num_labels = num_states - 1

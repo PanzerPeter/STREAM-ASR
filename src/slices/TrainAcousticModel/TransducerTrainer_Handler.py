@@ -13,13 +13,12 @@ import random
 import re
 import shutil
 import time
+from datetime import timedelta
 
 import torch
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import jiwer
-from rich.console import Console
-from rich.panel import Panel
 
 from src.shared_kernel.Checkpoint_Adapter import resume_if_available, save_checkpoint
 from src.shared_kernel.Config_Adapter import get_config
@@ -42,7 +41,6 @@ from src.slices.ExtractFeatures.FrameBucketSampler import FrameBucketSampler
 from src.slices.TrainAcousticModel.CtcGreedyDecoder import ctc_greedy_decode
 from src.slices.TrainAcousticModel.TransducerModel import TransducerModel
 from src.slices.TrainAcousticModel._train_utils import (
-    _fmt_hms,
     _Checkpointed,
     _seed_all,
     branch_gain_params,
@@ -129,8 +127,6 @@ def _warm_start_encoder(model: TransducerModel, path: str, log) -> None:
     # RMS 1 and finds its own level inside the window, rather than inheriting the pretrain's
     # amplitude -- which is the thing this run is trying not to inherit (CLAUDE.md pitfall 15
     # measures that handoff at trunk RMS 5.7-17.0 against 1.5-2.7 for the model that works).
-    # A mid-run insertion is a different problem and wants a measured init: scripts/
-    # migrate_trunk_norm.py.
     missing, unexpected = model.encoder.load_state_dict(sd, strict=False)
     stray = [k for k in missing if ".trunk_norm." not in k]
     if stray or unexpected:
@@ -299,7 +295,6 @@ def run_transducer(cmd: TransducerTrainCommand) -> str:
     # is in time and still lets an explicit env override win. Allocator-only -- numerics untouched.
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     log = configure_logging()
-    console = Console()
     os.makedirs(cmd.ckpt_dir, exist_ok=True)
     device = cmd.device if torch.cuda.is_available() else "cpu"
     torch.set_float32_matmul_precision("high")
@@ -355,19 +350,18 @@ def run_transducer(cmd: TransducerTrainCommand) -> str:
     peak_lrs = [[g["lr"] for g in opt.param_groups] for opt in optimizers]
 
     n_params = sum(p.numel() for p in model.parameters())
-    console.print(
-        Panel(
-            f"device {device} · params {n_params / 1e6:.1f} M · steps {cmd.total_steps:,}\n"
-            f"lr {tr.lr_schedule} · warmup {tr.warmup_steps:,} · stable {tr.lr_stable_ratio:.2f}"
-            f" · decay {tr.lr_decay_frac:.2f} · floor {tr.lr_min_ratio:.3f}\n"
-            f"chunks {tr.chunk_sizes} · ctc_aux {get_config().transducer.ctc_aux_weight}\n"
-            f"compiled modules {n_compiled or 'off (eager)'}"
-            f" · grad_checkpoint {tr.grad_checkpoint}\n"
-            f"warm-start {cmd.warm_start or '(none)'} · tb → {cmd.log_dir}",
-            title="[bold]STREAM · Transducer[/bold]",
-            border_style="cyan",
-            expand=False,
-        )
+    log.info(
+        f"STREAM · Transducer │ device {device} · params {n_params / 1e6:.1f} M · "
+        f"steps {cmd.total_steps:,}"
+    )
+    log.info(
+        f"lr wsd · warmup {tr.warmup_steps:,} · decay {tr.lr_decay_frac:.2f} · "
+        f"floor {tr.lr_min_ratio:.3f} · chunks {tr.chunk_sizes} · "
+        f"ctc_aux {get_config().transducer.ctc_aux_weight}"
+    )
+    log.info(
+        f"compiled modules {n_compiled or 'off (eager)'} · grad_checkpoint {tr.grad_checkpoint}"
+        f" · warm-start {cmd.warm_start or '(none)'} · tb → {cmd.log_dir}"
     )
 
     last_ckpt = os.path.join(cmd.ckpt_dir, "transducer_last.pt")
@@ -409,11 +403,6 @@ def run_transducer(cmd: TransducerTrainCommand) -> str:
     gain_params = branch_gain_params(model)
     mix_params = stack_mix_params(model)
     n_stacks = len(mix_params)
-    # Under "full" the simple term IS the rnnt term (TransducerModel.rnnt_loss returns the same
-    # tensor three times) and CR-CTC is identically 0 when off, so both would log a duplicate and a
-    # constant. Only report what carries information.
-    log_simple = tr.rnnt_loss == "pruned"
-    log_cr = get_config().transducer.cr_ctc
     if step > 0:
         log.info(f"resumed from {last_ckpt} @ step {step:,} (resume #{resume_count})")
         _drop_snapshots_after(cmd.ckpt_dir, step, log)
@@ -442,8 +431,6 @@ def run_transducer(cmd: TransducerTrainCommand) -> str:
                     1.0,
                     tr.warmup_steps,
                     cmd.total_steps,
-                    schedule=tr.lr_schedule,
-                    stable_ratio=tr.lr_stable_ratio,
                     decay_frac=tr.lr_decay_frac,
                     min_ratio=tr.lr_min_ratio,
                 )
@@ -457,7 +444,7 @@ def run_transducer(cmd: TransducerTrainCommand) -> str:
                     with torch.autocast(
                         device_type="cuda", dtype=torch.bfloat16, enabled=(device == "cuda")
                     ):
-                        total, rnnt, ctc, ictc, cr, simple = model.joint_loss(batch, chunk, step)
+                        total, rnnt, ctc, ictc = model.joint_loss(batch, chunk)
                         loss = total / tr.grad_accum
                     loss.backward()
                 except torch.OutOfMemoryError:
@@ -518,7 +505,9 @@ def run_transducer(cmd: TransducerTrainCommand) -> str:
                 if step % tr.log_every == 0:
                     now = time.perf_counter()
                     its = (step - win_step) / max(now - win_start, 1e-9)
-                    eta = _fmt_hms((cmd.total_steps - step) / its) if its > 0 else "-"
+                    eta = "-"
+                    if its > 0:
+                        eta = str(timedelta(seconds=int((cmd.total_steps - step) / its)))
                     # Watch the pretrained encoder drift: a fast climb here after warmup is the
                     # erosion signature the encoder_lr_scale / per-token loss fix target.
                     # _foreach_norm folds the ~600 per-parameter reductions into one fused
@@ -573,8 +562,6 @@ def run_transducer(cmd: TransducerTrainCommand) -> str:
                                     rnnt,
                                     ctc,
                                     ictc,
-                                    cr,
-                                    simple,
                                     last_grad_norm,
                                     last_guard_norm,
                                     enc_norm,
@@ -591,8 +578,6 @@ def run_transducer(cmd: TransducerTrainCommand) -> str:
                         v_rnnt,
                         v_ctc,
                         v_ictc,
-                        v_cr,
-                        v_simple,
                         v_gnorm,
                         v_guard,
                         v_enc,
@@ -600,16 +585,11 @@ def run_transducer(cmd: TransducerTrainCommand) -> str:
                         v_ceiling,
                         v_trunk,
                         v_stable_rank,
-                    ) = flat[:13]
-                    v_res = flat[13 : 13 + n_stacks]
-                    v_proc = flat[13 + n_stacks : 13 + 2 * n_stacks]
-                    v_trunk_rms = flat[13 + 2 * n_stacks :]
-                    terms = f"rnnt {v_rnnt:5.2f}"
-                    if log_simple:
-                        terms += f" simple {v_simple:5.2f}"
-                    terms += f" ctc {v_ctc:5.2f} ictc {v_ictc:5.2f}"
-                    if log_cr:
-                        terms += f" cr {v_cr:5.2f}"
+                    ) = flat[:11]
+                    v_res = flat[11 : 11 + n_stacks]
+                    v_proc = flat[11 + n_stacks : 11 + 2 * n_stacks]
+                    v_trunk_rms = flat[11 + 2 * n_stacks :]
+                    terms = f"rnnt {v_rnnt:5.2f} ctc {v_ctc:5.2f} ictc {v_ictc:5.2f}"
                     log.info(
                         f"step {step:>7,}/{cmd.total_steps:,} │ loss {v_loss:6.3f} ({terms}) │ "
                         f"chunk {chunk} │ lr {lr:.2e} │ {its:5.2f} it/s │ eta {eta}"
@@ -646,15 +626,6 @@ def run_transducer(cmd: TransducerTrainCommand) -> str:
                         ("trunk_stable_rank_min", v_stable_rank),
                     ):
                         writer.add_scalar(f"train/{name}", val, step)
-                    # Only when they say something the tags above do not: `rnnt_simple` is the same
-                    # tensor as `rnnt` under the "full" objective and `cr_ctc` is identically 0
-                    # with CR-CTC off.
-                    if log_simple:
-                        # What picks the pruning band, so it diverging is a failure that would
-                        # otherwise show up only as a slowly worsening WER.
-                        writer.add_scalar("train/rnnt_simple", v_simple, step)
-                    if log_cr:
-                        writer.add_scalar("train/cr_ctc", v_cr, step)
                     for i, (res, proc) in enumerate(zip(v_res, v_proc)):
                         writer.add_scalar(f"stack_mix/{i}_residual", res, step)
                         writer.add_scalar(f"stack_mix/{i}_processed", proc, step)
@@ -817,13 +788,10 @@ def run_transducer(cmd: TransducerTrainCommand) -> str:
         },
     )
     writer.close()
-    console.print(
-        Panel(
-            f"steps {step:,} · elapsed {_fmt_hms(time.perf_counter() - run_start)} · "
-            f"best dev ctc-WER {best_wer:.4f}\nlast → {last_ckpt}\nbest → {best_ckpt}",
-            title="[bold green]Transducer training complete[/bold green]",
-            border_style="green",
-            expand=False,
-        )
+    elapsed = timedelta(seconds=int(time.perf_counter() - run_start))
+    log.success(
+        f"Transducer training complete │ steps {step:,} · elapsed {elapsed} · "
+        f"best dev ctc-WER {best_wer:.4f}"
     )
+    log.success(f"last → {last_ckpt} · best → {best_ckpt}")
     return last_ckpt

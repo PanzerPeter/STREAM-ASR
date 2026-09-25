@@ -21,9 +21,8 @@ Turn manifest rows into padded log-mel/token training batches.
 ## Notes
 `FrameBucketSampler` batches by budget, not by a fixed count: `max_frames_per_batch` and
 `max_tokens_per_batch` are sums (they bound the average batch), while `max_lattice_per_batch` caps
-`B × max(frames) × max(chars)` on the *worst* batch. Under `rnnt_loss: full` that product was peak
-VRAM itself; under `pruned` the real joiner sees `[B,T,s_range,V]` and the product bounds the simple
-loss's frame-slab bandwidth instead.
+`B × max(frames) × max(chars)` on the *worst* batch, which is the full RNN-T lattice and therefore
+peak VRAM itself.
 
 Order is a duration sort, optionally re-sorted by transcript length inside a sliding window of that
 order (`token_sort_window`, default 1 = off). The full lattice is charged at the batch's **max** `U`,
@@ -31,8 +30,7 @@ and two utterances of equal duration differ up to 2× in token count, so a mixed
 on every cell. Measured on `train_sp2` at the shipped budgets (`scripts/measure_lattice_waste.py`):
 22.9 % of lattice cells are `U` padding at window 1, 5.6 % at 256, 2.0 % at 1024, which is 21 % less
 lattice work per epoch. The window must be far wider than a batch (mean `B` ≈ 22) or it is inert,
-since the saving needs a whole batch to fall inside one homogeneous run. It buys nothing under
-`pruned`, whose lattice does not depend on `U`. Off by default: batches homogeneous in speaking rate
+since the saving needs a whole batch to fall inside one homogeneous run. Off by default: batches homogeneous in speaking rate
 are a training-semantics change no run has isolated.
 
 The batch list is built once and cached. It depends only on the fixed sort order and the three

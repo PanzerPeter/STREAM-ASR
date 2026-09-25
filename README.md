@@ -409,7 +409,7 @@ src/
     Evaluate/           # corpus WER/CER/RTF/latency + ablation table + dev weight tuning
     Demo/               # local FastAPI web UI: file upload + live-mic streaming transcription
 scripts/              # env check, 960 h data build, LM corpus download, ckpt averaging,
-                      #   safetensors export, step profiler, trunk-norm checkpoint migration
+                      #   safetensors export, step profiler, lattice-waste measurement
 tests/                # shape / round-trip / equivalence / count sanity tests
 data/                 # LibriSpeech splits, manifests, tokenizer, cmvn, checkpoints (gitignored)
 ```
@@ -426,12 +426,11 @@ data/                 # LibriSpeech splits, manifests, tokenizer, cmvn, checkpoi
 | `LogMel_Transform.py` | 80-bin log-mel frontend |
 | `Tokenizer_Adapter.py` | SentencePiece BPE-500 wrapper |
 | `RnntLoss.py` | RNN-T forward-backward (own kernel, replaces torchaudio's) |
-| `RnntLossPruned.py` | icefall's two-stage pruned RNN-T objective, implemented and locked by test, off by default |
 | `BiasNorm.py`, `SwiGluFfn.py`, `RoPE_Transform.py` | blocks shared by encoder and LM |
 | `Checkpoint_Adapter.py` | atomic stateful save/load + `resume_if_available` |
 | `SignalGuard.py` | cooperative SIGINT/SIGTERM stop for training loops |
 | `Muon_Optimizer.py`, `Optimizer_Adapter.py` | Muon + AdamW optimizer stack |
-| `LrSchedule.py`, `GradientClipping.py` | warmup + cosine/WSD shape, and the matrices/scalars split clip, shared by both acoustic trainers |
+| `LrSchedule.py`, `GradientClipping.py` | warmup + WSD shape, and the matrices/scalars split clip, shared by both acoustic trainers |
 | `ParameterProjection.py` | re-projects the bounded parameters (`BiasNorm.log_scale`, stack `bypass`, `in_proj` σ₁) onto their ranges after every optimizer step |
 | `RandomProjectionQuantizer.py` | frozen BEST-RQ target quantizer |
 | `MaskUtils.py`, `Logging_Adapter.py` | masking helpers, loguru sink |

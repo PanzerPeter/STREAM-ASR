@@ -18,7 +18,6 @@ from torch.utils.data import DataLoader
 from src.shared_kernel.Config_Adapter import get_config
 from src.shared_kernel.Optimizer_Adapter import build_optimizer
 from src.shared_kernel.RnntLoss import rnnt_loss
-from src.shared_kernel.RnntLossPruned import prune_ranges, rnnt_loss_pruned, rnnt_loss_simple
 from src.shared_kernel.Tokenizer_Adapter import SentencePieceTokenizer
 from src.slices.ExtractFeatures.FeatureCache import FeatureCacheReader
 from src.slices.ExtractFeatures.FeatureCollator import collate_features
@@ -101,63 +100,15 @@ def _stage_breakdown(model: TransducerModel, batch, chunk: int, device: str) -> 
         pred_in = torch.cat([blanks, tokens], dim=1)
         ms, pred = _elapsed(lambda: model.predictor(pred_in), device)
         rows.append(("predictor fwd", ms))
-        if tr.rnnt_loss == "full":
-            ms, logits = _elapsed(lambda: model.joiner(memory, pred), device)
-            rows.append(("joiner fwd (lattice)", ms))
-            ms, cost = _elapsed(
-                lambda: rnnt_loss(
-                    logits, tokens.int(), out_len.int(), tlens.int(), blank=blank, reduction="sum"
-                ),
-                device,
-            )
-            rows.append(("rnnt loss fwd", ms))
-        else:
-            # Split into the four stages the pruned objective actually adds, because the whole
-            # point of the change is WHERE the joiner cost went -- a single "rnnt" row would hide
-            # whether the simple pass or the band scan ate the saving.
-            ms, proj = _elapsed(
-                lambda: (model.simple_am_proj(memory).float(), model.simple_lm_proj(pred).float()),
-                device,
-            )
-            rows.append(("simple projections", ms))
-            am, lm_proj = proj
-            ms, simple_out = _elapsed(
-                lambda: rnnt_loss_simple(
-                    am, lm_proj, tokens.int(), out_len.int(), tlens.int(), blank=blank
-                ),
-                device,
-            )
-            rows.append(("simple loss fwd", ms))
-            simple_cost, occupancy = simple_out
-            s_range = min(tr.s_range, pred.shape[1])
-            ms, s_begin = _elapsed(
-                lambda: prune_ranges(occupancy, out_len.long(), tlens.long(), s_range), device
-            )
-            rows.append(("prune ranges", ms))
-            idx = s_begin.unsqueeze(-1) + torch.arange(s_range, device=device)
-            ms, pred_band = _elapsed(
-                lambda: pred.gather(
-                    1, idx.reshape(pred.shape[0], -1, 1).expand(-1, -1, pred.shape[-1])
-                ).view(pred.shape[0], memory.shape[1], s_range, pred.shape[-1]),
-                device,
-            )
-            rows.append(("predictor band gather", ms))
-            ms, logits = _elapsed(lambda: model.joiner.band(memory, pred_band), device)
-            rows.append(("joiner fwd (band)", ms))
-            ms, cost = _elapsed(
-                lambda: rnnt_loss_pruned(
-                    logits,
-                    tokens.int(),
-                    s_begin,
-                    out_len.int(),
-                    tlens.int(),
-                    blank=blank,
-                    reduction="sum",
-                ),
-                device,
-            )
-            rows.append(("pruned loss fwd", ms))
-            cost = cost + simple_cost.sum()
+        ms, logits = _elapsed(lambda: model.joiner(memory, pred), device)
+        rows.append(("joiner fwd (lattice)", ms))
+        ms, cost = _elapsed(
+            lambda: rnnt_loss(
+                logits, tokens.int(), out_len.int(), tlens.int(), blank=blank, reduction="sum"
+            ),
+            device,
+        )
+        rows.append(("rnnt loss fwd", ms))
         total = cost / tlens.sum().clamp(min=1) + t.ctc_aux_weight * model.ctc_loss(
             ctc_logits, out_len, tokens, tlens
         )
@@ -254,13 +205,6 @@ def main() -> None:
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--device", default="cuda")
     p.add_argument(
-        "--rnnt-loss",
-        choices=("full", "pruned"),
-        default=None,
-        help="override training.transducer.rnnt_loss for this run, so both objectives can be "
-        "measured on the same batches in one sitting (default: the configured value)",
-    )
-    p.add_argument(
         "--max-frames",
         type=int,
         default=None,
@@ -297,11 +241,6 @@ def main() -> None:
     a = p.parse_args()
 
     tr_cfg = get_config().training.transducer
-    if a.rnnt_loss is not None:
-        # Mutating the cached config is what makes the comparison apples-to-apples: the model reads
-        # the objective in __init__ (it decides whether the simple projections exist at all), and
-        # the sampler's budgets must stay identical across the two runs.
-        tr_cfg.rnnt_loss = a.rnnt_loss
     if a.max_frames is not None:
         tr_cfg.max_frames_per_batch = a.max_frames
     if a.max_tokens is not None:
@@ -311,7 +250,7 @@ def main() -> None:
     if a.token_sort_window is not None:
         tr_cfg.token_sort_window = a.token_sort_window
     print(
-        f"  objective {tr_cfg.rnnt_loss} · frames {tr_cfg.max_frames_per_batch:,} · "
+        f"  frames {tr_cfg.max_frames_per_batch:,} · "
         f"tokens {tr_cfg.max_tokens_per_batch:,} · lattice {tr_cfg.max_lattice_per_batch:.2e} · "
         f"token_sort_window {tr_cfg.token_sort_window}"
     )

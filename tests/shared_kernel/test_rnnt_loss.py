@@ -156,8 +156,8 @@ def test_frame_slabbing_does_not_change_the_result(monkeypatch):
 def test_alignment_loss_matches_the_logit_entry_point():
     # alignment_loss is the same recursion as rnnt_loss, entered one level lower: the caller
     # supplies the alignment-grid log-probs instead of a lattice. Driving both from the same logits
-    # must give the same cost, or the pruned path (which only has the lower entry) is scoring a
-    # different model.
+    # must give the same cost, or the analytic backward (which reads alpha/beta from the lower
+    # entry) is differentiating a different model.
     import torch
     import torch.nn.functional as F
     from src.shared_kernel.RnntLoss import alignment_loss, rnnt_loss

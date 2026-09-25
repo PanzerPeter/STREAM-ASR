@@ -8,6 +8,7 @@ from typing import Iterable
 
 import numpy as np
 import torch
+from torch.utils.data import Dataset
 
 from src.shared_kernel.Config_Adapter import get_config
 
@@ -95,7 +96,7 @@ def write_feature_cache(
         json.dump(header, f)
 
 
-class FeatureCacheReader:
+class FeatureCacheReader(Dataset[torch.Tensor]):
     def __init__(self, cache_dir: str, split: str, fingerprint: str | None = None) -> None:
         with open(os.path.join(cache_dir, f"{split}.header.json"), encoding="utf-8") as f:
             header = json.load(f)

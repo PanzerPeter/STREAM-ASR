@@ -106,7 +106,7 @@ def test_shuffle_permutes_without_mutating_the_cached_order(tmp_path):
 
 def test_lattice_budget_bounds_the_worst_case_batch(tmp_path):
     # Two sum budgets never bound B * max(frames) * max(tokens), which is what the alignment grid
-    # actually costs -- VRAM under the full objective, simple-loss bandwidth under the pruned one.
+    # actually costs: the full RNN-T lattice's VRAM.
     # One long-transcript utterance among short ones is enough to make a batch that fits both sums
     # cost several times the typical one.
     rows = [{"num_samples": 16000, "text": "A" * 20} for _ in range(9)]

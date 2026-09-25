@@ -1,18 +1,17 @@
 # STREAM-LM training: Muon+AdamW + warmup->cosine, bf16 autocast (eager), z-loss, val perplexity,
 # best-ckpt. Windows are document-masked, so a training position only ever attends its own corpus
 # line -- the same context a rescored ASR hypothesis has at decode time.
-# Terminal logging mirrors the acoustic trainers (Logging_Adapter loguru sink + rich Panels +
-# TensorBoard) so a multi-hour LM run is monitored the same way.
+# Terminal logging mirrors the acoustic trainers (Logging_Adapter loguru sink + TensorBoard) so a
+# multi-hour LM run is monitored the same way.
 import math
 import os
 import time
+from datetime import timedelta
 from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader, RandomSampler
 from torch.utils.tensorboard import SummaryWriter
-from rich.console import Console
-from rich.panel import Panel
 
 from src.shared_kernel.Config_Adapter import LmConfig, get_config
 from src.shared_kernel.Checkpoint_Adapter import resume_if_available, save_checkpoint
@@ -28,23 +27,12 @@ from src.slices.TrainLanguageModel.TrainLm_Command import TrainLm_Command
 _VAL_WINDOWS = 1280
 
 
-def _fmt_hms(seconds: float) -> str:
-    # Duplicated from the acoustic trainers' identical helper rather than imported: AC-002 forbids
-    # reaching into another slice's internals, and VSA makes duplication (not a shared-kernel
-    # promotion) the default until an explicit /abstract command.
-    seconds = max(0, int(seconds))
-    h, rem = divmod(seconds, 3600)
-    m, s = divmod(rem, 60)
-    return f"{h:d}:{m:02d}:{s:02d}"
-
-
 class TrainLm_Handler:
     def run(self, cmd: TrainLm_Command) -> float:
         # Same allocator setting the transducer trainer uses: micro-batch activation blocks vary in
         # size across the run, and growing a segment in place beats rounding up to a fresh block.
         os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
         log = configure_logging()
-        console = Console()
         lm = get_config().lm
         if lm.batch_size % lm.grad_accum:
             raise ValueError(
@@ -85,20 +73,22 @@ class TrainLm_Handler:
         writer = SummaryWriter(cmd.log_dir)
 
         n_params = sum(p.numel() for p in model.parameters())
-        console.print(
-            Panel(
-                f"device {device} · params {n_params / 1e6:.1f} M · steps {start:,} → {steps:,}\n"
-                f"d_model {lm.d_model} · layers {lm.layers} · heads {lm.heads} "
-                f"(kv {lm.kv_groups}) · ctx {lm.context_len}\n"
-                f"batch {lm.batch_size} ({lm.grad_accum} x {micro}) · {lm.optimizer} · "
-                f"adamw lr {lm.lr_peak:g} / muon lr "
-                f"{lm.muon_lr:g} / warmup {lm.warmup_steps:,} · eval every {lm.eval_interval:,}\n"
-                f"resume {'#' + str(resume_count) if start else 'fresh'} · "
-                f"ckpt every {lm.ckpt_every:,} → {cmd.out_dir} · tb → {cmd.log_dir}",
-                title="[bold]STREAM · LM[/bold]",
-                border_style="cyan",
-                expand=False,
-            )
+        log.info(
+            f"STREAM · LM │ device {device} · params {n_params / 1e6:.1f} M · "
+            f"steps {start:,} → {steps:,}"
+        )
+        log.info(
+            f"d_model {lm.d_model} · layers {lm.layers} · heads {lm.heads} "
+            f"(kv {lm.kv_groups}) · ctx {lm.context_len}"
+        )
+        log.info(
+            f"batch {lm.batch_size} ({lm.grad_accum} x {micro}) · adamw lr {lm.lr_peak:g} / "
+            f"muon lr {lm.muon_lr:g} / warmup {lm.warmup_steps:,} · "
+            f"eval every {lm.eval_interval:,}"
+        )
+        log.info(
+            f"resume {'#' + str(resume_count) if start else 'fresh'} · "
+            f"ckpt every {lm.ckpt_every:,} → {cmd.out_dir} · tb → {cmd.log_dir}"
         )
 
         run_start = time.perf_counter()
@@ -150,7 +140,7 @@ class TrainLm_Handler:
                     now = time.perf_counter()
                     its = (step - win_step) / max(now - win_start, 1e-9)
                     avg_loss = (win_loss / max(step - win_step, 1)).item()  # one sync per window
-                    eta = _fmt_hms((steps - step) / its) if its > 0 else "-"
+                    eta = str(timedelta(seconds=int((steps - step) / its))) if its > 0 else "-"
                     pct = 100.0 * step / steps
                     log.info(
                         f"step {step:>7,}/{steps:,} ({pct:4.1f}%) │ "
@@ -185,16 +175,12 @@ class TrainLm_Handler:
 
         self._save(last_ckpt, model, optimizers, step, resume_count, best)
         writer.close()
-        console.print(
-            Panel(
-                f"steps {step:,} · elapsed {_fmt_hms(time.perf_counter() - run_start)} · "
-                f"best val ppl {best if math.isfinite(best) else float('nan'):.3f}\n"
-                f"last → {last_ckpt}\nbest → {best_ckpt}",
-                title="[bold green]STREAM-LM complete[/bold green]",
-                border_style="green",
-                expand=False,
-            )
+        elapsed = timedelta(seconds=int(time.perf_counter() - run_start))
+        log.success(
+            f"STREAM-LM complete │ steps {step:,} · elapsed {elapsed} · "
+            f"best val ppl {best if math.isfinite(best) else float('nan'):.3f}"
         )
+        log.success(f"last → {last_ckpt} · best → {best_ckpt}")
         return best
 
     def _save(
@@ -244,15 +230,6 @@ class TrainLm_Handler:
         # Muon on the block weight matrices, AdamW on the tied embedding/readout and the norms --
         # the same split the acoustic stack uses, which is why partition_params is shared.
         # `head` is named as a readout so the tied table is stepped once, by AdamW.
-        if lm.optimizer == "adamw":
-            return [
-                torch.optim.AdamW(
-                    model.parameters(),
-                    lr=lm.lr_peak,
-                    weight_decay=lm.weight_decay,
-                    betas=(0.9, 0.95),
-                )
-            ]
         muon_p, adamw_p = partition_params(model, head_patterns=("head",))
         return [
             Muon(muon_p, lr=lm.muon_lr, weight_decay=lm.weight_decay),

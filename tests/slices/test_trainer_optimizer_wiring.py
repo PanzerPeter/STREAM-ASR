@@ -30,7 +30,6 @@ def test_shape_schedule_preserves_distinct_muon_and_adamw_peaks():
             self.ctc_head = nn.Linear(8, 4)  # head pattern -> AdamW
 
     cfg = OptimConfig(
-        optimizer="muon+adamw",
         muon_lr=2.0e-2,
         adamw_lr=1.5e-3,
         muon_momentum=0.95,

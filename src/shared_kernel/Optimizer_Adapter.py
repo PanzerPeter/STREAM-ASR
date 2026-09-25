@@ -8,19 +8,10 @@ from src.shared_kernel.Muon_Optimizer import Muon
 
 # Output heads / readouts that must stay on AdamW, matched as substrings of the dotted module name.
 # `pred_head` is the BEST-RQ pretrain head (BestRqModel); `ctc_head`/`interctc` are the main and
-# auxiliary CTC readouts; `joiner.out` is the transducer readout; `simple_am_proj`/`simple_lm_proj`
-# are the pruned objective's linear-joiner readouts, vocab-width like the others. The joiner's
+# auxiliary CTC readouts; `joiner.out` is the transducer readout. The joiner's
 # `enc_proj`/`pred_proj` are hidden 2D projections and are intentionally omitted here so they fall
 # through to Muon.
-_DEFAULT_HEAD_PATTERNS = (
-    "frontend",
-    "ctc_head",
-    "pred_head",
-    "interctc",
-    "joiner.out",
-    "simple_am_proj",
-    "simple_lm_proj",
-)
+_DEFAULT_HEAD_PATTERNS = ("frontend", "ctc_head", "pred_head", "interctc", "joiner.out")
 
 
 def partition_params(
@@ -105,9 +96,6 @@ def build_optimizer(model: nn.Module, cfg: OptimConfig) -> list[torch.optim.Opti
     # Every group `_lr_groups` emits carries its own `weight_decay`, so the optimizer-level value is
     # only the default a group would inherit if one were ever added without it.
     wd = cfg.weight_decay
-    if cfg.optimizer == "adamw":
-        groups = _lr_groups(list(model.parameters()), cfg.adamw_lr, enc_ids, enc_scale, wd)
-        return [torch.optim.AdamW(groups, weight_decay=wd, betas=(0.9, 0.98), fused=fused)]
     muon_p, adamw_p = partition_params(model)
     muon = Muon(
         _lr_groups(muon_p, cfg.muon_lr, enc_ids, enc_scale, wd),

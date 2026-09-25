@@ -75,4 +75,3 @@ def test_decode_config_loads():
 def test_features_config_present():
     cfg = get_config()
     assert cfg.features.cache_dir == "data/features/mel"
-    assert cfg.features.enabled is True

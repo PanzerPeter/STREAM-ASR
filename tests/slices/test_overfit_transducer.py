@@ -13,10 +13,8 @@ def test_transducer_overfits_one_batch():
         [(torch.randn(160, 80), [3, 4, 5, 6, 7]), (torch.randn(120, 80), [8, 9, 10])]
     )
     model = TransducerModel(cmvn_path=None).to(device).train()
-    # Overfit a FIXED batch: masking would move the target each step. cr_ctc has to go too -- its
-    # two-view path SpecAugments unconditionally, so _spec_augment alone does not fix the input.
+    # Overfit a FIXED batch: masking would move the target each step.
     model._spec_augment = False
-    model._cr_ctc = False
     opt = torch.optim.AdamW(model.parameters(), lr=3e-4)
     first = None
     for _ in range(60):

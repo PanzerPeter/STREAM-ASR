@@ -31,14 +31,12 @@ def test_build_optimizer_muon_plus_adamw():
     cfg = get_config().optim
     opts = build_optimizer(net, cfg)
     assert isinstance(opts, list)
-    if cfg.optimizer == "muon+adamw":
-        assert any(isinstance(o, Muon) for o in opts)
-        assert any(isinstance(o, torch.optim.AdamW) for o in opts)
+    assert any(isinstance(o, Muon) for o in opts)
+    assert any(isinstance(o, torch.optim.AdamW) for o in opts)
 
 
 def test_optim_config_loads():
     cfg = get_config().optim
-    assert cfg.optimizer in ("adamw", "muon+adamw")
     assert cfg.adamw_lr > 0
 
 
@@ -76,7 +74,6 @@ def test_encoder_lr_scale_downscales_encoder_groups():
 
     net = _Enc()
     cfg = OptimConfig(
-        optimizer="muon+adamw",
         muon_lr=0.02,
         adamw_lr=0.01,
         muon_momentum=0.95,
@@ -135,24 +132,3 @@ def test_muon_groups_all_still_decay():
     assert isinstance(muon, Muon)
     assert {g["weight_decay"] for g in muon.param_groups} == {cfg.weight_decay}
     assert all(p.ndim == 2 for g in muon.param_groups for p in g["params"])
-
-
-def test_simple_projections_go_to_adamw_not_muon():
-    # They are vocab-width readouts like joiner.out and ctc_head, not hidden matrices. Muon's
-    # spectral normalisation is wrong for a readout.
-    import torch.nn as nn
-    from src.shared_kernel.Optimizer_Adapter import partition_params
-
-    class _M(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.hidden = nn.Linear(8, 8)
-            self.simple_am_proj = nn.Linear(8, 4)
-            self.simple_lm_proj = nn.Linear(8, 4)
-
-    net = _M()
-    muon, adamw = partition_params(net)
-    adamw_ids = {id(p) for p in adamw}
-    assert id(net.simple_am_proj.weight) in adamw_ids
-    assert id(net.simple_lm_proj.weight) in adamw_ids
-    assert id(net.hidden.weight) in {id(p) for p in muon}

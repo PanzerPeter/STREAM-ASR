@@ -3,7 +3,7 @@ transducer:
   # left behind silently becomes the binding one: raising frames 32k -> 45k -> 58k with tokens held
   # at 4000 produced B = 18, 19, 19 and an identical 273 s of audio per step.
   #
-  # MEASURED 2026-08-02 (scripts/profile_transducer_step.py, rnnt_loss: full, expandable_segments):
+  # MEASURED 2026-08-02 (scripts/profile_transducer_step.py, expandable_segments):
   # B=20, 274 s audio/step, 190.6 ms/step = 1438x realtime, peak 7.41 GiB allocated / 7.51 GiB
   # reserved of the ~10.2 GiB this card leaves a training process. The ~2.7 GiB left over is margin
   # for the epoch's densest batch and for whatever else is on the desktop -- do not spend it without
@@ -41,43 +41,12 @@ transducer:
   # a 192 ms step) that is ~6% off epoch wall time, and peak VRAM is unchanged because the
   # worst-batch cap still binds.
   #
-  # Only worth anything under `rnnt_loss: full`, where the lattice is charged at the batch's max U
-  # (the pruned lattice is [B,T,s_range,V] and does not depend on U at all).
-  #
   # Off by default because making every batch homogeneous in transcript length -- i.e. in speaking
   # rate -- is a training-semantics change no run has isolated, and the recipe that shipped 3.43%
   # test-clean did not have it. It is the cheapest untried speed experiment on this stage: 256 buys
   # four fifths of the win at a quarter of the correlation. Turn it on, then compare dev ctc-WER
   # against a matched-STEP baseline before keeping it.
   token_sort_window: 1
-  # RNN-T objective.
-  #
-  # "full" (default) materialises the whole [B,T,U+1,V] lattice. It is the reference implementation
-  # the equivalence tests lock against and the objective every published checkpoint was trained
-  # with. Its lattice is a large size-varying allocation, which fragments the default caching
-  # allocator badly -- 5.25 GiB allocated against 9.71 GiB reserved, which reads as a VRAM ceiling
-  # that is not there. The trainer sets expandable_segments (see TransducerTrainer_Handler), under
-  # which the same batch reserves 7.51 GiB against 7.41 allocated and the ceiling disappears.
-  #
-  # "pruned" evaluates the real joiner only on an s_range-wide band chosen by a linear simple
-  # joiner. It genuinely uses less memory (6.83 GiB at B=24 vs 7.41 at B=20) but is 30 % SLOWER end
-  # to end -- 1103x realtime vs 1438x, measured 2026-08-02 on the same card -- because it trades one
-  # big lattice GEMM for a 4x longer kernel launch stream: 82,937 launches/step at 5.4 us mean
-  # against full's 20,166 at 17.1 us. `rnnt_loss_pruned` scans frames in a Python loop through plain
-  # autograd, so backward retraces it. Keep it for a model whose lattice does not fit even
-  # unfragmented; fix its launch count (a custom Function with an analytic fused backward, as
-  # RnntLoss._scan already has) before choosing it for speed.
-  #
-  # This key is part of the ARCHITECTURE, not just the training loop: "pruned" adds simple_am_proj
-  # and simple_lm_proj, so a checkpoint saved under one value will not load under the other.
-  rnnt_loss: full
-  s_range: 5                     # band width; 5 is the reference recipe's value
-  # Loss weights ramp linearly over this many loader batches: simple 1.0 -> simple_loss_scale,
-  # pruned 0.1 -> 1.0. The joiner and both simple projections start fresh against a BEST-RQ
-  # encoder, so the bounds are meaningless for the first few thousand batches and the pruned term
-  # must not dominate while they are.
-  prune_warmup_steps: 4000
-  simple_loss_scale: 0.5
   # 28,000 x 3 = 84,000 frames per optimizer update, 1.17x v1.0's proven 18,000 x 4 = 72,000.
   # DO NOT move this together with muon_lr/adamw_lr: the one variable this run isolates against v1.0
   # is how much audio the model sees, and changing batch size and LR together makes it unattributable.
@@ -148,23 +117,10 @@ transducer:
   # clip_grad_norm_ is structurally inert for the 135 Muon matrices. The LR is the only lever on
   # this loop that is live mid-run.
   total_steps: 600000
-  # LR shape after warmup: hold the stable level, then a 1-sqrt anneal over the last lr_decay_frac
-  # of the budget. Preferred over `cosine` because cosine's total_steps IS its curve, so bumping it
-  # mid-run re-heats the LR at the resume step, whereas under WSD the same bump only moves the
-  # decay window. Full rationale in TrainAcousticModel/CONTEXT.md.
-  lr_schedule: wsd
-  # Stable-phase level as a fraction of the peak LRs in optim.yaml. 1.0 is the fresh-run recipe;
-  # **set it back to 1.0 for any run started with --fresh**. 0.45 is a splice value: it continues a
-  # run already 96k steps into the old single cosine, whose shape there was 0.47, so the switch to
-  # WSD resumes at the LR that run had reached instead of re-heating a settled encoder.
-  #
-  # MEASURED 2026-07-30: a fresh 175k run left at 0.45 by mistake came out WORSE, not better --
-  # full-dev ctc-WER 0.0633 vs the spliced run's 0.0610, test-clean greedy 4.82 %/6.64 % and beam
-  # 4.57 %/6.31 % (offline/streaming, `_best` checkpoint) against 4.50/6.27 and 4.30/5.95 from the
-  # spliced run's averaged checkpoint. Its dev/transducer_wer probe looked far better (0.0455 vs
-  # 0.0622) -- do not believe that number across runs: the probe is ~1k words and its sampling
-  # changed between the two runs. The encoder wants the full peak early.
-  lr_stable_ratio: 1.0
+  # LR shape after warmup (WSD): hold the peak, then a 1-sqrt anneal over the last lr_decay_frac of
+  # the budget. Bumping total_steps mid-run only moves the decay window; under the cosine schedule
+  # this replaced, total_steps WAS the curve, so the same bump re-heated the LR at the resume step.
+  # Full rationale in TrainAcousticModel/CONTEXT.md.
   lr_decay_frac: 0.25            # last 25% of total_steps = the anneal window
   lr_min_ratio: 0.01             # floor: an LR reaching exactly 0 wastes the last few k steps
   # NB: weight decay is NOT here -- it is `weight_decay` in config/optim.yaml, which is what

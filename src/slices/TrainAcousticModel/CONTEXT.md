@@ -9,10 +9,8 @@ Train the Zipformer encoder plus the single-pass streaming RNN-T head (a `Statel
 - Input: `TransducerTrainCommand`
 - Output: `str` (checkpoint path, `transducer_last.pt`)
 - Model surface: `TransducerModel(features, lengths, chunk_size=0) -> (memory, out_lengths,
-  ctc_logits, interctc_logits, base_lengths)`; `joint_loss(batch, chunk_size, step) -> (total, rnnt,
-  ctc, interctc, cr, simple)`, where `cr` is the CR-CTC consistency KL (0 when `transducer.cr_ctc`
-  is off) and `simple` is the pruned objective's linear-joiner loss (equal to `rnnt` under the
-  `full` objective). `step` drives the prune ramp only.
+  ctc_logits, interctc_logits, base_lengths)`; `joint_loss(batch, chunk_size) -> (total, rnnt, ctc,
+  interctc)`, where `interctc` is the raw mean over the taps.
 
 The trainer resumes from `transducer_last.pt` on restart (via `resume_if_available`) and is
 SIGINT/SIGTERM-safe: `SignalGuard` catches the signal, finishes the in-flight step, and checkpoints
@@ -63,23 +61,14 @@ for the aligned-frame path.
   `reduction="sum"`, then normalises per-token (`/ token_lengths.sum()`). This matches
   `F.ctc_loss`'s per-token `"mean"`, so all three losses share one O(1) scale and the aux weights are
   not silently ~`1/avg_tokens` weaker than nominal, an imbalance that makes InterCTC diverge.
-- `ctc_loss` / `interctc_terms` / `interctc_loss`: standard CTC on the main head (25 Hz) and each
-  InterCTC tap (its own `base_lengths`, ~50 Hz). CTC is rate-agnostic, so mixing rates across heads
-  is fine. `interctc_terms` returns the raw per-tap losses; `interctc_loss` is their weighted sum.
+- `ctc_loss` / `interctc_terms`: standard CTC on the main head (25 Hz) and each InterCTC tap (its
+  own `base_lengths`, ~50 Hz). CTC is rate-agnostic, so mixing rates across heads is fine.
+  `interctc_terms` returns the raw per-tap losses; `joint_loss` weights them.
 - `joint_loss`: applies SpecAugment to the log-mel input when `self.training` and
   `training.transducer.spec_augment`, then `total = rnnt + ctc_aux_weight * ctc +
-  Σ(interctc_weights[k] * interctc_k)`. Returns `(total, rnnt, ctc, ictc_raw, cr, simple)` where
-  `ictc_raw` is the raw mean interctc across taps (a direct read on intermediate-stack
+  Σ(interctc_weights[k] * interctc_k)`. Returns `(total, rnnt, ctc, ictc_raw)` where `ictc_raw` is the raw mean interctc across taps (a direct read on intermediate-stack
   CTC-decodability) rather than the weighted sum. The aux CTC head doubles as a greedy dev-WER probe
   (`CtcGreedyDecoder.py`).
-- `rnnt_loss`: branches on `training.transducer.rnnt_loss`. `full` materialises the whole
-  `[B,T,U+1,V]` joiner lattice; `pruned` (the default) runs `shared_kernel/RnntLossPruned`: a linear
-  simple joiner (`simple_am_proj` + `simple_lm_proj`, no non-linearity, so its lattice is a
-  transient) gives per-frame occupancy, `prune_ranges` turns that into an `s_range`-wide band, and
-  the real joiner is evaluated only on the band via `TransducerJoiner.band`. Both terms are
-  per-token; `_ramp(step)` moves them from `(simple 1.0, pruned 0.1)` to
-  `(simple_loss_scale, 1.0)` over `prune_warmup_steps` loader batches. `pruned` adds two modules the
-  published v1.0 checkpoints do not contain, so set `rnnt_loss: full` to load them.
 - `StatelessPredictor.py`: icefall-style. It embeds the previous non-blank token (blank-prefixed for
   the sequence start), then applies a depthwise causal `Conv1d` over `predictor_context` frames.
   There is no recurrence, so streaming state is just the last `context - 1` token ids
@@ -95,15 +84,6 @@ for the aligned-frame path.
 - Warm-start: `_warm_start_encoder` in `TransducerTrainer_Handler.py` strict-loads `encoder.*` from
   the BEST-RQ checkpoint (`data/checkpoints/bestrq_encoder.pt` by default,
   `training.transducer.warm_start`); predictor/joiner/CTC/InterCTC heads always train from scratch.
-- **CR-CTC** (`transducer.cr_ctc`, default off, because a full run landed 0.0674 dev transducer-WER
-  against the shipped recipe's 0.0553; see `config/transducer.yaml`): when on, train-mode
-  `joint_loss` takes the two-view path (`_joint_loss_cr`), which builds two independently
-  SpecAugment-masked views, a second CTC-only encoder forward on view 2, and a bidirectional-KL
-  consistency term (`_cr_consistency`, weight `cr_weight`) tying the two CTC heads. RNN-T runs on
-  view 1 only, since its `[B,T,U+1,V]` lattice is the memory hog, and the CTC term averages both
-  views. The second encoder forward roughly doubles encoder activation memory, so on 12 GB pair it
-  with `grad_checkpoint: true` or a lower `max_frames_per_batch`. Off restores the proven
-  single-view objective and `cr == 0`.
 
 ### Shapes and execution
 CTC/InterCTC/transducer blank id = `VOCAB_SIZE` (500); logits width = 501, shared across all heads
@@ -124,7 +104,7 @@ wrapping, so `state_dict` keys are unchanged and the checkpoints still load into
 decode/eval path. Activation checkpointing (`_Checkpointed` wrapping each stack, in
 `_train_utils.py`) is optional and off by default, gated by `training.transducer.grad_checkpoint`,
 and composes with compilation. `_train_utils.py` holds the slice-local helpers (`_seed_all`,
-`_fmt_hms`, `_Checkpointed`, `compile_hot_modules`, `GradNormGuard`, `branch_gain_params`,
+`_Checkpointed`, `compile_hot_modules`, `GradNormGuard`, `branch_gain_params`,
 `gains_at_ceiling`, `GainCeilingWatch`, `stack_mix_params`, `trunk_gain_max`,
 `trunk_stable_rank_min`). `GainCeilingWatch` is the branch-gain counterpart of `GradNormGuard`: it
 warns (never aborts) when more `BiasNorm` gains come to rest on `model.biasnorm_log_scale_max` than
@@ -166,13 +146,13 @@ six times. `ZipformerStack.trunk_norm` is a `BiasNorm` on each `Linear` `in_proj
 own, wider window (`model.trunk_norm_log_scale_max`) -- wider because the healthy trunk ledger sits
 just under the BRANCH ceiling. `branch_gain_params` therefore excludes them, and
 `stack_mix/{i}_trunk` now reports the POST-norm residual. Inserting them into an existing
-checkpoint is `scripts/migrate_trunk_norm.py`, not a reload. Reference values and the whole amplitude ledger are in `MODEL_ARCHITECTURE.md`. The pieces the BEST-RQ pretrainer needs as well live in the Shared Kernel:
+checkpoint mid-run is a migration, not a reload; the script that did it for the 600k run was
+retired once that run finished. Reference values and the whole amplitude ledger are in `MODEL_ARCHITECTURE.md`. The pieces the BEST-RQ pretrainer needs as well live in the Shared Kernel:
 `LrSchedule.lr_at` and `GradientClipping` (`guarded_parameters`, `unguarded_parameters`,
 `clip_grads_per_tensor`, `grad_norm_of`).
 
 ### Configuration
 Training-loop hyperparameters live under `training.transducer` in `config/training.yaml`:
-`rnnt_loss full` (`pruned` is implemented and tested but 30 % slower here; see COMMANDS.md Step 4),
 `max_frames_per_batch 28000`, `max_tokens_per_batch 4400` (transcript-length budget on the same
 lattice), `max_lattice_per_batch 1.1e7` (a *worst-batch* cap in `B × max(frames) × max(chars)`, since
 the other two are sums and bound only the average, so it is what keeps peak VRAM off the epoch's
@@ -233,8 +213,7 @@ Then `grad_accum 3` (84,000 frames per update, 1.17× v1.0's proven 72,000), `wa
 (= `2500 × grad_accum`, holding 2,500 optimizer updates: the transient it protects against is
 measured in updates, so it does not scale with run length), `total_steps 525000`,
 `chunk_sizes [0, 16, 32]`, `warm_start`, `spec_augment`, `dev_wer_utts 200` (greedy-transducer WER
-probe size), `keep_last_n 5`, plus the LR shape (`lr_schedule wsd` / `lr_stable_ratio 1.0` /
-`lr_decay_frac 0.25` / `lr_min_ratio 0.01`).
+probe size), `keep_last_n 5`, plus the WSD LR shape (`lr_decay_frac 0.25` / `lr_min_ratio 0.01`).
 
 `total_steps` counts **loader batches**, not optimizer updates: `step += 1` sits inside
 `for batch in train_loader`, outside the `grad_accum` window. 600,000 × 28,000 frames = 46,667 h =
@@ -252,22 +231,16 @@ multi-tensor kernels engage. Checkpoints written before that merge cannot be res
 are unaffected, and only the moments are non-portable.
 
 ### LR schedule (`shared_kernel.LrSchedule.lr_at`)
-Linear warmup, then `lr_schedule` selects the shape. `wsd` (default) holds `lr_stable_ratio * peak`
-until the last `lr_decay_frac` of `total_steps`, then anneals with a 1-sqrt profile to
-`lr_min_ratio * peak`; `cosine` anneals from the end of warmup to the same floor. Both land exactly
-at `total_steps`, and `lr_min_ratio > 0` stops the tail steps from running at an LR that no longer
-trains.
+Linear warmup, then WSD: hold the peak until the last `lr_decay_frac` of `total_steps`, then anneal
+with a 1-sqrt profile to `lr_min_ratio * peak`, landing exactly at `total_steps`. `lr_min_ratio > 0`
+stops the tail steps from running at an LR that no longer trains.
 
-Under cosine, `total_steps` *is* the curve, not just the budget: raising it mid-run re-heats the LR
-at the resume step. The 3.55 %-WER checkpoint that preceded the current one came out of exactly
-that. Cosine annealed to 0 at 120k, `total_steps` was bumped to 175k, and the run resumed at 25 % of
-peak and annealed a second time, giving an unintended two-cycle schedule. That is why a single 175k
-cosine sits ~2 WER points behind it at a *matched* step (at 92k: 50 % of peak vs that run's 15 %).
-WSD makes the same bump move only the decay window, and a fresh 175k WSD run at
-`lr_stable_ratio: 1.0` landed within ~1 σ of the accidental two-cycle result (test-clean beam
-4.38 %/5.84 % vs 4.30 %/5.95 %, offline/streaming), so the two-cycle schedule was luck rather than a
-recipe worth reproducing.
-
-When switching an in-flight cosine run over to WSD, set `lr_stable_ratio` to the cosine shape value
-at the resume step (`0.5 * (1 + cos(pi * (step - warmup) / (total - warmup)))`) so the restart
-continues at the LR that run had already reached instead of re-heating the encoder.
+WSD replaced a cosine schedule, under which `total_steps` *is* the curve, not just the budget:
+raising it mid-run re-heats the LR at the resume step. The 3.55 %-WER checkpoint that preceded v1.0
+came out of exactly that. Cosine annealed to 0 at 120k, `total_steps` was bumped to 175k, and the
+run resumed at 25 % of peak and annealed a second time, giving an unintended two-cycle schedule.
+Under WSD the same bump moves only the decay window, and a fresh 175k WSD run landed within ~1 σ of
+the accidental two-cycle result (test-clean beam 4.38 %/5.84 % vs 4.30 %/5.95 %,
+offline/streaming), so the two-cycle schedule was luck rather than a recipe worth reproducing.
+Holding the stable phase BELOW peak measured worse: a fresh 175k run at 0.45 of peak decoded
+test-clean beam 4.57 %/6.31 % against 4.30 %/5.95 %. The encoder wants the full peak early.

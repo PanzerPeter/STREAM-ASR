@@ -131,67 +131,22 @@ python -m src.slices.PretrainEncoder.pretrain_bestrq --fresh --total-steps 24000
 
 Single joint stage: the 53.8 M-param Zipformer encoder, a `StatelessPredictor` and an additive
 `TransducerJoiner`, trained together under
-`rnnt_loss + ctc_aux_weight * ctc_loss + interctc_loss` (55.3 M params total). The aux CTC and
+`rnnt_loss + ctc_aux_weight * ctc_loss + Σ interctc_weights[k] * interctc_k` (55.3 M params total). The aux CTC and
 InterCTC taps are regularizers and health probes rather than separate stages.
 
-#### The RNN-T objective: `full` (default) vs `pruned`
-
-`training.transducer.rnnt_loss` selects between two implementations of the same loss.
-
-* `full` (default) materialises the whole `[B,T,U+1,V]` joiner lattice. It is the reference the
-  equivalence tests lock against, and it is what every published checkpoint was trained with.
-* `pruned` evaluates the real joiner on an `s_range`-wide band of the alignment grid. A *linear*
-  simple joiner (`simple_am_proj` + `simple_lm_proj`, no non-linearity, so its lattice is a
-  transient inside the loss and never a stored activation) gives per-frame occupancy;
-  `prune_ranges` turns that into band starts; the real joiner runs only on the band.
-
-The two are locked together by test: at full band width the pruned recursion reproduces `rnnt_loss`
-bit-for-bit in fp64, forward *and* gradient. On a real batch the pruned cost is a tight upper bound
-on the full one (57.157 vs 57.076, +0.14 % at `s_range: 5`), and it can only ever be higher, because
-pruning drops alignments.
-
-**`pruned` is off because it measured 30 % slower, not because it failed.** Head to head on the same
-card and the same allocator, 2026-08-02:
-
-| objective | B | audio/step | ms/step | ×realtime | allocated | reserved | launches/step | mean kernel |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `full` @ 28k frames | 20 | 274 s | 190.6 | **1438** | 7.41 GiB | 7.51 GiB | 20,166 | 17.1 µs |
-| `pruned` @ 38k frames | 24 | 369 s | 334.9 | 1103 | 6.83 GiB | 6.96 GiB | 82,937 | 5.4 µs |
-
-Pruning does save memory. It was adopted to lift a VRAM ceiling that turned out to be an artifact:
-the full lattice is a large size-varying allocation, so under the *default* caching allocator it
-reserves 9.71 GiB while allocating 5.25, and the trainer sets `expandable_segments:True`, under
-which that gap is 0.10 GiB. With the ceiling gone, what remains is the launch count:
-`rnnt_loss_pruned` scans frames in a Python loop through plain autograd, so backward retraces it,
-and the step becomes launch-bound (5.4 µs mean kernel) where `full` is not (17.1 µs). Reach for
-`pruned` when a lattice genuinely does not fit *unfragmented*. Before choosing it for speed,
-give its scan a custom `autograd.Function` with an analytic fused backward, the same treatment
-`RnntLoss._scan` already has (27.3 → 13.1 ms, bit-identical).
-
-Under `pruned`, `prune_warmup_steps` (4000 batches) ramps the two terms from `(simple 1.0,
-pruned 0.1)` to `(simple_loss_scale, 1.0)`: the bounds come from a freshly-initialised simple joiner,
-so they are noise until it means something. Watch `train/rnnt_simple` in TensorBoard next to
-`train/rnnt`: the simple loss is what picks the band, so it diverging corrupts the objective while
-the pruned term still reads finite.
-
-> **`pruned` adds two modules that `full` checkpoints do not contain.** Switching to it makes
-> `transducer_avg.pt` and friends fail to load with `Missing key(s) in state_dict:
-> simple_am_proj.weight, …`, which breaks Steps 5, 7, 8 and 9. The key is part of the architecture,
-> not just the training loop.
+The RNN-T term materialises the whole `[B,T,U+1,V]` joiner lattice and runs this repo's own
+forward-backward (`shared_kernel/RnntLoss`). A pruned objective (icefall's two-stage, band-only
+joiner) was implemented, locked to it by test, and removed: head to head on 2026-08-02 it saved
+memory (6.83 vs 7.41 GiB) but ran **30 % slower** (1103× vs 1438× realtime), because its Python
+frame scan made the step launch-bound (82,937 launches/step at 5.4 µs vs 20,166 at 17.1 µs). The
+VRAM ceiling it was built to lift was allocator fragmentation, which `expandable_segments:True`
+removes. It lives in git history (`RnntLossPruned.py`) if a lattice ever genuinely does not fit.
 
 ```bash
 python -m src.slices.TrainAcousticModel.train_transducer
 #   re-running over a checkpoint from a different recipe? add --fresh to start from step 0
-#   resuming a checkpoint written BEFORE model.trunk_norm? migrate it first -- it is missing the
-#   10 trunk-normaliser parameters, and a plain resume fails on load_state_dict. Initialises each
-#   log_scale from the measured per-stack trunk RMS and remaps AdamW's state by name:
-PYTHONPATH=. python scripts/migrate_trunk_norm.py \
-  --src data/checkpoints/transducer_step81000.pt --out data/checkpoints/transducer_last.pt
 #   step too slow? where the time goes, per stage + per kernel (needs a free GPU, ~2 min):
 PYTHONPATH=. python scripts/profile_transducer_step.py
-#   compare the two RNN-T objectives on the same batches (overrides the config for the run):
-PYTHONPATH=. python scripts/profile_transducer_step.py --rnnt-loss full   --steps 20
-PYTHONPATH=. python scripts/profile_transducer_step.py --rnnt-loss pruned --steps 20
 #   sweep the batch budget against peak VRAM without editing config between runs. Raise all THREE
 #   budgets together or the one you left alone silently pins B (measured: with tokens held at 4000,
 #   frames 32k/45k/58k all produced B=19 and identical 273 s audio/step):
@@ -216,8 +171,7 @@ PYTHONPATH=. python scripts/measure_lattice_waste.py
   `U` padding from 22.9 % of lattice cells to 5.6 %/2.0 % and epoch lattice work by ~18/21 %, worth
   roughly 6 % of wall time at the profiled split. It also raises the batch count ~2.6 %, so compare
   runs at matched **steps**, and it changes what a batch looks like (homogeneous speaking rate), so
-  check dev ctc-WER before keeping it. Inert under `rnnt_loss: pruned`, and inert at any window near
-  the batch size (~22).
+  check dev ctc-WER before keeping it. Inert at any window near the batch size (~22).
 * Budget derivation, both computed and the minimum taken: `audio_budget_steps = 144000 × 3600 / 274`
   = 1,891,971 (reference parity, 50 epochs × 2880 h); `wall_budget_steps = 50 × 3600 / 0.1906` =
   944,386 (50 h at the measured ms/step). Wall binds; rounded down to 900,000 to leave room for the
@@ -225,7 +179,7 @@ PYTHONPATH=. python scripts/measure_lattice_waste.py
   stable phase had gone flat to within noise (dev ctc-WER −0.0005 over 80k steps, per-eval σ ≈
   .0011), so the remaining 310k stable steps bought an unmeasurable amount while the anneal, worth
   −15 to −30 % relative, was still 25 h of compute away. Lowering `total_steps` under WSD only
-  moves the decay window (675k → 450k); it does not re-heat the LR the way `cosine` would. Expect
+  moves the decay window (675k → 450k); it does not re-heat the LR the way the old cosine schedule did. Expect
   ~32 h of steps total (the run measured ~27 h at 0.163 s/step). **Before the anneal starts, copy
   `transducer_step448200.pt` out of the rotation**: `keep_last_n 5 × ckpt_every 5400` spans 27k
   steps, so a 150k-step anneal deletes the only pre-anneal resume point and with it the option to go
@@ -385,20 +339,12 @@ slower, bounds VRAM).
 > reserves 7.51 GiB against 7.41 allocated. `scripts/profile_transducer_step.py` sets it too, but
 > anything else that measures VRAM must, or it is profiling a different allocator than the run.
 
-One experiment is off by default, for these reasons:
-
-* `cr_ctc` (`config/transducer.yaml`, default `false`) consistency-regularises the CTC head over two
-  SpecAugment views (bidirectional KL, `cr_weight`) with RNN-T on view 1 only, and adds a second
-  encoder forward. **It lost.** A 163.8k-step run of `cr_ctc: true` plus `--train-manifest
-  data/manifests/train_sp.jsonl` (the *old* 3-way manifest, which the build script no longer emits)
-  reached best dev transducer-WER 0.0674 against the shipped recipe's
-  0.0553 (≈ +2 % test WER), with InterCTC and grad-norm climbing through the tail. That is
-  over-regularisation on top of an aux stack already carrying `ctc_aux_weight` 0.2 and two InterCTC
-  taps at 0.15. The run also moved the objective and the data recipe together, so **neither is
-  isolated and the negative result is unattributed**. `_joint_loss_cr` also never applied the
-  paper's 2.5× time-mask. Re-enabling means retuning `cr_weight`/`ctc_aux_weight`, pairing it with
-  `grad_checkpoint: true` or a lower `max_frames_per_batch`, and changing one thing at a time.
-  The `train/cr_ctc` TensorBoard scalar reads 0 while it is off.
+CR-CTC (a two-view consistency KL on the CTC head) was tried and removed. A 163.8k-step run of it
+plus the old 3-way speed-perturb manifest reached best dev transducer-WER 0.0674 against the shipped
+recipe's 0.0553 (≈ +2 % test WER), with InterCTC and grad-norm climbing through the tail:
+over-regularisation on top of an aux stack already carrying `ctc_aux_weight` 0.2 and two InterCTC
+taps at 0.15. The run moved the objective and the data recipe together, so **the negative result is
+unattributed**; the implementation is in git history if it is ever retried one change at a time.
 
 #### Resuming and interrupting training
 
@@ -615,13 +561,13 @@ the YAML is authoritative.
 | --- | --- |
 | `config/audio.yaml` | sample rate, n_mels, FFT/window/hop, CMVN epsilon |
 | `config/augment.yaml` | SpecAugment masks (GPU batch op applied in `TransducerModel.joint_loss`) |
-| `config/features.yaml` | log-mel cache directory and enable flag |
+| `config/features.yaml` | log-mel cache directory |
 | `config/model.yaml` | encoder dims/layers/heads, conv kernel, dropout, RoPE base, `encoder_value_residual_lambda`, vocab size, and the amplitude bounds: `biasnorm_log_scale_min`/`_max`, `biasnorm_max_amplification`, `stack_bypass_min`, `stack_in_proj_max_sigma`, `trunk_norm`, `trunk_norm_log_scale_max` |
-| `config/training.yaml` | `transducer`: objective (`rnnt_loss` = `pruned`\|`full`, `s_range`, `prune_warmup_steps`, `simple_loss_scale`), batch budgets (`max_frames_per_batch`, `max_tokens_per_batch`, `max_lattice_per_batch`), `grad_accum`, LR shape (`warmup_steps`, `total_steps`, `lr_schedule`, `lr_stable_ratio`, `lr_decay_frac`, `lr_min_ratio`), `chunk_sizes`, `warm_start`, `grad_checkpoint`, `compile_modules`, `token_sort_window`, `spec_augment`, `dev_wer_utts`, `keep_last_n` |
-| `config/transducer.yaml` | `predictor_dim`, `predictor_context`, `joiner_dim`, `ctc_aux_weight`, `interctc_layers`/`interctc_weights`, `cr_ctc`/`cr_weight` |
-| `config/optim.yaml` | `optimizer` (`adamw`\|`muon+adamw`), `muon_lr`/`adamw_lr`, `muon_momentum`, `ns_steps`, `weight_decay`, `encoder_lr_scale` |
-| `config/pretrain.yaml` | BEST-RQ: `lr_scale`, `codebook_size`/`codebook_dim`/`num_codebooks`, `mask_prob`/`mask_span`/`noise_std`, `stack_frames`, `chunk_sizes`, LR shape (`warmup_steps`, `total_steps`, `lr_schedule`, `lr_decay_frac`, `lr_min_ratio`), `grad_clip`/`log_every`/`save_every`, `dev_every`/`dev_batches`, `max_frames_per_batch`, `seed` |
-| `config/lm.yaml` | STREAM-LM: `d_model`/`layers`/`heads`/`kv_groups`, `context_len`, `optimizer`/`muon_lr`/`lr_peak`/`z_loss`, schedule, `subset_words` |
+| `config/training.yaml` | `transducer`: batch budgets (`max_frames_per_batch`, `max_tokens_per_batch`, `max_lattice_per_batch`), `grad_accum`, WSD LR shape (`warmup_steps`, `total_steps`, `lr_decay_frac`, `lr_min_ratio`), `chunk_sizes`, `warm_start`, `grad_checkpoint`, `compile_modules`, `token_sort_window`, `spec_augment`, `dev_wer_utts`, `keep_last_n` |
+| `config/transducer.yaml` | `predictor_dim`, `predictor_context`, `joiner_dim`, `ctc_aux_weight`, `interctc_layers`/`interctc_weights` |
+| `config/optim.yaml` | `muon_lr`/`adamw_lr`, `muon_momentum`, `ns_steps`, `weight_decay`, `encoder_lr_scale` |
+| `config/pretrain.yaml` | BEST-RQ: `lr_scale`, `codebook_size`/`codebook_dim`/`num_codebooks`, `mask_prob`/`mask_span`/`noise_std`, `stack_frames`, `chunk_sizes`, WSD LR shape (`warmup_steps`, `total_steps`, `lr_decay_frac`, `lr_min_ratio`), `grad_clip`/`log_every`/`save_every`, `dev_every`/`dev_batches`, `max_frames_per_batch`, `seed` |
+| `config/lm.yaml` | STREAM-LM: `d_model`/`layers`/`heads`/`kv_groups`, `context_len`, `muon_lr`/`lr_peak`/`z_loss`, schedule, `subset_words` |
 | `config/decode.yaml` | `chunk_size`, `beam_size`, `max_symbols`, `lm_weight` (α), `ilm_weight` (β), `lm_checkpoint`, `length_bonus` |
 | `config/eval.yaml` | `ablation_stages` (`greedy_transducer`/`beam`/`beam_lm`), `report_path` (`{split}` placeholder), `workers`, `rtf_probe_utts` |
 

@@ -18,3 +18,9 @@ def test_greedy_collapses_repeats_and_drops_blank():
         logits[0, t, idx] = 10.0
     out = ctc_greedy_decode(logits.argmax(dim=-1), torch.tensor([len(path)]), _FakeTok())
     assert out == ["5 7"]
+
+
+def test_greedy_keeps_a_repeat_separated_by_blank():
+    blank = get_config().model.blank_id
+    best = torch.tensor([[5, blank, 5, 5, blank]])
+    assert ctc_greedy_decode(best, torch.tensor([5]), _FakeTok()) == ["5 5"]

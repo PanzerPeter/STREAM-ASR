@@ -17,8 +17,7 @@ context_len: 256
 value_residual_lambda: 1.0   # inject layer-0 values into deeper layers; 0.0 = vanilla
 
 # training
-optimizer: muon+adamw        # adamw | muon+adamw (2D hidden weights -> Muon, rest -> AdamW)
-muon_lr: 2.0e-2              # Muon peak LR for the block weight matrices
+muon_lr: 2.0e-2              # Muon peak LR for the 2D block weight matrices (rest -> AdamW)
 lr_peak: 1.0e-3              # AdamW peak LR (embeddings/norms), also the schedule's reference
 # Softmax z-loss (Chowdhery et al.): penalises log^2(Z) to hold the partition function near 1. Free
 # at 502 classes, and it keeps the logits from drifting through the long cosine tail.

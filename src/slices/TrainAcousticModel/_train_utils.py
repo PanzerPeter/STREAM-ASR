@@ -387,13 +387,6 @@ def _seed_all(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def _fmt_hms(seconds: float) -> str:
-    seconds = max(0, int(seconds))
-    h, rem = divmod(seconds, 3600)
-    m, s = divmod(rem, 60)
-    return f"{h:d}:{m:02d}:{s:02d}"
-
-
 class _Checkpointed(torch.nn.Module):
     """Wraps a stack so its forward runs under activation checkpointing."""
 

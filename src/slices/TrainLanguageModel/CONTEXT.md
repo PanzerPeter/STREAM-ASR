@@ -32,8 +32,7 @@ embeddings, and value-residual (layer-0 attention values injected into every dee
 ## Training loop
 `TrainLm_Handler.run`: Muon on the block weight matrices plus AdamW (`betas=(0.9, 0.95)`,
 `weight_decay`) on the tied embedding/readout and the norms. That is the same split the acoustic
-stack uses, via the shared `Optimizer_Adapter.partition_params` (`lm.optimizer: adamw` falls back to
-a single AdamW over everything). Linear warmup -> cosine decay applied as a shape multiplier on each
+stack uses, via the shared `Optimizer_Adapter.partition_params`. Linear warmup -> cosine decay applied as a shape multiplier on each
 group's own peak LR, bf16 autocast on CUDA (fp32 on CPU), gradient clipping, and an optional
 `lm.z_loss` term squaring the softmax log-normaliser to keep the logits from drifting. Evaluates
 val perplexity (bounded to `_VAL_WINDOWS = 1280` windows, so the bound is independent of
