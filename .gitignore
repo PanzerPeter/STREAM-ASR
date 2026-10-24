@@ -4,8 +4,9 @@ __pycache__/
 .pytest_cache/
 data/
 runs/
-release/
+release/**/*.safetensors
 *.model
+!release/**/*.model
 *.vocab
 docs/
 CLAUDE.md

@@ -49,6 +49,9 @@ python -m src.slices.Evaluate.evaluate --other
 
 # Step 9: local web demo at http://127.0.0.1:8000
 python -m src.slices.Demo.serve_demo --lm-weight 0.7 --ilm-weight 0.4
+
+# Step 10: export the release weights (pickle-free .safetensors, see §2 Step 10)
+PYTHONPATH=. python scripts/export_safetensors.py --src data/checkpoints/transducer_avg.pt --dst release/stream-asr-v1.5/model.safetensors
 ```
 
 ---
@@ -526,12 +529,31 @@ level while the microphone is open, and a flat meter is what separates a dead mi
 decode that heard nothing. The microphone needs a secure origin, so reach the demo at `127.0.0.1` or
 `localhost`, not at a LAN address.
 
+### Step 10: release export
+
+```bash
+V=release/stream-asr-v1.5
+PYTHONPATH=. python scripts/export_safetensors.py --src data/checkpoints/transducer_avg.pt --dst $V/model.safetensors
+PYTHONPATH=. python scripts/export_safetensors.py --src data/checkpoints/lm_best.pt --dst $V/lm.safetensors
+cp data/tokenizer/bpe500.model $V/
+(cd $V && sha256sum model.safetensors lm.safetensors bpe500.model > SHA256SUMS)
+```
+
+A trainer checkpoint carries optimizer and RNG state, so it is twice the size of the weights and
+needs `weights_only=False` to load. The export writes the bare `model` state_dict and records the
+source checkpoint's sha256 and the git commit in the file header. Export from a clean tree: a dirty
+one is recorded as `<commit>-dirty`. The `.safetensors` files are gitignored and ship as GitHub
+release assets; the model card, tokenizer and `SHA256SUMS` are tracked. Every loader
+(`--checkpoint`, `decode.lm_checkpoint`) accepts a `.safetensors` path directly. v1.5 reuses the v1.0
+LM file unchanged (same `source_sha256`), so copy it rather than re-exporting, or the header's commit
+changes and with it the checksum.
+
 ---
 
 ## 3. Tests
 
 ```bash
-# Fast suite: 317 passed, 2 deselected
+# Fast suite: 300 passed, 2 deselected
 PYTHONPATH=. python -m pytest -q
 
 # Slow GPU gates, individually

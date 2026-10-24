@@ -7,6 +7,7 @@ import random
 from typing import Any
 
 import torch
+from safetensors.torch import load_file
 
 
 def _as_list(optimizers):
@@ -49,6 +50,13 @@ def save_checkpoint(
 
 
 def load_checkpoint(path: str, model, optimizers=None, map_location="cpu") -> dict:
+    # A .safetensors file is a published release (scripts/export_safetensors.py): bare weights with
+    # no optimizer, step or RNG state, so there is nothing to resume from it.
+    if path.endswith(".safetensors"):
+        if optimizers is not None:
+            raise ValueError(f"{path} holds weights only and cannot restore optimizer state")
+        model.load_state_dict(load_file(path, device=str(map_location)))
+        return {"step": 0, "best_wer": math.inf, "resume_count": 0, "extra": {}}
     # weights_only=False: the payload carries python/torch RNG state (arbitrary pickled objects),
     # which the torch 2.11 weights_only default would reject.
     ckpt = torch.load(path, map_location=map_location, weights_only=False)

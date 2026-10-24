@@ -94,3 +94,28 @@ def test_atomic_no_partial_on_replace(tmp_path):
     save_checkpoint(path, model, opt, step=2)
     assert not os.path.exists(path + ".tmp")  # tmp cleaned by os.replace
     assert load_checkpoint(path, model, opt)["step"] == 2
+
+
+def test_exported_safetensors_loads_back(tmp_path):
+    # A release file goes trainer .pt -> export_safetensors -> load_checkpoint. The tied pair
+    # exercises export's alias clone: the file must still load strict into a freshly tied model.
+    import pytest
+
+    from scripts.export_safetensors import export
+
+    def tied():
+        m = torch.nn.Sequential(torch.nn.Embedding(5, 4), torch.nn.Linear(4, 5, bias=False))
+        m[1].weight = m[0].weight
+        return m
+
+    src_model = tied()
+    src, dst = str(tmp_path / "ck.pt"), str(tmp_path / "model.safetensors")
+    save_checkpoint(src, src_model, None, step=7)
+    export(src, dst)
+
+    target = tied()
+    assert load_checkpoint(dst, target)["step"] == 0
+    assert torch.equal(target[0].weight, src_model[0].weight)
+    assert target[1].weight is target[0].weight
+    with pytest.raises(ValueError):
+        load_checkpoint(dst, target, torch.optim.SGD(target.parameters(), lr=0.1))

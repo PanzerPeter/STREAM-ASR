@@ -209,15 +209,27 @@ uv venv .venv --python 3.12
 uv pip install -r requirements.txt
 .venv/bin/python scripts/verify_env.py   # expect: OK: ... cap=(12, 0)
 
-PYTHONPATH=. .venv/bin/python -m pytest -q   # 317 passed, 2 deselected (slow GPU gates)
+PYTHONPATH=. .venv/bin/python -m pytest -q   # 300 passed, 2 deselected (slow GPU gates)
 ```
 
-Then decode a file with a trained checkpoint:
+Then decode a file with the released v1.5 weights. The tokenizer and checksums are in
+[`release/stream-asr-v1.5/`](release/stream-asr-v1.5/), and the two weight files are attached to the
+[v1.5 release](https://github.com/PanzerPeter/STREAM-ASR/releases/tag/v1.5):
 
 ```bash
-PYTHONPATH=. .venv/bin/python -m src.slices.Decode.streaming_decode AUDIO.flac --offline
-PYTHONPATH=. .venv/bin/python -m src.slices.Decode.streaming_decode AUDIO.flac   # streaming
+V=release/stream-asr-v1.5
+gh release download v1.5 -R PanzerPeter/STREAM-ASR -D $V -p '*.safetensors'
+(cd $V && sha256sum -c SHA256SUMS)
+
+.venv/bin/python -m src.slices.Decode.streaming_decode AUDIO.flac --offline \
+    --checkpoint $V/model.safetensors --tokenizer $V/bpe500.model
+.venv/bin/python -m src.slices.Decode.streaming_decode AUDIO.flac \
+    --checkpoint $V/model.safetensors --tokenizer $V/bpe500.model   # streaming
 ```
+
+To rescore with STREAM-LM, point `lm_checkpoint` in `config/decode.yaml` at `$V/lm.safetensors`.
+The [model card](release/stream-asr-v1.5/README.md) lists the files and their provenance. Without
+flags, every entry point loads the locally trained `data/checkpoints/transducer_avg.pt`.
 
 Every flag, tuning knob and failure mode is documented in [COMMANDS.md](COMMANDS.md), and every
 operator, shape and amplitude bound in [MODEL_ARCHITECTURE.md](MODEL_ARCHITECTURE.md). The stages
@@ -412,6 +424,7 @@ scripts/              # env check, 960 h data build, LM corpus download, ckpt av
                       #   safetensors export, step profiler, lattice-waste measurement
 tests/                # shape / round-trip / equivalence / count sanity tests
 data/                 # LibriSpeech splits, manifests, tokenizer, cmvn, checkpoints (gitignored)
+release/              # per-version model card, tokenizer, SHA256SUMS (weights ship as release assets)
 ```
 
 <details>
@@ -427,7 +440,7 @@ data/                 # LibriSpeech splits, manifests, tokenizer, cmvn, checkpoi
 | `Tokenizer_Adapter.py` | SentencePiece BPE-500 wrapper |
 | `RnntLoss.py` | RNN-T forward-backward (own kernel, replaces torchaudio's) |
 | `BiasNorm.py`, `SwiGluFfn.py`, `RoPE_Transform.py` | blocks shared by encoder and LM |
-| `Checkpoint_Adapter.py` | atomic stateful save/load + `resume_if_available` |
+| `Checkpoint_Adapter.py` | atomic stateful save/load + `resume_if_available`; loads release `.safetensors` |
 | `SignalGuard.py` | cooperative SIGINT/SIGTERM stop for training loops |
 | `Muon_Optimizer.py`, `Optimizer_Adapter.py` | Muon + AdamW optimizer stack |
 | `LrSchedule.py`, `GradientClipping.py` | warmup + WSD shape, and the matrices/scalars split clip, shared by both acoustic trainers |

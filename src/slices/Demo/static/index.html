@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>STREAM ASR — local demo</title>
+<title>STREAM ASR: local demo</title>
 <style>
   :root {
     --bg: #0f1117; --card: #191c24; --edge: #2a2f3a; --edge-hi: #3b4250;
@@ -112,7 +112,7 @@
 </head>
 <body>
   <header>
-    <h1><span>STREAM</span> ASR — local demo</h1>
+    <h1><span>STREAM</span> ASR: local demo</h1>
     <p class="sub">Zipformer encoder + streaming RNN-T, LM-rescored · runs entirely on your machine</p>
     <div id="cfg" class="cfg"></div>
   </header>
@@ -160,7 +160,7 @@
 <script>
 const $ = (id) => document.getElementById(id);
 // Transcript text is injected into innerHTML to grey out the running partial, so it goes through
-// the DOM's own escaper first — an apostrophe or ampersand in a hypothesis must render, not parse.
+// the DOM's own escaper first: an apostrophe or ampersand in a hypothesis must render, not parse.
 const esc = (s) => { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; };
 const fmtDur = (s) => `${Math.floor(s / 60)}:${(s % 60).toFixed(1).padStart(4, "0")}`;
 
@@ -179,7 +179,7 @@ const fmtDur = (s) => `${Math.floor(s / 60)}:${(s % 60).toFixed(1).padStart(4, "
       chip("beam", c.beam_size) +
       (c.lm
         ? chip("LM", `α ${c.lm.alpha} · β ${c.lm.beta}`, "on")
-        : chip("LM", "off — acoustic only", "off")) +
+        : chip("LM", "off (acoustic only)", "off")) +
       chip("chunk", `${c.chunk_ms} ms`);
   } catch { /* the strip is diagnostic; the demo still works without it */ }
 })();
@@ -277,7 +277,7 @@ function micFail(msg) { micOut.className = "out error"; micOut.textContent = msg
 micBtn.onclick = async () => {
   // getUserMedia lives on navigator.mediaDevices, which the browser only injects in a *secure
   // context*: HTTPS, or plain HTTP on localhost / 127.0.0.1 / [::1]. On a LAN IP, the machine
-  // hostname, or 0.0.0.0 it is undefined (not a permission denial) — so guide the user instead
+  // hostname, or 0.0.0.0 it is undefined (not a permission denial), so guide the user instead
   // of throwing "reading 'getUserMedia' of undefined".
   const md = navigator.mediaDevices;
   if (!md || !md.getUserMedia) {
@@ -298,7 +298,7 @@ micBtn.onclick = async () => {
   micMeta.textContent = "";       // clear the previous utterance's RTF before this one starts
   if (ctx.sampleRate !== 16000) {
     micMeta.className = "meta warn";
-    micMeta.textContent = `⚠ browser gave ${ctx.sampleRate} Hz, not 16000 — transcription may be off`;
+    micMeta.textContent = `⚠ browser gave ${ctx.sampleRate} Hz, not 16000, transcription may be off`;
   }
 
   const wsScheme = location.protocol === "https:" ? "wss" : "ws";  // match page scheme (HTTPS→wss)
