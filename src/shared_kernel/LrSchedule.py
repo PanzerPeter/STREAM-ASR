@@ -19,8 +19,8 @@ def lr_at(
     `min_ratio > 0` keeps the tail steps doing work and keeps the rolling snapshots that
     `scripts/average_checkpoints.py` means over meaningfully different from one another. Raising
     `total` mid-run only moves the decay window. Under the cosine schedule this replaced, `total`
-    was the curve, so bumping it re-heated the LR at the resume step -- which is how the
-    120k -> 175k bump that produced the v1.0 checkpoint accidentally became a two-cycle schedule.
+    was the curve, so bumping it re-heated the LR at the resume step and silently turned one run
+    into a two-cycle schedule.
     """
     if step < warmup:
         return peak * step / max(1, warmup)

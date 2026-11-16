@@ -4,7 +4,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.shared_kernel.RoPE_Transform import apply_rotary, rotary_tables
+from src.shared_kernel.Config_Adapter import get_config
+from src.shared_kernel.RoPE_Transform import apply_rotary, rope_inv_freq, rotary_tables
 
 
 def _rms_norm(x: torch.Tensor) -> torch.Tensor:
@@ -14,6 +15,8 @@ def _rms_norm(x: torch.Tensor) -> torch.Tensor:
 
 
 class CausalGqaAttention(nn.Module):
+    inv_freq: torch.Tensor
+
     def __init__(self, d_model: int, heads: int, kv_groups: int, dropout: float) -> None:
         super().__init__()
         if d_model % heads != 0:
@@ -29,13 +32,15 @@ class CausalGqaAttention(nn.Module):
         self.kv_proj = nn.Linear(d_model, 2 * kv_groups * self.head_dim, bias=False)
         self.out = nn.Linear(d_model, d_model, bias=False)
         self.lam = 0.0  # set by StreamLmModel per layer (0 on layer 0, config value deeper)
+        inv_freq = rope_inv_freq(self.head_dim, get_config().model.rope_base)
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def _project(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         b, t, _ = x.shape
         q = self.q_proj(x).view(b, t, self.heads, self.head_dim).transpose(1, 2)
         kv = self.kv_proj(x).view(b, t, 2, self.kv_groups, self.head_dim)
         k, v = kv[:, :, 0].transpose(1, 2), kv[:, :, 1].transpose(1, 2)
-        cos, sin = rotary_tables(t, self.head_dim, x.device, x.dtype, 0)
+        cos, sin = rotary_tables(torch.arange(t, device=x.device), self.inv_freq, x.dtype)
         q, k = _rms_norm(q), _rms_norm(k)
         q, k = apply_rotary(q, cos, sin), apply_rotary(k, cos, sin)
         return q, k, v

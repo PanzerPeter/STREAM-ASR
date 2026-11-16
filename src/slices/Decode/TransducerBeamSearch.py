@@ -1,14 +1,10 @@
-# Single-pass RNN-T decode over encoder memory, acoustic-only. Greedy for live partials; a small
-# time-synchronous beam (per-frame non-blank expansion, capped at max_symbols) for the final. The
-# LM is NOT consulted here -- it attaches as n-best rescoring in StreamingDecoder_Handler (score
-# each final hypothesis once, re-rank by acoustic + alpha*lm), which is what keeps corpus decode
-# inside its GPU budget. So this searcher is pure acoustic by construction.
+# Single-pass RNN-T beam search over encoder memory, acoustic-only. The LM is NOT consulted here: it
+# attaches as n-best rescoring in StreamingDecoder_Handler, which keeps corpus decode inside its GPU
+# budget. Greedy decoding is the model's own label-looping search (TransducerModel.greedy_decode).
 #
 # Predictor-state contract (StatelessPredictor.step): step(state, token) -> (out, new_state), where
-# `new_state` is already the context AFTER consuming `token`. That is exactly what the NEXT call
-# needs, so it must be reused directly -- never re-derived by calling step a second time with the
-# just-emitted token (that would duplicate the emitted token into its own context window). Both
-# greedy and search below make exactly ONE predictor.step call per hypothesis per emission attempt.
+# `new_state` is already the context AFTER consuming `token`, so it is reused directly and never
+# re-derived by stepping the just-emitted token a second time.
 import math
 
 import torch
@@ -17,29 +13,27 @@ import torch.nn.functional as F
 from src.shared_kernel.Config_Adapter import get_config
 from src.slices.TrainAcousticModel.TransducerModel import TransducerModel
 
-# A search hypothesis: (label ids, path log-prob, predictor state BEFORE `last`, last token id).
-_Hyp = tuple[tuple[int, ...], float, torch.Tensor, int]
+# (label ids, path log-prob, predictor state BEFORE `last`, last token id, emission frame per id).
+_Hyp = tuple[tuple[int, ...], float, torch.Tensor, int, tuple[int, ...]]
 
 
 def _logadd(a: float, b: float) -> float:
-    # log(exp(a)+exp(b)) in a stable form -- marginalises two alignments of the SAME label sequence.
     hi, lo = (a, b) if a >= b else (b, a)
     return hi + math.log1p(math.exp(lo - hi))
 
 
 def _recombine(hyps: list[_Hyp]) -> list[_Hyp]:
-    # RNN-T hypothesis recombination: two hyps with identical label ids are the same partial output
-    # reached by different blank/emit alignments, so their probabilities must be *summed* (logadd),
-    # not left to compete for separate beam slots (splitting mass, which can prune the true best).
-    # For the stateless predictor, equal ids imply an identical (state, last), so the representative
-    # kept here is exact. Returns best-first.
+    # Equal label ids are the same partial output reached by different alignments: their mass is
+    # summed (logadd) rather than split across beam slots. With the stateless predictor equal ids
+    # imply an identical (state, last); the emission frames kept are the likelier alignment's.
     merged: dict[tuple[int, ...], _Hyp] = {}
-    for ids, score, state, last in hyps:
-        prev = merged.get(ids)
+    for hyp in hyps:
+        prev = merged.get(hyp[0])
         if prev is None:
-            merged[ids] = (ids, score, state, last)
-        else:
-            merged[ids] = (ids, _logadd(prev[1], score), state, last)
+            merged[hyp[0]] = hyp
+            continue
+        keep = prev if prev[1] >= hyp[1] else hyp
+        merged[hyp[0]] = (keep[0], _logadd(prev[1], hyp[1]), keep[2], keep[3], keep[4])
     return sorted(merged.values(), key=lambda h: h[1], reverse=True)
 
 
@@ -51,89 +45,46 @@ class TransducerBeamSearch:
         self.blank = get_config().model.blank_id
 
     @torch.no_grad()
-    def greedy(self, memory: torch.Tensor) -> list[int]:
-        # memory [1, T, De] -> token ids. Mirrors the trainer's greedy dev-WER probe exactly.
-        device = memory.device
-        state = self.model.predictor.init_state(1, device)
-        prev = torch.full((1,), self.blank, dtype=torch.long, device=device)
-        ids: list[int] = []
-        for t in range(memory.shape[1]):
-            enc_t = memory[:, t]  # [1, De]
-            emitted = 0
-            while emitted < self.max_symbols:
-                # ONE step call; `new_state` is the context after `prev` -- reuse it verbatim.
-                pred_out, new_state = self.model.predictor.step(state, prev)
-                logits = self.model.joiner.step(enc_t, pred_out)  # [1, V]
-                tok = int(logits.argmax(dim=-1))
-                if tok == self.blank:
-                    break
-                ids.append(tok)
-                state = new_state
-                prev = torch.full((1,), tok, dtype=torch.long, device=device)
-                emitted += 1
-        return ids
+    def search(self, memory: torch.Tensor) -> list[tuple[list[int], float, list[int]]]:
+        """memory [1, T, De] -> n-best (ids, acoustic score, emission frames), best first.
 
-    @torch.no_grad()
-    def search(self, memory: torch.Tensor) -> list[tuple[list[int], float]]:
-        # memory [1, T, De] -> n-best (ids, acoustic score) best-first, time-synchronous RNN-T beam.
-        # Every live hypothesis' predictor+joiner is evaluated in ONE batched call per symbol step
-        # (batch dim = live beam width), so a whole frame costs a handful of GPU launches + a single
-        # host sync instead of one per hypothesis.
-        #
-        # Structure (Graves-style A/B time-synchronous search):
-        #   `active`  -- hyps that may still EMIT another symbol at the current frame.
-        #   `blanked` -- hyps that took the blank at this frame; blank is scored EXACTLY ONCE, then
-        #                the hyp advances to t+1 and is NOT re-expanded here. Keeping blanked hyps
-        #                in the live beam instead would charge an idling hyp up to max_symbols
-        #                blank log-probs at a single frame -- a systematic over-penalty that biases
-        #                the search.
-        # `_recombine` merges equal-prefix hyps by logadd at every prune so probability mass is
-        # summed, not split across duplicate beam slots.
-        #
-        # Each hypothesis: (ids, score, predictor state BEFORE `last` [context-1], last token id).
-        # `state` is the context that must precede `last` in the next predictor.step call.
+        Graves A/B time-synchronous search: `active` hyps may still emit at frame t; a hyp that
+        takes the blank is scored for it exactly once and retires to t+1 (keeping it in the live
+        beam would charge an idling hyp up to max_symbols blanks per frame). The whole live beam is
+        one batched predictor+joiner call per symbol step, with one host sync.
+        """
         device = memory.device
         init_pred = self.model.predictor.init_state(1, device)[0]  # [context-1]
-        active: list[_Hyp] = [((), 0.0, init_pred, self.blank)]
+        active: list[_Hyp] = [((), 0.0, init_pred, self.blank, ())]
         for t in range(memory.shape[1]):
-            enc_t = memory[:, t]  # [1, De] (broadcasts over the batched predictor outputs)
+            enc_t = memory[:, t]  # [1, De], broadcasts over the batched predictor outputs
             blanked: list[_Hyp] = []
             for _ in range(self.max_symbols):
                 if not active:
                     break
-                states = torch.stack([h[2] for h in active])  # [n, context-1]
+                states = torch.stack([h[2] for h in active])
                 lasts = torch.tensor([h[3] for h in active], dtype=torch.long, device=device)
-                pred_out, new_states = self.model.predictor.step(states, lasts)  # [n,D],[n,ctx-1]
+                pred_out, new_states = self.model.predictor.step(states, lasts)
                 logp = F.log_softmax(self.model.joiner.step(enc_t, pred_out), dim=-1)  # [n, V]
                 k = min(self.beam_size, logp.shape[-1])
                 top_lp, top_tok = torch.topk(logp, k, dim=-1)
-                # ONE device->host sync per symbol step instead of three: the blank column, the
-                # top-k log-probs and the top-k ids ride out in a single [n, 1+2k] copy. A symbol
-                # step is a handful of microseconds of compute, so the syncs were the step. Ids go
-                # through fp32, which is exact for a 501-symbol vocabulary (< 2^24).
+                # The blank column, the top-k log-probs and the top-k ids leave in ONE copy; ids
+                # through fp32 are exact for a 501-symbol vocabulary.
                 packed = torch.cat(
-                    [
-                        logp[:, self.blank : self.blank + 1].float(),
-                        top_lp.float(),
-                        top_tok.float(),
-                    ],
+                    [logp[:, self.blank : self.blank + 1].float(), top_lp.float(), top_tok.float()],
                     dim=1,
-                ).tolist()  # [n, 1 + 2k]
+                ).tolist()
                 emitted: list[_Hyp] = []
-                for i, (ids, score, state, last) in enumerate(active):
+                for i, (ids, score, state, last, frames) in enumerate(active):
                     row = packed[i]
-                    # Blank: score once, retire to `blanked` (predictor context unchanged -- blank
-                    # is never fed to the predictor, so state/last carry over verbatim).
-                    blanked.append((ids, score + row[0], state, last))
-                    # Child state = new_states[i] (context AFTER `last`); NO second step call.
-                    child_state = new_states[i]
+                    blanked.append((ids, score + row[0], state, last, frames))
                     for lp, tok_f in zip(row[1 : 1 + k], row[1 + k :]):
                         tok = int(tok_f)
-                        if tok == self.blank:
-                            continue
-                        emitted.append((ids + (tok,), score + lp, child_state, tok))
+                        if tok != self.blank:
+                            emitted.append(
+                                (ids + (tok,), score + lp, new_states[i], tok, frames + (t,))
+                            )
                 active = _recombine(emitted)[: self.beam_size]
-            # Hyps that hit max_symbols without blanking still advance to t+1 (forced time step, no
-            # extra blank cost); fold them in with the blanked set and prune for the next frame.
+            # Hyps that hit max_symbols still advance to t+1 (forced step, no blank cost).
             active = _recombine(blanked + active)[: self.beam_size]
-        return [(list(ids), score) for ids, score, _, _ in _recombine(active)]
+        return [(list(h[0]), h[1], list(h[4])) for h in _recombine(active)]

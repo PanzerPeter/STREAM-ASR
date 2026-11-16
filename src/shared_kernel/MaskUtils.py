@@ -8,12 +8,21 @@ def make_pad_mask(lengths: torch.Tensor, max_len: int) -> torch.Tensor:
     return positions >= lengths.unsqueeze(1)  # [B, max_len]
 
 
-def make_chunk_mask(seq_len: int, chunk_size: int, device: torch.device) -> torch.Tensor:
-    # Chunk-causal visibility: query i sees keys in its own chunk and all earlier chunks.
-    # This is the dynamic-chunk regularizer: the same weights then run offline
-    # (full) or streaming (small chunk). True = attend. chunk_size <= 0 -> full context.
+def make_chunk_mask(
+    seq_len: int, chunk_size: int, left_context: int, device: torch.device
+) -> torch.Tensor | None:
+    """Chunk-causal visibility with a CHUNK-granular left window. True = attend.
+
+    Query i in the chunk starting at s(i) sees key j iff s(i) - left <= j < s(i) + chunk. The window
+    is anchored at the chunk start, not at i, because that is what a streaming ring buffer holds:
+    a per-frame window would give each query of one chunk a different history and break
+    streaming == batched. chunk_size <= 0 -> full context (None); left_context < 0 -> unlimited.
+    """
     if chunk_size <= 0:
-        return torch.ones(seq_len, seq_len, dtype=torch.bool, device=device)
+        return None
     idx = torch.arange(seq_len, device=device)
-    chunk_of = idx // chunk_size  # [seq_len]
-    return chunk_of.unsqueeze(1) >= chunk_of.unsqueeze(0)  # [i, j] True iff chunk(j) <= chunk(i)
+    start = (idx // chunk_size * chunk_size).unsqueeze(1)  # [T, 1] chunk start of each query
+    visible = idx.unsqueeze(0) < start + chunk_size
+    if left_context >= 0:
+        visible &= idx.unsqueeze(0) >= start - left_context
+    return visible

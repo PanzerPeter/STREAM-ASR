@@ -1,7 +1,9 @@
 from dataclasses import FrozenInstanceError
+
 import pytest
+
 from src.slices.Decode.StreamingDecode_Command import StreamingDecode_Command
-from src.slices.Decode.StreamingDecode_Response import StreamingDecode_Response, SegmentResult
+from src.slices.Decode.StreamingDecode_Response import SegmentResult, StreamingDecode_Response
 
 
 def test_dtos_are_frozen():
@@ -14,6 +16,8 @@ def test_dtos_are_frozen():
         audio_s=2.0,
         finalize_s=0.05,
         first_partial_latency_s=0.4,
+        token_ids=[7],
+        token_emit_s=[0.32],
     )
     assert resp.segments[0].text == "hi"
     with pytest.raises(FrozenInstanceError):

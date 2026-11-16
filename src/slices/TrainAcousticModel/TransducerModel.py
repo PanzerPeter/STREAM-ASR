@@ -1,142 +1,208 @@
+from dataclasses import dataclass
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from src.shared_kernel.Config_Adapter import get_config
-from src.shared_kernel.RnntLoss import rnnt_loss
+from src.shared_kernel.RnntLoss import occupancy_band, rnnt_loss
 from src.slices.ExtractFeatures.FeatureBatch_Response import FeatureBatch
 from src.slices.ExtractFeatures.SpecAugmentBatch import apply_spec_augment_batch
+from src.slices.TrainAcousticModel.DwSepSubsampling import FRONTEND_STRIDE
+from src.slices.TrainAcousticModel.S2Encoder import S2Encoder
 from src.slices.TrainAcousticModel.StatelessPredictor import StatelessPredictor
 from src.slices.TrainAcousticModel.TransducerJoiner import TransducerJoiner
-from src.slices.TrainAcousticModel.ZipformerEncoder import ZipformerEncoder
+
+# Output frames the label-looping search scans per joiner call while a hypothesis emits nothing.
+_LOOP_WINDOW = 16
+
+
+@dataclass(frozen=True)
+class LossTerms:
+    """Every term is per TOKEN (MODEL_ARCHITECTURE.md §6.4); tensors stay on device."""
+
+    total: torch.Tensor
+    rnnt: torch.Tensor
+    ctc: torch.Tensor
+    band_scale: torch.Tensor  # median c(T-1)/U before the rescale; nan while the band is off
+    band_infeasible: torch.Tensor  # utterances whose band misses a terminal; must stay 0
 
 
 class TransducerModel(nn.Module):
-    """Single-pass streaming RNN-T: unchanged Zipformer encoder + stateless predictor + additive
-    joiner, trained with rnnt + ctc_aux_weight*ctc + sum(interctc_weights*interctc_k). The aux CTC
-    head doubles as a cheap greedy dev-WER probe; InterCTC taps regularise intermediate stacks."""
+    """S2 encoder + CTC head + stateless predictor + additive joiner, trained jointly with
+    `rnnt + ctc_loss_scale * ctc` on a CTC-banded lattice."""
 
     def __init__(self, cmvn_path: str | None = "data/features/cmvn.pt") -> None:
         super().__init__()
-        model = get_config().model
-        t = get_config().transducer
-        self.encoder = ZipformerEncoder(cmvn_path=cmvn_path)
-        self.ctc_head = nn.Linear(self.encoder.output_dim, model.logits_width)
-        self.interctc_layers = list(t.interctc_layers)
-        self.interctc_weights = list(t.interctc_weights)
-        self.interctc_heads = nn.ModuleList(
-            [nn.Linear(model.encoder_dims[i], model.logits_width) for i in self.interctc_layers]
-        )
+        cfg = get_config()
+        t = cfg.transducer
+        self.encoder = S2Encoder(cmvn_path=cmvn_path)
+        self.ctc_head = nn.Linear(self.encoder.output_dim, cfg.model.logits_width)
         self.predictor = StatelessPredictor()
-        self.joiner = TransducerJoiner()
-        self._blank = model.blank_id
-        self._ctc_aux_weight = t.ctc_aux_weight
-        self._spec_augment = get_config().training.transducer.spec_augment
-        # reduction="sum" (not "mean") so we can normalise per-token below. A per-utterance "mean"
-        # would divide only by batch size, yielding a per-utterance sum (~O(#tokens) ≈ 30), whereas
-        # F.ctc_loss("mean") is per-token (~O(1)). Mixing the two silently down-weights the CTC/
-        # InterCTC aux terms by ~1/avg_tokens relative to their nominal weights -- so once the RNN-T
-        # gradient matures it overpowers the aux heads (InterCTC diverges, dev-WER regresses).
-        # Per-token normalisation puts all three losses on one O(1) scale so the weights mean what
-        # they say. (Muon+AdamW are ~scale-invariant, so this reweights gradients, not step size.)
-        self._rnnt_reduction = "sum"
+        self.joiner = TransducerJoiner(self.encoder.output_dim)
+        self._blank = cfg.model.blank_id
+        self._ctc_scale = t.ctc_loss_scale
+        self._band_width = t.band_width
+        self._spec_augment = cfg.training.transducer.spec_augment
 
     def forward(
-        self, features: torch.Tensor, lengths: torch.Tensor, chunk_size: int = 0
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor], torch.Tensor]:
-        memory, out_lengths, inters, base_lengths = self.encoder(
-            features, lengths, chunk_size, return_intermediates=self.interctc_layers
-        )
-        ctc_logits = self.ctc_head(memory)
-        interctc_logits = [head(x) for head, x in zip(self.interctc_heads, inters)]
-        return memory, out_lengths, ctc_logits, interctc_logits, base_lengths
-
-    def ctc_loss(
         self,
-        logits: torch.Tensor,
+        features: torch.Tensor,
         lengths: torch.Tensor,
-        tokens: torch.Tensor,
-        token_lengths: torch.Tensor,
-    ) -> torch.Tensor:
-        # Pass the already-padded [B, S] targets straight to F.ctc_loss (its 2-D target form):
-        # entries past token_lengths[i] are ignored, so no flatten is needed. Concatenating the
-        # rows instead would slice each with a GPU scalar bound, costing B device->host syncs per
-        # CTC call -- and this path is called 3x a step (main + 2 InterCTC taps).
-        return F.ctc_loss(
-            F.log_softmax(logits, dim=-1).transpose(0, 1),  # [T, B, V]
-            tokens,
-            lengths,
-            token_lengths,
-            blank=self._blank,
-            zero_infinity=True,
-        )
+        chunk_size: int = 0,
+        left_context: int = -1,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        memory, out_lengths = self.encoder(features, lengths, chunk_size, left_context)
+        return memory, out_lengths, self.ctc_head(memory)
 
-    def interctc_terms(
-        self,
-        interctc_logits: list[torch.Tensor],
-        base_lengths: torch.Tensor,
-        tokens: torch.Tensor,
-        token_lengths: torch.Tensor,
-    ) -> list[torch.Tensor]:
-        # Raw (unweighted) CTC per tap. Intermediate taps are at base rate; their CTC input lengths
-        # are base_lengths. CTC is rate-agnostic, so mixing these 50Hz aux heads with the 25Hz main
-        # head is fine. Kept raw so training logs can show each stack's actual CTC-decodability
-        # (the weighted sum hid whether a climb was the encoder eroding or just the weight).
-        return [
-            self.ctc_loss(logits, base_lengths, tokens, token_lengths) for logits in interctc_logits
-        ]
-
-    def rnnt_loss(
+    def transducer_cost(
         self,
         memory: torch.Tensor,
         out_lengths: torch.Tensor,
         tokens: torch.Tensor,
         token_lengths: torch.Tensor,
+        band_lo: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # Blank-prefixed prediction inputs -> predictor -> joiner lattice.
-        blanks = torch.full(
-            (tokens.shape[0], 1), self._blank, dtype=torch.long, device=tokens.device
-        )
+        """Per-utterance -log p(y|x) [B] on the full lattice, or on the band starting at band_lo."""
+        blanks = tokens.new_full((tokens.shape[0], 1), self._blank)
         pred = self.predictor(torch.cat([blanks, tokens], dim=1))  # [B, U+1, Dp]
-        # Training runs this under bf16 autocast, so the joiner's Linear emits bf16 logits. They go
-        # to the loss as-is: it promotes to fp32 inside its own log-softmax, so the bf16 lattice is
-        # the only [B, T, U+1, V] tensor that has to survive until backward. Materialising an fp32
-        # copy here instead would double that, on the step's largest allocation.
-        logits = self.joiner(memory, pred)  # [B, T, U+1, V]
-        cost = rnnt_loss(
+        cols = None
+        if band_lo is not None:
+            width = min(self._band_width + 1, tokens.shape[1] + 1)
+            cols = band_lo.unsqueeze(2) + torch.arange(width, device=band_lo.device)
+        # bf16 logits go to the loss as-is: it promotes per slab, so the bf16 lattice is the only
+        # lattice-sized tensor alive until backward.
+        logits = self.joiner(memory, pred, cols)
+        return rnnt_loss(
             logits,
             tokens.int(),
             out_lengths.int(),
             token_lengths.int(),
             blank=self._blank,
-            reduction=self._rnnt_reduction,
+            reduction="none",
+            band_lo=band_lo,
         )
-        # Per-token mean -> same O(1) scale as the CTC aux (see the reduction note in __init__).
-        return cost / token_lengths.sum().clamp(min=1)
+
+    def band(
+        self, ctc_log_probs: torch.Tensor, out_lengths: torch.Tensor, token_lengths: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # The CTC head that sets the band is DETACHED from it (MODEL_ARCHITECTURE.md §11).
+        lo, _, scale, infeasible = occupancy_band(
+            ctc_log_probs[..., self._blank].detach(), out_lengths, token_lengths, self._band_width
+        )
+        return lo, scale, infeasible
 
     def joint_loss(
-        self, batch: FeatureBatch, chunk_size: int
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Returns ``(total, rnnt, ctc, interctc)``; ``interctc`` is the RAW mean over the taps."""
+        self, batch: FeatureBatch, chunk_size: int, left_context: int, use_band: bool
+    ) -> LossTerms:
         device = self.ctc_head.weight.device
-        # non_blocking pairs with the loader's pin_memory: the four H2D copies are issued async and
-        # overlap with the tail of the previous step instead of blocking the launch thread on each.
+        # non_blocking pairs with the loader's pin_memory, so the copies overlap the previous step.
         feats = batch.features.to(device, non_blocking=True)
         flens = batch.feature_lengths.to(device, non_blocking=True)
         tokens = batch.tokens.to(device, non_blocking=True)
         tlens = batch.token_lengths.to(device, non_blocking=True)
-        # SpecAugment is a train-only input regulariser; joint_loss is only ever the training path,
-        # but gate on self.training anyway so an eval-mode caller can never mask its own inputs.
         if self._spec_augment and self.training:
-            feats = apply_spec_augment_batch(feats, flens)
-        memory, out_len, ctc_logits, interctc_logits, base_len = self.forward(
-            feats, flens, chunk_size
+            feats = apply_spec_augment_batch(feats, flens, self.encoder.cmvn_mean)
+        memory, out_len, logits = self(feats, flens, chunk_size, left_context)
+        n_tok = tlens.sum().clamp(min=1)
+        log_probs = F.log_softmax(logits.float(), dim=-1)
+        ctc = (
+            F.ctc_loss(
+                log_probs.transpose(0, 1),
+                tokens,
+                out_len,
+                tlens,
+                blank=self._blank,
+                reduction="sum",
+                zero_infinity=True,
+            )
+            / n_tok
         )
-        rnnt = self.rnnt_loss(memory, out_len, tokens, tlens)
-        ctc = self.ctc_loss(ctc_logits, out_len, tokens, tlens)
-        ictc_terms = self.interctc_terms(interctc_logits, base_len, tokens, tlens)
-        ictc = sum(w * term for w, term in zip(self.interctc_weights, ictc_terms))
-        total = rnnt + self._ctc_aux_weight * ctc + ictc
-        # Log the RAW mean interctc (not the weighted sum) -- it tracks the actual
-        # CTC-decodability of the tapped stacks, the signal that flags encoder erosion.
-        return total, rnnt, ctc, torch.stack(ictc_terms).mean()
+        nan = log_probs.new_full((), float("nan"))
+        band_lo, scale, infeasible = None, nan, log_probs.new_zeros(())
+        if use_band and self._band_width > 0:
+            band_lo, scales, flags = self.band(log_probs, out_len, tlens)
+            scale, infeasible = scales.median(), flags.sum().float()
+        rnnt = self.transducer_cost(memory, out_len, tokens, tlens, band_lo).sum() / n_tok
+        total = rnnt + self._ctc_scale * ctc
+        return LossTerms(total, rnnt, ctc, scale, infeasible)
+
+    @torch.no_grad()
+    def greedy_decode(
+        self, memory: torch.Tensor, lengths: torch.Tensor, max_symbols: int
+    ) -> tuple[list[list[int]], list[list[int]]]:
+        """Label-looping greedy (Bataev et al. 2024), batched: (token ids, emission frame) per row.
+
+        While a hypothesis emits blanks its predictor state does not move, so the joiner is
+        evaluated on the next `_LOOP_WINDOW` frames at once against that one state and the search
+        jumps to the first frame whose argmax is non-blank. That is exactly frame-by-frame greedy
+        (`test_label_looping_equals_framewise`) with one joiner call per emitted token instead of
+        one per frame. A frame that has emitted `max_symbols` tokens is left, as frame-wise does.
+        """
+        batch, num_frames, _ = memory.shape
+        device = memory.device
+        lengths = lengths.to(device)
+        enc = self.joiner.enc_proj(memory)  # [B, T, J]
+        state = self.predictor.init_state(batch, device)
+        prev = torch.full((batch,), self._blank, dtype=torch.long, device=device)
+        out, next_state = self.predictor.step(state, prev)
+        pred = self.joiner.pred_proj(out)
+        t = torch.zeros(batch, dtype=torch.long, device=device)
+        symbols = torch.zeros_like(t)
+        offsets = torch.arange(_LOOP_WINDOW, device=device)
+        ids: list[list[int]] = [[] for _ in range(batch)]
+        frames: list[list[int]] = [[] for _ in range(batch)]
+        while True:
+            active = t < lengths
+            idx = t.unsqueeze(1) + offsets  # [B, W]
+            in_range = idx < lengths.unsqueeze(1)
+            cells = enc.gather(
+                1, idx.clamp(max=num_frames - 1).unsqueeze(2).expand(-1, -1, enc.shape[2])
+            )
+            best = self.joiner.out(torch.tanh(cells + pred.unsqueeze(1))).argmax(dim=-1)  # [B, W]
+            non_blank = (best != self._blank) & in_range & active.unsqueeze(1)
+            first = non_blank.int().argmax(dim=1)
+            emit = non_blank.any(dim=1)
+            at = t + first
+            tok = best.gather(1, first.unsqueeze(1)).squeeze(1)
+            packed = torch.stack([active.long(), emit.long(), tok, at]).tolist()  # one sync
+            if not any(packed[0]):
+                break
+            for lane in range(batch):
+                if packed[1][lane]:
+                    ids[lane].append(packed[2][lane])
+                    frames[lane].append(packed[3][lane])
+            symbols = torch.where(emit, torch.where(at == t, symbols, 0) + 1, symbols)
+            t = torch.where(emit, at, torch.where(active, t + _LOOP_WINDOW, t))
+            leave = emit & (symbols >= max_symbols)
+            t = torch.where(leave, t + 1, t)
+            symbols = torch.where(leave, 0, symbols)
+            state = torch.where(emit.unsqueeze(1), next_state, state)
+            prev = torch.where(emit, tok, prev)
+            out, stepped = self.predictor.step(state, prev)
+            pred = torch.where(emit.unsqueeze(1), self.joiner.pred_proj(out), pred)
+            next_state = torch.where(emit.unsqueeze(1), stepped, next_state)
+        return ids, frames
+
+    def decode_window(
+        self,
+        features: torch.Tensor,
+        lengths: torch.Tensor,
+        chunk_size: int,
+        left_context: int,
+        tail_chunks: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Batched memory equal to what streaming decode produces: the final partial chunk is
+        completed and `tail_chunks` whole chunks of mean fill follow, all of their frames kept.
+        chunk_size 0 = offline (no tail). Returns (memory, kept lengths)."""
+        if chunk_size <= 0:
+            memory, out_len = self.encoder(features, lengths)
+            return memory, out_len
+        mel_chunk = chunk_size * FRONTEND_STRIDE
+        extra = mel_chunk * (tail_chunks + 1)
+        memory, _ = self.encoder(
+            F.pad(features, (0, 0, 0, extra)), lengths, chunk_size, left_context
+        )
+        per_chunk = mel_chunk // self.encoder.mel_frames_per_output
+        chunks = -(-lengths // mel_chunk) + tail_chunks
+        return memory, (chunks * per_chunk).clamp(max=memory.shape[1])

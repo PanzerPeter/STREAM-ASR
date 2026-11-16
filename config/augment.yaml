@@ -1,7 +1,8 @@
-# SpecAugment "LD" policy, at designed strength. Full-strength masking from step 0 pins a
-# randomly-initialised model in CTC blank collapse; the shipped pipeline warm-starts the encoder
-# from BEST-RQ pretraining, which is healthy enough to take the full policy immediately.
+# SpecAugment on raw log-mel, filled with the per-bin CMVN mean (0 after CMVN, MODEL_ARCHITECTURE.md
+# §9.1). Time masking follows lhotse's rule at x2.5 strength: up to 25 masks, each <= 5 % of the
+# utterance, all of them together <= 37.5 %.
 specaug_num_freq_masks: 2
 specaug_freq_width: 27
 specaug_time_ratio: 0.05
-specaug_max_time_masks: 10
+specaug_max_time_masks: 25
+specaug_max_time_fraction: 0.375

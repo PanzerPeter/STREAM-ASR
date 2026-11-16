@@ -2,12 +2,15 @@
 # time masking scaled by length) but runs on the collated batch already on-device, off the
 # dataloader worker. Time masks stay within each sample's valid length so padding is never touched.
 #
+# The fill is the per-bin CMVN mean in RAW log-mel, which is exactly 0 once the encoder normalises.
+# A raw 0.0 lands at a median +1.5 sigma after CMVN: a loud plateau instead of "nothing here".
+#
 # Fully vectorised: the mask geometry is drawn as [B, K] tensors and reduced into one boolean
 # [B, T, n_mels] mask, so the cost is a fixed handful of kernels regardless of batch size. Masking
-# per utterance instead would cost an `int(lengths[i])` device->host sync each (twice per step
-# under CR-CTC) plus a slice-assign launch per mask -- pipeline bubbles on the critical path. The
-# sampled distribution is the standard one: widths and starts are uniform over the same integer
-# ranges, drawn as floor(rand * n) rather than randint(0, n) to stay on-device.
+# per utterance instead would cost an `int(lengths[i])` device->host sync each plus a slice-assign
+# launch per mask: pipeline bubbles on the critical path. The sampled distribution is the standard
+# one: widths and starts are uniform over the same integer ranges, drawn as floor(rand * n) rather
+# than randint(0, n) to stay on-device.
 import torch
 
 from src.shared_kernel.Config_Adapter import get_config
@@ -20,7 +23,10 @@ def _uniform_int(high: torch.Tensor) -> torch.Tensor:
     return (torch.rand(high.shape, device=high.device, dtype=torch.float32) * high).long()
 
 
-def apply_spec_augment_batch(features: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+def apply_spec_augment_batch(
+    features: torch.Tensor, lengths: torch.Tensor, fill: torch.Tensor
+) -> torch.Tensor:
+    """Mask `features` [B, T, n_mels] (raw log-mel) with `fill` [n_mels], the CMVN mean."""
     cfg = get_config().augment
     batch, num_frames, n_mels = features.shape
     device = features.device
@@ -42,10 +48,12 @@ def apply_spec_augment_batch(features: torch.Tensor, lengths: torch.Tensor) -> t
     )  # [B, 1, n_mels]
 
     # Time masks: count and span both scale with the utterance's own valid length --
-    # num_time = min(max_time_masks, int(ratio*L)), span ~ U{0..max(1, int(ratio*L))}.
+    # num_time = min(max_time_masks, int(ratio*L)), and each span ~ U{0..max_span} with max_span
+    # also capped so num_time spans together stay under max_time_fraction*L (lhotse's rule).
     span_cap = (valid.float() * cfg.specaug_time_ratio).long()
     num_time = span_cap.clamp(max=cfg.specaug_max_time_masks)
-    max_span = span_cap.clamp(min=1)
+    total_cap = (valid.float() * cfg.specaug_max_time_fraction).long()
+    max_span = torch.minimum(span_cap, total_cap // num_time.clamp(min=1)).clamp(min=1)
     span = _uniform_int((max_span + 1).expand(batch, cfg.specaug_max_time_masks).contiguous())
     # Every utterance draws max_time_masks slots but only num_time of them are real; zeroing the
     # span of the surplus slots is the vectorised equivalent of never drawing them.
@@ -65,4 +73,5 @@ def apply_spec_augment_batch(features: torch.Tensor, lengths: torch.Tensor) -> t
     # Both mask families are confined to t < length. Time starts are already drawn so that
     # start+span <= length; this final AND is what keeps the freq masks off the padding too.
     in_valid = frames < valid.view(batch, 1, 1)
-    return features.masked_fill((freq_masked | time_masked) & in_valid, 0.0)
+    masked = (freq_masked | time_masked) & in_valid
+    return torch.where(masked, fill.to(features.dtype), features)

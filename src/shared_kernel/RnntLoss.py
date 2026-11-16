@@ -16,6 +16,11 @@
 #     forward returns and the softmax is recomputed in backward, which costs one extra elementwise
 #     pass and removes a [B, T, U+1, V] fp32 tensor from the step's peak.
 #
+#   * The lattice may be BANDED: `[B, T, W', V]` cells at `u = lo[b, t] + j` instead of all `U+1`.
+#     Only the gather (lattice -> two arc grids) and the scatter of the gradient back change; the
+#     scan runs on the full `[B, T, U+1]` grid with out-of-band arcs at _NEG, so a band that covers
+#     the whole grid (`lo = 0`, `W' = U+1`) IS the full loss, bit for bit.
+#
 # Anti-diagonals are addressed through a *sheared* view, shear[d, u] = grid[d - u, u], which turns
 # "the cells with t+u=d" into "row d" so a step is a vector op rather than a strided gather.
 import torch
@@ -203,6 +208,11 @@ def alignment_loss(
     return -log_partition, alpha, beta
 
 
+def _band_index(lo: torch.Tensor, width: int) -> torch.Tensor:
+    # [B, T] band starts -> [B, T, W'] grid column u of every band cell.
+    return lo.unsqueeze(2) + torch.arange(width, device=lo.device)
+
+
 class _RnntLoss(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -211,34 +221,41 @@ class _RnntLoss(torch.autograd.Function):
         targets: torch.Tensor,
         logit_lengths: torch.Tensor,
         target_lengths: torch.Tensor,
+        lo: torch.Tensor,
         blank: int,
     ) -> torch.Tensor:
-        batch, num_frames, num_states, vocab = logits.shape
-        num_labels = num_states - 1
+        batch, num_frames, width, vocab = logits.shape
+        num_labels = targets.shape[1]
+        num_states = num_labels + 1
         frames = logit_lengths.long()
         labels = target_lengths.long()
+        cols = _band_index(lo, width)  # [B, T, W']
+        # Label id leaving each band cell; the column past the last label (u = U) has no label arc,
+        # so the padded 0 there is gathered and then dropped with that column.
+        band_targets = (
+            F.pad(targets.long(), (0, 1)).unsqueeze(1).expand(batch, num_frames, num_states)
+        ).gather(2, cols)
 
         # Promote inside the kernel: under bf16 autocast no fp32 copy of the whole lattice is ever
         # materialised, only one slab at a time. promote_types (rather than a hard float32) keeps an
         # fp64 caller in fp64, which is what makes gradcheck meaningful.
         accum = torch.promote_types(logits.dtype, torch.float32)
-        blank_lp = logits.new_empty((batch, num_frames, num_states), dtype=accum)
-        label_lp = logits.new_empty((batch, num_frames, num_labels), dtype=accum)
-        slab = _frame_slab(batch, num_frames, num_states, vocab)
+        band_blank = logits.new_empty((batch, num_frames, width), dtype=accum)
+        band_label = logits.new_empty((batch, num_frames, width), dtype=accum)
+        slab = _frame_slab(batch, num_frames, width, vocab)
         for start in range(0, num_frames, slab):
             stop = min(start + slab, num_frames)
             log_probs = torch.log_softmax(logits[:, start:stop], dim=-1, dtype=accum)
-            blank_lp[:, start:stop] = log_probs[..., blank]
-            label_lp[:, start:stop] = (
-                log_probs[:, :, :num_labels, :]
-                .gather(
-                    3,
-                    targets.long()
-                    .view(batch, 1, num_labels, 1)
-                    .expand(batch, stop - start, num_labels, 1),
-                )
-                .squeeze(3)
-            )
+            band_blank[:, start:stop] = log_probs[..., blank]
+            band_label[:, start:stop] = log_probs.gather(
+                3, band_targets[:, start:stop].unsqueeze(3)
+            ).squeeze(3)
+
+        blank_lp = band_blank.new_full((batch, num_frames, num_states), _NEG)
+        blank_lp.scatter_(2, cols, band_blank)
+        label_lp = band_blank.new_full((batch, num_frames, num_states), _NEG)
+        label_lp.scatter_(2, cols, band_label)
+        label_lp = label_lp[:, :, :num_labels].contiguous()
 
         # alignment_loss masks blank_lp/label_lp in place, which backward relies on too: an unmasked
         # label log-prob at t == logit_length would pair with the virtual accepting state in the arc
@@ -246,7 +263,7 @@ class _RnntLoss(torch.autograd.Function):
         cost, alpha, beta = alignment_loss(blank_lp, label_lp, frames, labels)
 
         ctx.save_for_backward(
-            logits, targets, blank_lp, label_lp, alpha, beta, frames, labels, -cost
+            logits, band_targets, cols, blank_lp, label_lp, alpha, beta, frames, labels, -cost
         )
         ctx.blank = blank
         return cost
@@ -262,7 +279,8 @@ class _RnntLoss(torch.autograd.Function):
         (grad_output,) = grad_outputs
         (
             logits,
-            targets,
+            band_targets,
+            cols,
             blank_lp,
             label_lp,
             alpha,
@@ -271,7 +289,8 @@ class _RnntLoss(torch.autograd.Function):
             labels,
             log_partition,
         ) = ctx.saved_tensors
-        batch, num_frames, num_states, _ = logits.shape
+        batch, num_frames, width, vocab = logits.shape
+        num_states = blank_lp.shape[2]
         num_labels = num_states - 1
         device = logits.device
         rows = torch.arange(batch, device=device)
@@ -285,7 +304,7 @@ class _RnntLoss(torch.autograd.Function):
         )
 
         # Posterior mass of each arc: P(paths through the arc) / P(all paths). Arcs outside the
-        # utterance's rectangle carry a _NEG term and underflow to exactly 0.
+        # utterance's rectangle (or outside the band) carry a _NEG term and underflow to exactly 0.
         norm = log_partition.view(batch, 1, 1)
         blank_grad = torch.exp(alpha + blank_lp + beta_next_t - norm)  # [B, T, U+1]
         label_grad = torch.exp(
@@ -293,30 +312,27 @@ class _RnntLoss(torch.autograd.Function):
         )  # [B, T, U]
 
         # d(-log Z)/d logits[v] = softmax(logits)[v] * sum_k dZ/d log_probs[k] - dZ/d log_probs[v],
-        # and only the blank and the utterance's own next label have a non-zero dZ/d log_probs.
+        # and only the blank and the cell's own next label have a non-zero dZ/d log_probs.
         upstream = grad_output.view(batch, 1, 1)
-        scale = (blank_grad + F.pad(label_grad, (0, 1))) * upstream
-        blank_grad = blank_grad * upstream
-        label_grad = -label_grad * upstream
+        blank_grad = (blank_grad * upstream).gather(2, cols)  # [B, T, W']
+        label_grad = (F.pad(label_grad, (0, 1)) * upstream).gather(2, cols)
+        scale = blank_grad + label_grad
         # Written slab-by-slab straight into a gradient of the caller's dtype, so the fp32 softmax
         # never exists at full lattice size (see _WORK_BYTES).
         grad = torch.empty_like(logits)
-        vocab = logits.shape[3]
-        slab = _frame_slab(batch, num_frames, num_states, vocab)
+        slab = _frame_slab(batch, num_frames, width, vocab)
         for start in range(0, num_frames, slab):
             stop = min(start + slab, num_frames)
             part = torch.softmax(logits[:, start:stop], dim=-1, dtype=alpha.dtype)
             part.mul_(scale[:, start:stop].unsqueeze(3))
             part[..., ctx.blank] -= blank_grad[:, start:stop]
-            part[:, :, :num_labels, :].scatter_add_(
+            part.scatter_add_(
                 3,
-                targets.long()
-                .view(batch, 1, num_labels, 1)
-                .expand(batch, stop - start, num_labels, 1),
-                label_grad[:, start:stop].unsqueeze(3),
+                band_targets[:, start:stop].unsqueeze(3),
+                -label_grad[:, start:stop].unsqueeze(3),
             )
             grad[:, start:stop] = part
-        return grad, None, None, None, None
+        return grad, None, None, None, None, None
 
 
 def rnnt_loss(
@@ -326,26 +342,88 @@ def rnnt_loss(
     target_lengths: torch.Tensor,
     blank: int,
     reduction: str = "sum",
+    band_lo: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Graves RNN-T loss over a joiner lattice.
+    """Graves RNN-T loss over a full or banded joiner lattice.
 
     Args:
-        logits: ``[B, T, U+1, V]`` joiner output, any float dtype. The log-softmax and the
-            forward-backward accumulate at fp32 or the input's own precision, whichever is wider
-            (so an fp64 caller stays in fp64); the returned gradient is cast back to the input.
+        logits: ``[B, T, W', V]`` joiner output, any float dtype. ``W' = U+1`` with
+            ``band_lo=None`` (the full lattice); otherwise cell ``j`` of frame ``t`` is grid
+            column ``band_lo[b, t] + j``. Accumulates at fp32 or the input's own precision,
+            whichever is wider; the returned gradient is cast back to the input.
         targets: ``[B, U]`` label ids, zero-padded past ``target_lengths``.
         logit_lengths: ``[B]`` valid encoder frames per utterance.
         target_lengths: ``[B]`` valid labels per utterance.
         blank: blank index into ``V``.
         reduction: ``"none"`` -> ``[B]`` per-utterance costs; ``"sum"``/``"mean"`` -> scalar.
+        band_lo: ``[B, T]`` long band starts from `occupancy_band`, or None for the full lattice.
     """
     if logits.ndim != 4:
-        raise ValueError(f"logits must be [B, T, U+1, V], got {tuple(logits.shape)}")
+        raise ValueError(f"logits must be [B, T, W', V], got {tuple(logits.shape)}")
     if reduction not in ("none", "sum", "mean"):
         raise ValueError('reduction should be one of "none", "sum", or "mean"')
-    costs = _RnntLoss.apply(logits, targets, logit_lengths, target_lengths, blank)
+    if band_lo is None:
+        if logits.shape[2] != targets.shape[1] + 1:
+            raise ValueError("a full lattice needs U+1 label states per frame")
+        band_lo = logits.new_zeros(logits.shape[:2], dtype=torch.long)
+    costs = _RnntLoss.apply(logits, targets, logit_lengths, target_lengths, band_lo, blank)
     if reduction == "sum":
         return costs.sum()
     if reduction == "mean":
         return costs.mean()
     return costs
+
+
+@torch.no_grad()
+def occupancy_band(
+    blank_log_probs: torch.Tensor,
+    frames: torch.Tensor,
+    labels: torch.Tensor,
+    band_width: int,
+) -> tuple[torch.Tensor, int, torch.Tensor, torch.Tensor]:
+    """Per-frame band start from the CTC head's cumulative non-blank mass (MODEL_ARCHITECTURE.md
+    §6.5).
+
+    `blank_log_probs` is ``[B, T]`` log p_ctc(blank | t), used without gradient. Returns
+    ``(lo [B, T] long, W', band_scale [B], infeasible [B] bool)``: band cell ``j`` of frame ``t``
+    is label state ``lo + j``. `band_scale` is ``c(T-1)/U`` before the rescale (the
+    drift diagnostic); `infeasible` marks a band that still misses ``(0, 0)`` or ``(T-1, U)``,
+    which the two repair passes make impossible, so any True is a bug.
+    """
+    batch, num_frames = blank_log_probs.shape
+    device = blank_log_probs.device
+    u_max = int(labels.max()) if batch else 0
+    width = min(band_width + 1, u_max + 1)
+    t = torch.arange(num_frames, device=device)
+    valid = t.unsqueeze(0) < frames.unsqueeze(1)
+    last = (frames - 1).clamp(min=0)
+    lab = labels.to(blank_log_probs.dtype).unsqueeze(1)
+
+    p_nb = (1.0 - blank_log_probs.float().exp()).clamp(min=0.0) * valid
+    occ = p_nb.cumsum(dim=1)
+    total = occ.gather(1, last.unsqueeze(1))  # [B, 1] c(T-1)
+    band_scale = (total / lab.clamp(min=1.0)).squeeze(1)
+    # A head that has not learned to emit yet carries no alignment: fall back to the diagonal.
+    diagonal = t.unsqueeze(0) * lab / last.unsqueeze(1).clamp(min=1)
+    occ = torch.where(total < 0.5, diagonal, occ * lab / total.clamp(min=1e-6))
+
+    hi = (labels + 1 - width).clamp(min=0).unsqueeze(1)  # [B, 1] highest legal band start
+    lo = (occ.floor().long() - band_width // 2).clamp(min=0)
+    lo = torch.minimum(lo, hi)
+    lo[:, 0] = 0
+    end_cols = (t.unsqueeze(0) >= last.unsqueeze(1)).expand(batch, num_frames)
+    lo = torch.where(end_cols, hi, lo)
+    step = width - 1
+    ramp = t.unsqueeze(0) * step
+    # (1) forward: the largest lo' <= lo whose per-frame rise is <= W'-1, so the path stays
+    # connected. It only lowers lo, so a late jump drags (T-1, U) out of the band ...
+    lo = torch.cummin(lo - ramp, dim=1).values + ramp
+    lo = torch.where(end_cols, hi, lo)
+    # (2) ... and the reverse pass lifts the tail back: the smallest lo'' >= lo' with the same step
+    # bound that still ends at hi. Without it the cost is a finite 2e30 and the gradient is inf.
+    rev = torch.flip(torch.cummax(torch.flip(lo - ramp, dims=[1]), dim=1).values, dims=[1])
+    lo = torch.maximum(lo, rev + ramp)
+
+    start_ok = lo[:, 0] == 0
+    end_ok = (lo.gather(1, last.unsqueeze(1)).squeeze(1) == hi.squeeze(1)) | (frames == 0)
+    return lo, width, band_scale, ~(start_ok & end_ok)

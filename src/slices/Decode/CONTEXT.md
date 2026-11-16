@@ -1,8 +1,8 @@
 # Decode
 
 ## Purpose
-Transcribe audio with the trained transducer, streaming or offline, via a single-pass RNN-T beam
-search.
+Transcribe audio with the trained transducer, streaming or offline, via a single-pass RNN-T search
+(label-looping greedy or a time-synchronous beam).
 
 ## Entry Point
 - Type: CLI (`streaming_decode.py`) / function call
@@ -22,8 +22,8 @@ search.
 
 ## Notes
 The tie to `TrainAcousticModel` is limited to the model classes it must run: it instantiates
-`TransducerModel` (reaching `model.encoder`, `model.predictor`, `model.joiner`) and imports
-`StreamCache`, the companion type of the encoder's public `streaming_forward` API. The model
+`TransducerModel` (reaching `model.encoder`, `model.predictor`, `model.joiner`, `greedy_decode`)
+and reads `FRONTEND_STRIDE`, the mel frames per 25 Hz encoder frame. The model
 definitions are the artifact contract, so no trainer handlers, collators, or training-specific
 utilities are imported.
 
@@ -43,15 +43,21 @@ running the joiner with the encoder memory zeroed and renormalising over the non
 subtracted. With this repo's stateless predictor that prior is inherently low-order, which is the
 regime LODR argues is the right thing to subtract. `beta = 0` reproduces plain fusion exactly.
 
-**Streaming** feeds the encoder feature-rate chunks of `2·decode.chunk_size` through
-`streaming_forward` with a carried `StreamCache`; offline runs one full-context `forward`. Both
-funnel into the same beam search.
+**Streaming** feeds the encoder `4·decode.chunk_size` mel frames per step through
+`S2Encoder.streaming_forward` with a cache from `init_stream(1, decode.left_context)`: frontend
+tails, each block's conv tail, and a ring of the last `left_context` frames of pre-RoPE keys and
+values per attention block, so the state is constant-size (1.32 M values, 5.3 MB in fp32, at
+5.12 s) for any stream length. Offline runs one full-context `forward`. Both funnel into the same search.
 
-**Known tail approximation.** The streaming path pads the final feature chunk to an aligned size and
-trims the padding-derived output frames. The encoder is bit-exact vs `forward(chunk_size=B)` for
-every aligned frame (see `test_streaming_forward_equivalence`), but for utterances whose
-post-frontend length is odd, the last 1 to 2 output frames differ from the offline reference: the
-padded frames leak into the boundary chunk through same-chunk attention, and the ×8 downsampling
-stack cannot separate fewer than 8 real base frames from padding at its rate. The effect is confined
-to the utterance tail with negligible WER impact. An exact fix would require threading a
-valid-length mask through every streaming module (attention/conv/downsample) and is deferred.
+**Tail.** The final partial chunk is completed and `decode.tail_chunks` (1) whole chunks follow;
+the encoder mean-fills and key-masks everything past `n_valid`, and EVERY output frame is kept.
+Tokens the transducer emits a little late need those frames: dropping them costs ~0.5 dev-other
+WER (`MODEL_ARCHITECTURE.md` §7.3). Streaming equals the batched `TransducerModel.decode_window`
+to fp32 round-off (`test_streaming_forward_equivalence`, `test_streaming_decode`).
+
+**Greedy.** `beam_size == 1` runs the model's label-looping greedy (`TransducerModel.greedy_decode`),
+exact for greedy with one joiner call per emitted token; the beam is the Graves A/B search.
+
+**Emission times.** The response carries the best hypothesis' `token_ids` and `token_emit_s`: per
+token, the audio time it could first be shown (end of its chunk streaming, end of its frame
+offline). Evaluate turns them into per-word emission latency.

@@ -26,18 +26,6 @@ def _write_wav(tmp_path):
     return str(p)
 
 
-def _aligned_wave(feat_chunk: int) -> torch.Tensor:
-    # compute_log_mel yields T = n_samples // hop_length + 1 frames (torchaudio MelSpectrogram,
-    # center=True). Pick n_samples so T lands exactly on a multiple of feat_chunk (itself a
-    # multiple of 2*chunk_lcm() given decode.chunk_size is a chunk_lcm() multiple), so
-    # _stream_encode's tail-padding branch never triggers -- no odd-tail approximation is involved
-    # and the streaming path reproduces the chunked forward frame-for-frame.
-    hop = get_config().audio.hop_length
-    target_frames = feat_chunk * 2  # two full streaming steps, well short of being slow
-    n_samples = (target_frames - 1) * hop
-    return (torch.randn(n_samples) * 0.01).float()
-
-
 def test_streaming_and_offline_paths_run(tmp_path):
     torch.manual_seed(0)
     model = TransducerModel(cmvn_path=None).eval()
@@ -55,6 +43,12 @@ def test_streaming_and_offline_paths_run(tmp_path):
     assert abs(o.rtf - o.decode_s / o.audio_s) < 1e-9
     assert 0.0 <= o.finalize_s <= o.decode_s
     assert len(s.segments) >= 1 and len(o.segments) >= 1
+    # One emission time per token, non-decreasing, and a streaming token is shown at a chunk end.
+    for r in (s, o):
+        assert len(r.token_emit_s) == len(r.token_ids)
+        assert r.token_emit_s == sorted(r.token_emit_s)
+    chunk_s = handler.cfg.decode.chunk_size * 0.04
+    assert all(abs(t / chunk_s - round(t / chunk_s)) < 1e-6 for t in s.token_emit_s)
 
 
 def test_lm_weight_zero_skips_lm_load():
@@ -106,7 +100,7 @@ def test_nbest_for_rescore_separates_acoustic_and_lm(tmp_path, monkeypatch):
         wave = load_audio(path)
         mem, _ = handler._encode(wave, False, 0.0)
         ref = TransducerBeamSearch(model, 4, handler.cfg.decode.max_symbols).search(mem)
-    assert [(e.ids, e.acoustic) for e in nb] == ref  # acoustic beam == pure LM-off search
+    assert [(e.ids, e.acoustic) for e in nb] == [(i, a) for i, a, _ in ref]
     assert all(e.lm == -float(len(e.ids)) for e in nb)  # unweighted LM score attached
     # The internal-LM term is attached unweighted too, so one decode serves the whole beta grid.
     assert all(e.ilm <= 0.0 for e in nb)
@@ -134,7 +128,7 @@ def test_length_bonus_reorders_toward_longer_hypotheses():
     # Stub the searcher: a short hyp leads acoustically by 0.5 over a hyp two tokens longer.
     class _StubSearch:
         def search(self, memory):
-            return [([7], -1.0), ([7, 8, 9], -1.5)]
+            return [([7], -1.0, [0]), ([7, 8, 9], -1.5, [0, 1, 2])]
 
     handler.searcher = _StubSearch()  # type: ignore[assignment]
 
@@ -145,39 +139,28 @@ def test_length_bonus_reorders_toward_longer_hypotheses():
     assert handler._search_rescore(torch.zeros(1, 1, 1))[0][0] == [7, 8, 9]
 
 
-def test_streaming_greedy_equals_chunked_forward_greedy():
-    # Load-bearing equivalence: the STREAMING decode path reproduces greedy decode over the
-    # batched CHUNKED-forward encoder memory exactly. This is test_streaming_forward_equivalence
-    # (streaming_forward(chunk) == forward(chunk_size=B)) lifted to the decode layer: with
-    # beam_size=1, search() is a per-frame greedy decision (blank-continue vs. the single best
-    # non-blank token), a pure function of encoder memory, so identical memory => identical text.
-    #
-    # We deliberately do NOT compare against the OFFLINE path here. _offline_encode uses
-    # chunk_size=0 (full bidirectional context) by design -- that is the spec's lower-WER offline
-    # mode and it can see future frames the causal streaming path never can, so it is intentionally
-    # non-equivalent to streaming. The meaningful invariant is streaming == the SAME chunk-causal
-    # computation done batched, which is what CHUNK=decode.chunk_size gives below.
+def test_streaming_decode_equals_the_batched_decode_window():
+    # The streaming path (bounded cache, completed final chunk, kept tail chunk) reproduces greedy
+    # over the batched decode_window memory exactly: test_streaming_forward_equivalence lifted to
+    # the decode layer.
     torch.manual_seed(0)
     model = TransducerModel(cmvn_path=None).eval()
     handler = StreamingDecoder_Handler(model, _StubTok(), beam_size=1, fuse_lm=False)
-    chunk = handler.cfg.decode.chunk_size  # base-rate chunk the streaming path feeds
-    feat_chunk = 2 * chunk
-    wave = _aligned_wave(feat_chunk)
+    d = handler.cfg.decode
+    wave = (torch.randn(int(1.37 * 16000)) * 0.01).float()  # not chunk-aligned on purpose
     feats = compute_log_mel(wave).unsqueeze(0)
-    lengths = torch.tensor([feats.shape[1]])
     with torch.no_grad():
         s = handler.decode_waveform(wave, streaming=True)
-        # Batched chunk-causal reference memory (same mask streaming induces), decoded via the
-        # same greedy searcher the streaming path used.
-        mem_chunked, out_len = model.encoder(feats, lengths, chunk_size=chunk)
-        ref_ids = handler.searcher.search(mem_chunked[:, : int(out_len[0])])[0][0]
-    assert s.text == handler.tok.decode(ref_ids)
+        mem, keep = model.decode_window(
+            feats, torch.tensor([feats.shape[1]]), d.chunk_size, d.left_context, d.tail_chunks
+        )
+        ids, _ = model.greedy_decode(mem, keep, d.max_symbols)
+    assert s.token_ids == ids[0]
 
 
 def test_length_bonus_override_beats_config():
     # The eval tuner picks length_bonus on dev; it must reach the live rescorer, not be silently
     # overridden by the decode.yaml value (which stays 0.0 as the regression lock).
-    from src.shared_kernel.Config_Adapter import get_config
 
     model = TransducerModel(cmvn_path=None).eval()
     assert get_config().decode.length_bonus == 0.0

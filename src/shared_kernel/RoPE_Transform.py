@@ -1,23 +1,18 @@
-# Pure RoPE tables + application (shared transform)
+# Pure RoPE tables + application (shared transform). The inverse frequencies are built once by the
+# caller and held as a buffer, so a module's forward never reaches get_config() (that breaks a
+# torch.compile graph).
 import torch
 
-from src.shared_kernel.Config_Adapter import get_config
+
+def rope_inv_freq(head_dim: int, base: float) -> torch.Tensor:
+    half = head_dim // 2
+    return 1.0 / (base ** (torch.arange(0, half).float() / half))
 
 
 def rotary_tables(
-    seq_len: int,
-    head_dim: int,
-    device: torch.device,
-    dtype: torch.dtype,
-    pos_offset: int = 0,
+    positions: torch.Tensor, inv_freq: torch.Tensor, dtype: torch.dtype
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # Standard RoPE: pair channels, rotate by position-dependent angles. pos_offset starts
-    # positions at an arbitrary index (streaming chunks / incremental decode).
-    rope_base = get_config().model.rope_base
-    half = head_dim // 2
-    inv_freq = 1.0 / (rope_base ** (torch.arange(0, half, device=device).float() / half))
-    pos = torch.arange(pos_offset, pos_offset + seq_len, device=device).float()
-    angles = torch.outer(pos, inv_freq)
+    angles = torch.outer(positions.float(), inv_freq)
     emb = torch.cat([angles, angles], dim=-1)
     return emb.cos().to(dtype), emb.sin().to(dtype)
 

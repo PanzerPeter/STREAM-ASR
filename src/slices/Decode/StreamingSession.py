@@ -1,8 +1,9 @@
 # A live microphone session for the Demo slice.
 # Audio arrives incrementally (PCM chunks over a WebSocket); this drives the causal encoder
-# chunk-by-chunk and returns a running greedy-transducer hypothesis as a *partial*. When the
-# speaker stops, finalize() re-decodes the fully buffered waveform through the handler's verified
-# offline path (full context, single-pass RNN-T beam search), the authoritative result.
+# chunk-by-chunk with a bounded cache and returns a running label-looping greedy hypothesis as a
+# *partial*. When the speaker stops, finalize() re-decodes the fully buffered waveform offline (full
+# context, beam search): the design's "revise on endpoint" policy, which is the demo's choice and
+# never part of a reported streaming WER.
 #
 # Why two paths: the log-mel front end is center-padded, so a partial recomputed on a growing
 # buffer is only exact away from its trailing edge: perfect for a live caption, wrong for a final
@@ -13,7 +14,7 @@ import torch
 from src.shared_kernel.LogMel_Transform import compute_log_mel
 from src.slices.Decode.StreamingDecode_Response import StreamingDecode_Response
 from src.slices.Decode.StreamingDecoder_Handler import StreamingDecoder_Handler
-from src.slices.TrainAcousticModel.StreamCache import StreamCache
+from src.slices.TrainAcousticModel.DwSepSubsampling import FRONTEND_STRIDE
 
 
 class StreamingSession:
@@ -24,12 +25,12 @@ class StreamingSession:
         self.h = handler
         self.cfg = handler.cfg
         self.device = handler.model.ctc_head.weight.device
-        self.feat_chunk = 2 * self.cfg.decode.chunk_size  # feature-rate frames per encoder step
+        self.feat_chunk = FRONTEND_STRIDE * self.cfg.decode.chunk_size  # mel frames per step
         self.reset()
 
     def reset(self) -> None:
         self.buffer = torch.zeros(0, dtype=torch.float32)  # accumulated 16 kHz mono waveform
-        self.cache = StreamCache.init(self.h.model.encoder, batch_size=1, device=self.device)
+        self.cache = self.h.model.encoder.init_stream(1, self.cfg.decode.left_context, self.device)
         self._mems: list[torch.Tensor] = []  # encoder memory chunks accumulated so far
         self.fed = 0  # feature frames already handed to the encoder
 
@@ -53,8 +54,11 @@ class StreamingSession:
             return ""
         # Greedy over the accumulated memory is cheap and monotonic-enough for live captions; the
         # exact final comes from finalize()'s beam search over the offline-encoded memory.
-        ids = self.h.searcher.greedy(torch.cat(self._mems, dim=1))
-        return self.h.tok.decode(ids)
+        memory = torch.cat(self._mems, dim=1)
+        ids, _ = self.h.model.greedy_decode(
+            memory, torch.tensor([memory.shape[1]]), self.cfg.decode.max_symbols
+        )
+        return self.h.tok.decode(ids[0])
 
     @torch.no_grad()
     def finalize(self) -> StreamingDecode_Response:

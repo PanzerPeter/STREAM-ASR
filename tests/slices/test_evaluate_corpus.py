@@ -30,6 +30,8 @@ class _StubDecoder:
             audio_s=audio_s,
             finalize_s=finalize_s,
             first_partial_latency_s=0.05 if streaming else None,
+            token_ids=[],
+            token_emit_s=[],
         )
 
 
@@ -216,3 +218,28 @@ def test_each_split_binds_its_own_dev_manifest_and_report_path():
         assert split.test_manifest != split.dev_manifest
     paths = {_cfg().eval.report_path.format(split=n) for n in _SPLITS}
     assert len(paths) == len(_SPLITS)
+
+
+def test_handler_reports_edge_errors_and_probed_latency(tmp_path):
+    # Edge regions count reference words: "THE CAT" + "HELLO WORLD" are first-2 words, "SAT" a
+    # last-2 word; the one substitution (WORLD -> WORD) is a first-2 error. Latency comes from the
+    # probe, and only on streaming passes.
+    manifest, dec = _two_utt_fixture(
+        tmp_path, ("THE CAT SAT", "HELLO WORLD"), ("THE CAT SAT", "HELLO WORD")
+    )
+    calls: list[str] = []
+
+    def probe(wave, ref, resp):
+        calls.append(ref)
+        return [0.1, 0.3]
+
+    handler = EvaluateCorpus_Handler(dec, latency_probe=probe)
+    offline = handler.run(
+        EvaluateCorpus_Command(manifest_path=manifest, mode="offline", ablation_stage="beam")
+    )
+    assert abs(offline.first_err - 0.25) < 1e-9 and offline.last_err == 0.0
+    assert offline.emission_latency_median_s is None and not calls
+    stream = handler.run(
+        EvaluateCorpus_Command(manifest_path=manifest, mode="streaming", ablation_stage="beam")
+    )
+    assert len(calls) == 2 and abs(stream.emission_latency_median_s - 0.2) < 1e-9

@@ -1,26 +1,17 @@
-# Streaming/offline single-pass RNN-T decoder. chunk_size is in BASE-rate (50 fps) frames and MUST
-# be a multiple of ZipformerEncoder.chunk_lcm(); the handler feeds the encoder 2*chunk_size feature
-# frames per step.
-chunk_size: 16
+# Streaming/offline single-pass RNN-T decoder (MODEL_ARCHITECTURE.md §7, §8). chunk_size and
+# left_context count 25 Hz frames (40 ms) and must be multiples of 4 (the encoder's chunk_lcm). The
+# handler feeds 4 * chunk_size mel frames per step.
+chunk_size: 8                # 320 ms
+left_context: 128            # 5.12 s of attention history per stream; -1 = unlimited
+# Whole chunks of CMVN-mean fill fed after the audio, with every output frame KEPT, so tokens the
+# model emits late still have frames to land on (§7.3).
+tail_chunks: 1
 beam_size: 10
 max_symbols: 5               # max non-blank emissions per encoder frame
 lm_checkpoint: data/checkpoints/lm_best.pt
-
-# n-best re-ranking: acoustic + lm_weight*lm - ilm_weight*ilm + length_bonus*len. All three weights
-# default to 0.0, which reproduces the pure-acoustic decoder exactly (the regression lock), and all
-# three are swept together by evaluate.py's dev sweep (automatic unless --no-tune).
-# alpha: external STREAM-LM sequence score. Dev-tuned 2026-08-28 on the 600k model: 0.5 offline /
-# 0.7 streaming on clean, 0.7 / 1.1 on other -- all interior to the grid, so the v1.0 "alpha is
-# pinned at the top of --lm-grid" caveat is discharged. The harder the acoustics, the more external
-# LM the beam wants.
+# n-best re-ranking: acoustic + lm_weight * lm - ilm_weight * ilm + length_bonus * len. All 0.0 =
+# the pure-acoustic decoder (the regression lock). evaluate.py tunes all three on dev per split
+# and mode; the release's tuned values are in MODEL_ARCHITECTURE.md §12.
 lm_weight: 0.0
-# beta: subtracts the language prior the transducer's own predictor+joiner already carries, so the
-# external LM is not counted on top of it. Useful range ~[0.0, 0.6], and it must stay below
-# alpha, or the net prior flips sign. Dev-tuned 2026-08-28: clean 0.3 offline / 0.2 streaming,
-# other 0.4 offline / 0.5 streaming.
-# It tracks alpha, since both scale with how much of the score the beam wants from the LM.
 ilm_weight: 0.0
-# Per-token bonus offsetting RNN-T's un-normalised deletion bias. Dev-tuned 2026-08-28: clean 0.25
-# offline / 0.5 streaming, other 0.25 / 1.0. dev-other streaming selected 1.0, which is the TOP of
-# evaluate.py's 5-point grid, and the sweep warned about it -- widen that axis before trusting it.
 length_bonus: 0.0

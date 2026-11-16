@@ -19,3 +19,7 @@ class SentencePieceTokenizer:
 
     def decode(self, ids: list[int]) -> str:
         return self._sp.DecodeIds(ids)
+
+    def is_word_start(self, token_id: int) -> bool:
+        # SentencePiece marks the first piece of every word with U+2581.
+        return self._sp.IdToPiece(token_id).startswith("\u2581")

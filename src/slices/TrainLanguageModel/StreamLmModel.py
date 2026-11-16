@@ -1,13 +1,13 @@
-# STREAM-LM: deep-narrow causal Transformer. Reuses shared BiasNorm/SwiGluFfn + RoPE; adds GQA
+# STREAM-LM: deep-narrow causal Transformer (BiasNorm, SwiGLU FFN, RoPE) with GQA
 # (CausalGqaAttention), QK-norm, tied embeddings, and value-residual (layer-0 values injected into
 # every deeper layer). Inference exposes a full-sequence scorer for n-best rescoring.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.shared_kernel.BiasNorm import BiasNorm
-from src.shared_kernel.SwiGluFfn import SwiGluFfn
 from src.shared_kernel.Config_Adapter import get_config
+from src.slices.TrainLanguageModel.BiasNorm import BiasNorm
+from src.slices.TrainLanguageModel.SwiGluFfn import SwiGluFfn
 from src.slices.TrainLanguageModel.CausalGqaAttention import CausalGqaAttention
 
 

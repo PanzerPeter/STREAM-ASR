@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from src.shared_kernel.Config_Adapter import get_config, StreamConfig
+from src.shared_kernel.Config_Adapter import StreamConfig, get_config
 
 
 def test_loads_representative_values():
@@ -12,13 +12,11 @@ def test_loads_representative_values():
     assert isinstance(cfg, StreamConfig)
     assert cfg.audio.sample_rate == 16000
     assert cfg.audio.n_mels == 80
-    assert cfg.model.encoder_dims == (192, 256, 384, 512, 384, 256)
+    assert cfg.model.stack_dims == (256, 384, 512, 384)
+    assert cfg.model.stack_blocks == (4, 8, 0, 8)
     assert cfg.model.vocab_size == 500
     assert cfg.training.transducer.total_steps == 600000
-    # lr_peak lives solely in optim.yaml (adamw_lr/muon_lr), not per-stage.
-    # warmup is 2500 optimizer updates expressed in loader batches, so it tracks grad_accum rather
-    # than total_steps -- the transient it covers is measured in updates, not in run length.
-    assert cfg.training.transducer.warmup_steps == 2500 * cfg.training.transducer.grad_accum
+    assert cfg.training.transducer.warmup_steps == 5000
 
 
 def test_derived_values():
@@ -29,7 +27,7 @@ def test_derived_values():
 
 def test_lists_coerce_to_tuples():
     cfg = get_config()
-    assert isinstance(cfg.model.encoder_dims, tuple)
+    assert isinstance(cfg.model.stack_dims, tuple)
 
 
 def test_validation_rejects_bad_type(tmp_path):
@@ -44,7 +42,6 @@ def test_validation_rejects_bad_type(tmp_path):
         "lm.yaml",
         "eval.yaml",
         "optim.yaml",
-        "pretrain.yaml",
         "transducer.yaml",
     ]:
         shutil.copy(src / name, tmp_path / name)
@@ -75,3 +72,12 @@ def test_decode_config_loads():
 def test_features_config_present():
     cfg = get_config()
     assert cfg.features.cache_dir == "data/features/mel"
+
+
+def test_an_unknown_model_key_is_an_error(tmp_path):
+    # A misspelt architecture knob must not train the default model in silence.
+    shutil.copytree("config", tmp_path, dirs_exist_ok=True)
+    model = tmp_path / "model.yaml"
+    model.write_text(model.read_text() + "block_order: parallel\n")
+    with pytest.raises(ValidationError, match="block_order"):
+        get_config(str(tmp_path))

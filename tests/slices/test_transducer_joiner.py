@@ -3,47 +3,49 @@ import torch
 from src.shared_kernel.Config_Adapter import get_config
 from src.slices.TrainAcousticModel.TransducerJoiner import TransducerJoiner
 
+_DE = 384
+
+
+def _inputs(seed: int, t: int = 5, u1: int = 4):
+    torch.manual_seed(seed)
+    return torch.randn(2, t, _DE), torch.randn(2, u1, get_config().transducer.predictor_dim)
+
 
 def test_forward_lattice_shape_is_padded_to_a_tensor_core_alignment():
-    torch.manual_seed(0)
-    j = TransducerJoiner().eval()
-    De = get_config().model.encoder_dims[-1]
-    Dp = get_config().transducer.predictor_dim
+    j = TransducerJoiner(_DE).eval()
     V = get_config().model.logits_width
-    enc = torch.randn(2, 5, De)
-    pred = torch.randn(2, 4, Dp)
-    out = j(enc, pred)
-    assert out.shape == (2, 5, 4, V + (-V % 8))
-    assert out.shape[3] % 8 == 0
+    out = j(*_inputs(0))
+    assert out.shape == (2, 5, 4, V + (-V % 8)) and out.shape[3] % 8 == 0
 
 
 def test_padded_readout_columns_carry_exactly_zero_probability():
-    # The readout is widened only to align the lattice GEMM. The extra columns must be inert: -inf
-    # logits, hence exactly-zero softmax mass, so every log-softmax, gather and gradient downstream
-    # is the unpadded result. Anything finite there would silently steal probability from the vocab.
-    torch.manual_seed(2)
-    j = TransducerJoiner().eval()
+    j = TransducerJoiner(_DE).eval()
     V = get_config().model.logits_width
-    enc = torch.randn(2, 3, get_config().model.encoder_dims[-1])
-    pred = torch.randn(2, 2, get_config().transducer.predictor_dim)
     with torch.no_grad():
-        out = j(enc, pred)
+        out = j(*_inputs(2, 3, 2))
     assert torch.all(torch.isneginf(out[..., V:]))
-    probs = out.softmax(-1)
-    assert torch.all(probs[..., V:] == 0.0)  # exactly, not approximately
-    assert torch.allclose(probs[..., :V], out[..., :V].softmax(-1))
+    assert torch.all(out.softmax(-1)[..., V:] == 0.0)
+
+
+def test_band_cells_equal_the_full_lattice_cells():
+    # The band evaluates exactly the full lattice's cells at u = lo + j, nothing else.
+    j = TransducerJoiner(_DE).eval()
+    enc, pred = _inputs(1, t=6, u1=7)
+    lo = torch.tensor([[0, 0, 1, 2, 3, 4], [0, 1, 1, 2, 2, 4]])
+    cols = lo.unsqueeze(2) + torch.arange(3)
+    with torch.no_grad():
+        full = j(enc, pred)
+        band = j(enc, pred, cols)
+    expected = full.gather(2, cols.unsqueeze(3).expand(-1, -1, -1, full.shape[3]))
+    assert torch.equal(band, expected)
 
 
 def test_step_matches_full_lattice():
-    torch.manual_seed(1)
-    j = TransducerJoiner().eval()
-    De = get_config().model.encoder_dims[-1]
-    Dp = get_config().transducer.predictor_dim
+    j = TransducerJoiner(_DE).eval()
     V = get_config().model.logits_width
-    enc = torch.randn(1, 3, De)
-    pred = torch.randn(1, 2, Dp)
+    enc, pred = _inputs(1, 3, 2)
     with torch.no_grad():
-        full = j(enc, pred)  # [1, 3, 2, V + pad]
-        cell = j.step(enc[:, 1], pred[:, 0])  # [1, V] -- decode never pays for the padding
+        full = j(enc[:1], pred[:1])
+        cell = j.step(enc[:1, 1], pred[:1, 0])
     assert cell.shape == (1, V)
     assert torch.allclose(full[:, 1, 0, :V], cell, atol=1e-5)

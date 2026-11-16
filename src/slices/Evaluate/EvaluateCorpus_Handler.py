@@ -1,7 +1,9 @@
 # Corpus evaluation driver: runs the Decode slice's handler per utterance and aggregates WER/CER
 # (jiwer) + timing. The decoder is pre-configured for its ablation stage by the caller, so this
 # harness stays stage-agnostic (one loop produces every row of the ablation table).
+import statistics
 from collections import deque
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Protocol
 
@@ -12,11 +14,16 @@ from src.slices.Evaluate.EvaluateCorpus_Command import EvaluateCorpus_Command
 from src.slices.Evaluate.EvaluateCorpus_Response import EvaluateCorpus_Response
 from src.slices.Evaluate.Metrics import char_errors, word_errors
 from src.slices.Evaluate.Progress import Progress
+from src.slices.Evaluate.WordTiming import EdgeCounts
 
 # How many utterances' audio to decode from FLAC ahead of the model. Loading is libsndfile +
 # resample on the CPU and the GPU has nothing to do during it, so one worker running one utterance
 # ahead takes it off the critical path entirely; more than that only buys queue depth we never use.
 _PREFETCH = 2
+_P90 = 9  # index of the 90th percentile in statistics.quantiles(n=10)
+
+# (waveform, reference text, decode response) -> per-word emission latencies of that utterance.
+LatencyProbe = Callable[[torch.Tensor, str, Any], list[float]]
 
 
 class _Decoder(Protocol):
@@ -36,8 +43,11 @@ def subsample(rows: list[dict[str, Any]], limit: int | None) -> list[dict[str, A
 
 
 class EvaluateCorpus_Handler:
-    def __init__(self, decoder: _Decoder, label: str = "") -> None:
+    def __init__(
+        self, decoder: _Decoder, label: str = "", latency_probe: LatencyProbe | None = None
+    ) -> None:
         self.decoder = decoder
+        self.latency_probe = latency_probe
         # Free-text tag prefixing the per-utterance heartbeat so parallel stages stay
         # distinguishable in the interleaved log; falls back to stage/mode when the caller omits it.
         self.label = label
@@ -49,6 +59,8 @@ class EvaluateCorpus_Handler:
         w_err = w_ref = c_err = c_ref = 0
         audio_s = decode_s = finalize_s = 0.0
         lats: list[float] = []
+        word_lats: list[float] = []
+        edges = EdgeCounts()
 
         # Audio IO runs one utterance ahead of the model on its own thread; the decode timings the
         # response carries start after the waveform is in hand, so prefetching cannot flatter them.
@@ -65,6 +77,9 @@ class EvaluateCorpus_Handler:
                 resp = self.decoder.decode_waveform(wave, streaming)
                 we, wn = word_errors(r["text"], resp.text)
                 ce, cn = char_errors(r["text"], resp.text)
+                edges.add(r["text"], resp.text)
+                if streaming and self.latency_probe is not None:
+                    word_lats += self.latency_probe(wave, r["text"], resp)
                 w_err, w_ref, c_err, c_ref = w_err + we, w_ref + wn, c_err + ce, c_ref + cn
                 audio_s += resp.audio_s
                 decode_s += resp.decode_s
@@ -77,6 +92,7 @@ class EvaluateCorpus_Handler:
         prog.done(f"WER={100 * w_err / max(1, w_ref):.2f}%")
 
         timed = cmd.measure_timing
+        p90 = statistics.quantiles(word_lats, n=10)[_P90 - 1] if len(word_lats) > 1 else None
         return EvaluateCorpus_Response(
             stage=cmd.ablation_stage,
             mode=cmd.mode,
@@ -92,4 +108,7 @@ class EvaluateCorpus_Handler:
             rtf=(decode_s / max(audio_s, 1e-6)) if timed else None,
             latency_s=(sum(lats) / len(lats)) if (timed and lats) else None,
             finalize_s=(finalize_s / len(rows)) if (timed and rows) else None,
+            **edges.rates(),
+            emission_latency_median_s=statistics.median(word_lats) if word_lats else None,
+            emission_latency_p90_s=p90,
         )

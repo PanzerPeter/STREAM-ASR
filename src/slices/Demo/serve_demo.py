@@ -41,7 +41,7 @@ def main() -> None:
         "--beam-size",
         type=int,
         default=None,
-        help="beam width; 1 = greedy (faster, ~0.8 abs WER worse). Default: decode.beam_size",
+        help="beam width; 1 = label-looping greedy (faster). Default: decode.beam_size",
     )
     args = ap.parse_args()
 

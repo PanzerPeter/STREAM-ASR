@@ -1,8 +1,10 @@
-# RNN-T transducer architecture. Arch params only: the training loop's hyperparameters live in
-# training.yaml's `transducer:` section, decode params in decode.yaml.
-predictor_dim: 512        # token embedding width == stateless-predictor output width
-predictor_context: 2      # depthwise Conv1d left context (icefall-style stateless predictor)
-joiner_dim: 512           # additive joiner hidden width
-ctc_aux_weight: 0.2       # total = rnnt + ctc_aux_weight*ctc + sum(interctc_weights*interctc_k)
-interctc_layers: [3, 4]   # tap after the two widest encoder stacks (base-rate ~50Hz)
-interctc_weights: [0.15, 0.15]
+# RNN-T heads and objective (MODEL_ARCHITECTURE.md §6). Architecture and loss weights only: the
+# schedule is in training.yaml, decode settings in decode.yaml.
+predictor_dim: 512
+predictor_context: 2
+joiner_dim: 512
+# total = rnnt + ctc_loss_scale * ctc, both divided by the batch's token count (§6.4).
+ctc_loss_scale: 0.5
+# Banded RNN-T (§6.5): W tokens of lattice per frame around the CTC head's cumulative occupancy,
+# so W + 1 cells. 0 = the full lattice always.
+band_width: 16

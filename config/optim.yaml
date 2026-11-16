@@ -1,13 +1,6 @@
-# Optimizer settings, shared by every trainer: 2D hidden weights go to Muon, everything else to
-# AdamW.
-muon_lr: 2.0e-2
-adamw_lr: 1.5e-3
+# 2-D hidden matrices go to Muon, everything else to AdamW (MODEL_ARCHITECTURE.md §9.2).
+muon_lr: 1.0e-2
+adamw_lr: 7.5e-4
 muon_momentum: 0.95
 ns_steps: 5
 weight_decay: 1.0e-2
-# Discriminative fine-tuning. The encoder is BEST-RQ-pretrained while predictor/joiner/heads start
-# fresh, so a single peak LR erodes the pretrained features once the RNN-T gradient engages (seen
-# as InterCTC climbing and dev-WER backing off ~10k steps past the LR peak). Scales the encoder's
-# Muon+AdamW peaks so fresh modules adapt fast and the encoder is nudged, not overwritten.
-# 1.0 = disabled (uniform LR); tune in ~[0.25, 0.5].
-encoder_lr_scale: 0.5

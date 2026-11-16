@@ -38,6 +38,8 @@ class _StubHandler:
             audio_s=1.0,
             finalize_s=0.01,
             first_partial_latency_s=0.0,
+            token_ids=[],
+            token_emit_s=[],
         )
 
 
@@ -106,7 +108,7 @@ def test_config_route_reports_the_resolved_decode_settings():
     assert body["checkpoint"] == "transducer_avg.pt"  # basename only, not the whole local path
     assert body["beam_size"] == 10
     assert body["lm"] == {"alpha": 0.6, "beta": 0.2}
-    assert body["chunk_ms"] == round(1000 * get_config().decode.chunk_size / 50)
+    assert body["chunk_ms"] == round(1000 * get_config().decode.chunk_size / 25)
 
 
 def test_config_route_reports_an_absent_lm_as_null():

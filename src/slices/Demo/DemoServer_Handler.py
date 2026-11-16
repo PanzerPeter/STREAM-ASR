@@ -23,7 +23,7 @@ _EOF = "__eof__"  # client marks end-of-utterance so the server runs the final o
 # a short recording (a video, a dataset tarball) would be read in full before it could be rejected.
 # 64 MiB is ~35 min of 16 kHz mono WAV, past any plausible demo clip.
 _MAX_UPLOAD_BYTES = 64 * 1024 * 1024
-_BASE_FRAME_RATE = 50.0  # decode.chunk_size is counted in base-rate encoder frames
+_CHUNK_FRAME_RATE = 25.0  # decode.chunk_size is counted in 25 Hz encoder frames
 
 
 def build_app(handler: StreamingDecoder_Handler, checkpoint: str) -> FastAPI:
@@ -51,7 +51,7 @@ def build_app(handler: StreamingDecoder_Handler, checkpoint: str) -> FastAPI:
                 "checkpoint": Path(checkpoint).name,
                 "beam_size": handler.beam_size,
                 "lm": lm,
-                "chunk_ms": round(1000.0 * handler.cfg.decode.chunk_size / _BASE_FRAME_RATE),
+                "chunk_ms": round(1000.0 * handler.cfg.decode.chunk_size / _CHUNK_FRAME_RATE),
             }
         )
 

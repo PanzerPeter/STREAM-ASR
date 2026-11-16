@@ -8,7 +8,7 @@ release/**/*.safetensors
 *.model
 !release/**/*.model
 *.vocab
-docs/
+docs/superpowers/
 CLAUDE.md
 .claude/
 .mypy_cache/

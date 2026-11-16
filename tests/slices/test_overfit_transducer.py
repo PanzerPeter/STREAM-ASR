@@ -19,7 +19,7 @@ def test_transducer_overfits_one_batch():
     first = None
     for _ in range(60):
         opt.zero_grad(set_to_none=True)
-        total, *_ = model.joint_loss(batch, chunk_size=0)
+        total = model.joint_loss(batch, 0, -1, use_band=False).total
         total.backward()
         opt.step()
         first = first if first is not None else total.item()

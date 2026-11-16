@@ -17,12 +17,14 @@ text, used by the Decode slice to rescore the acoustic decoder's n-best list.
 ## Shared Kernel
 - `Config_Adapter.get_config().lm`: every model and schedule hyperparameter.
 - `Tokenizer_Adapter.SentencePieceTokenizer`: the acoustic model's BPE-500 vocab, shared verbatim.
-- `BiasNorm`, `SwiGluFfn`, `RoPE_Transform`: blocks shared with the acoustic encoder.
+- `RoPE_Transform`: rotary tables (inverse frequencies built once, held as a buffer).
 - `Optimizer_Adapter.partition_params` / `Muon_Optimizer`: the same Muon + AdamW split.
 - `Checkpoint_Adapter`, `SignalGuard`: atomic checkpointing plus interrupt-safe resume.
 
 ## Model
-Deep-narrow causal Transformer: `BiasNorm` + `SwiGluFfn` (shared with the acoustic encoder),
+Deep-narrow causal Transformer: `BiasNorm` + `SwiGluFfn` (slice-local, since the acoustic model
+uses neither; `BiasNorm`'s window lives in `config/lm.yaml` because it is part of the shipped
+`lm_best.pt`'s function),
 `CausalGqaAttention` (grouped-query attention with RoPE and QK-norm), tied input/output
 embeddings, and value-residual (layer-0 attention values injected into every deeper layer,
 `value_residual_lambda`). All hyperparameters come from `config/lm.yaml` via `get_config().lm`
@@ -32,15 +34,15 @@ embeddings, and value-residual (layer-0 attention values injected into every dee
 ## Training loop
 `TrainLm_Handler.run`: Muon on the block weight matrices plus AdamW (`betas=(0.9, 0.95)`,
 `weight_decay`) on the tied embedding/readout and the norms. That is the same split the acoustic
-stack uses, via the shared `Optimizer_Adapter.partition_params`. Linear warmup -> cosine decay applied as a shape multiplier on each
-group's own peak LR, bf16 autocast on CUDA (fp32 on CPU), gradient clipping, and an optional
+stack uses, via the shared `Optimizer_Adapter.partition_params`. Linear warmup -> cosine decay
+applied as a shape multiplier on each group's own peak LR, bf16 autocast on CUDA (fp32 on CPU), gradient clipping, and an optional
 `lm.z_loss` term squaring the softmax log-normaliser to keep the logits from drifting. Evaluates
 val perplexity (bounded to `_VAL_WINDOWS = 1280` windows, so the bound is independent of
 `grad_accum`) every `eval_interval` steps and on the final step, checkpointing whenever perplexity
 improves. `TrainLm_Command.max_steps` caps the run below `lm.total_steps` for smoke/overfit tests;
 production training uses the full `total_steps`.
 
-Resumable and interrupt-safe on the same harness as the acoustic trainers: `lm_last.pt` is written
+Resumable and interrupt-safe on the same harness as the transducer trainer: `lm_last.pt` is written
 every `ckpt_every` steps, `resume_if_available` restores model, both optimizers, RNG and step on the
 next launch (`--fresh` opts out), and `SignalGuard` turns Ctrl-C into a checkpoint-then-exit at the
 next step boundary. The best-so-far val perplexity travels in the checkpoint's `extra` so a resumed

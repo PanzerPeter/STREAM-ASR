@@ -24,7 +24,6 @@ class FrameBucketSampler(Sampler):
         seed: int = 0,
         max_tokens_per_batch: int | None = None,
         max_lattice_per_batch: int | None = None,
-        token_sort_window: int = 1,
     ) -> None:
         hop_length = get_config().audio.hop_length
         rows = [json.loads(line) for line in open(manifest, encoding="utf-8")]
@@ -38,30 +37,8 @@ class FrameBucketSampler(Sampler):
         self._shuffle = shuffle
         self._seed = seed
         self._epoch = 0
-        self._order = self._sorted_order(token_sort_window)
+        self._order = sorted(range(len(self._frames)), key=lambda i: self._frames[i])
         self._batches: list[list[int]] | None = None
-
-    def _sorted_order(self, window: int) -> list[int]:
-        # Duration-sorted, then re-sorted by transcript length inside a sliding window of that
-        # order. Frame bucketing alone leaves the RNN-T lattice padded in U: two utterances of the
-        # same duration can differ 2x in token count (speaking rate), and the full [B,T,U+1,V]
-        # lattice is charged at the batch's *max* U, not its mean. Measured over the 281k utterances
-        # of train.jsonl: lattice padding waste 21.6% -> 13.9% (8.8% fewer cells for the same audio,
-        # on a term worth ~26% of the step), frame padding still 0.2%, 138 -> 126 ms/step.
-        #
-        # A window is a compromise in both directions: too narrow and there is no token spread to
-        # exploit, too wide and it starts trading frame padding for token padding. 256/1024/4096
-        # measure 15.0/13.9/15.3% waste.
-        #
-        # Set from training.transducer.token_sort_window; see that key for why it defaults to off.
-        order = sorted(range(len(self._frames)), key=lambda i: self._frames[i])
-        if window <= 1 or self._max_tokens is None:
-            return order
-        return [
-            i
-            for start in range(0, len(order), window)
-            for i in sorted(order[start : start + window], key=lambda j: self._tokens[j])
-        ]
 
     def _batch_list(self) -> list[list[int]]:
         # The greedy fill reads only the (fixed) sort order and the three budgets, so it returns the
@@ -77,10 +54,9 @@ class FrameBucketSampler(Sampler):
         # *product* budget bounds its worst case: B x max(frames) x max(tokens) is a quantity two
         # independent sum caps never bound, and the densest batch of an epoch runs 1.7x the p99.9
         # one. Under the full objective that product was peak VRAM itself (the [B,T,U+1,V] lattice)
-        # and leaving it uncapped showed up as periodic "CUDA OOM - batch dropped". Under the pruned
-        # objective the real lattice no longer scales with U, but the simple loss still streams the
-        # same product through its frame-slab loop, so the cap now bounds bandwidth rather than
-        # VRAM -- a looser constraint, but the tail it clips is the same tail.
+        # and leaving it uncapped showed up as periodic "CUDA OOM - batch dropped". It binds during
+        # the transducer's full-lattice band warmup; once the band is on the lattice no longer
+        # scales with U and the encoder sets the peak.
         batches: list[list[int]] = []
         batch: list[int] = []
         frame_budget = 0

@@ -3,7 +3,7 @@ from functools import lru_cache
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, computed_field
+from pydantic import BaseModel, ConfigDict, computed_field
 
 _CONFIG_DIR = Path(__file__).resolve().parents[2] / "config"
 
@@ -22,6 +22,7 @@ class AugmentConfig(BaseModel):
     specaug_freq_width: int
     specaug_time_ratio: float
     specaug_max_time_masks: int
+    specaug_max_time_fraction: float
 
 
 class FeaturesConfig(BaseModel):
@@ -29,24 +30,18 @@ class FeaturesConfig(BaseModel):
 
 
 class ModelConfig(BaseModel):
+    # An unknown key is an error, not a no-op: a misspelt architecture knob would otherwise train
+    # the default model while the YAML claims otherwise.
+    model_config = ConfigDict(extra="forbid")
+
     frontend_channels: int
-    encoder_dims: tuple[int, ...]
-    encoder_downsampling: tuple[int, ...]
-    encoder_layers: tuple[int, ...]
-    encoder_heads: tuple[int, ...]
-    ffn_expansion: int
+    stack_dims: tuple[int, int, int, int]
+    stack_blocks: tuple[int, int, int, int]
+    head_dim: int
     conv_kernel_size: int
-    encoder_dropout: float
-    final_downsample: int
+    gate_floor: float
+    gate_init: float
     rope_base: float
-    encoder_value_residual_lambda: float
-    biasnorm_log_scale_min: float
-    biasnorm_log_scale_max: float
-    biasnorm_max_amplification: float
-    stack_bypass_min: float
-    stack_in_proj_max_sigma: float
-    trunk_norm: bool
-    trunk_norm_log_scale_max: float
     vocab_size: int
 
     @computed_field  # type: ignore[prop-decorator]
@@ -92,51 +87,34 @@ class TransducerConfig(BaseModel):
     predictor_dim: int
     predictor_context: int
     joiner_dim: int
-    ctc_aux_weight: float
-    interctc_layers: tuple[int, ...]
-    interctc_weights: tuple[float, ...]
+    ctc_loss_scale: float
+    band_width: int
 
 
 class TransducerTrainConfig(BaseModel):
     max_frames_per_batch: int
     max_tokens_per_batch: int
     max_lattice_per_batch: int
-    # Width of the sliding window the duration sort is re-sorted by transcript length inside, so a
-    # batch is homogeneous in U as well as in T. 1 = off (plain duration sort).
-    token_sort_window: int = 1
     grad_accum: int
     warmup_steps: int
     total_steps: int
-    # LR shape after warmup (WSD): hold peak until the last lr_decay_frac of total_steps, then a
-    # 1-sqrt anneal to lr_min_ratio * peak, landing at total_steps exactly.
-    lr_decay_frac: float = 0.25
-    lr_min_ratio: float = 0.0
+    lr_decay_frac: float
+    lr_min_ratio: float
+    branch_points: tuple[int, ...]
     grad_clip: float
-    # Runaway detector (see _train_utils.GradNormGuard). grad_clip cannot serve as one:
-    # Newton-Schulz
-    # renormalises Muon's update, so clipping the gradient does not bound the step for any of the
-    # encoder's 2D matrices. Sampled at log_every, where the grad norm is already synced to host.
-    guard_window: int = 20  # log windows in the trend median; 0 disables the guard entirely
-    guard_trend_factor: float = (
-        4.0  # trip when that median exceeds this x the run's quietest median
-    )
-    guard_patience: int = 3  # consecutive tripped windows before the run aborts
+    guard_window: int
+    guard_trend_factor: float
+    guard_patience: int
     log_every: int
     val_every: int
     ckpt_every: int
-    grad_checkpoint: bool = False
-    # Selective torch.compile of the elementwise leaf modules (see
-    # _train_utils.compile_hot_modules). NOT whole-model compilation, which this build cannot do.
-    compile_modules: bool = True
-    seed: int = 42
+    keep_last_n: int
+    band_warmup_steps: int
+    compile_blocks: bool
+    seed: int
     chunk_sizes: tuple[int, ...]
-    warm_start: str
-    dev_wer_utts: int = 200
-    spec_augment: bool = True
-    # Rolling snapshots kept for post-training checkpoint averaging (icefall/ESPnet-style). Every
-    # ckpt_every steps the trainer writes transducer_step{N}.pt, pruned to the newest keep_last_n;
-    # scripts/average_checkpoints.py means their weights into one decode checkpoint. 0 disables.
-    keep_last_n: int = 5
+    left_contexts: tuple[int, ...]
+    spec_augment: bool
 
 
 class TrainingConfig(BaseModel):
@@ -145,18 +123,14 @@ class TrainingConfig(BaseModel):
 
 class DecodeConfig(BaseModel):
     chunk_size: int
+    left_context: int
+    tail_chunks: int
     beam_size: int
-    lm_weight: float
-    lm_checkpoint: str
     max_symbols: int
-    # ILME subtraction weight (beta): score -= ilm_weight * internal-LM logprob. Cancels the
-    # transducer's own language prior so the external LM is not counted on top of it. 0.0 = off.
-    ilm_weight: float = 0.0
-    # Per-token bonus added to each hyp at n-best re-ranking (score += length_bonus*len(ids)).
-    # RNN-T acoustic scores are un-normalised sums of emission log-probs, so every extra token only
-    # lowers the score -- a standing bias toward deletions. A small positive bonus offsets it. 0.0 =
-    # off (regression lock); swept alongside lm_weight in the eval tuner.
-    length_bonus: float = 0.0
+    lm_checkpoint: str
+    lm_weight: float
+    ilm_weight: float
+    length_bonus: float
 
 
 class LmConfig(BaseModel):
@@ -168,6 +142,10 @@ class LmConfig(BaseModel):
     dropout: float
     context_len: int
     value_residual_lambda: float
+    norm_log_scale_min: float
+    norm_log_scale_max: float
+    norm_max_amplification: float
+    norm_eps: float
     muon_lr: float
     z_loss: float
     lr_peak: float
@@ -200,30 +178,6 @@ class OptimConfig(BaseModel):
     muon_momentum: float
     ns_steps: int
     weight_decay: float
-    encoder_lr_scale: float = 1.0
-
-
-class PretrainConfig(BaseModel):
-    lr_scale: float
-    codebook_size: int
-    codebook_dim: int
-    num_codebooks: int
-    mask_prob: float
-    mask_span: int
-    noise_std: float
-    stack_frames: int
-    chunk_sizes: list[int]
-    warmup_steps: int
-    total_steps: int
-    lr_decay_frac: float
-    lr_min_ratio: float
-    seed: int
-    grad_clip: float
-    log_every: int
-    save_every: int
-    dev_every: int
-    dev_batches: int
-    max_frames_per_batch: int
 
 
 class StreamConfig(BaseModel):
@@ -236,14 +190,12 @@ class StreamConfig(BaseModel):
     lm: LmConfig
     eval: EvalConfig
     optim: OptimConfig
-    pretrain: PretrainConfig
     transducer: TransducerConfig
 
 
 @lru_cache(maxsize=None)
 def get_config(config_dir: str | None = None) -> StreamConfig:
     root = Path(config_dir) if config_dir else _CONFIG_DIR
-    # One YAML per top-level section, named after it.
     return StreamConfig(
         **{k: yaml.safe_load((root / f"{k}.yaml").read_text()) for k in StreamConfig.model_fields}
     )

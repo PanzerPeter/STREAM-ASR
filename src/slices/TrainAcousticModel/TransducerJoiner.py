@@ -6,26 +6,21 @@ from src.shared_kernel.Config_Adapter import get_config
 
 
 class TransducerJoiner(nn.Module):
-    """Standard additive RNN-T joiner: project encoder memory and predictor output into a shared
-    joiner space, sum, tanh, then a readout to the vocab+blank width. Training materialises the
-    full [B, T, U+1, V] lattice for the RNN-T loss; decoding evaluates one (t, u) cell at a time."""
+    """Additive RNN-T joiner: project encoder memory and predictor output into a shared joiner
+    space, sum, tanh, then a readout to vocab+blank. Training evaluates it on the full
+    [B, T, U+1] lattice (band warmup) or on the band only; decoding one (t, u) cell at a time."""
 
-    def __init__(self) -> None:
+    def __init__(self, encoder_dim: int) -> None:
         super().__init__()
         model = get_config().model
         t = get_config().transducer
-        self.enc_proj = nn.Linear(model.encoder_dims[-1], t.joiner_dim)
+        self.enc_proj = nn.Linear(encoder_dim, t.joiner_dim)
         self.pred_proj = nn.Linear(t.predictor_dim, t.joiner_dim)
         self.out = nn.Linear(t.joiner_dim, model.logits_width)
-        # The readout is the model's largest GEMM by a wide margin (it is the only one that runs
-        # over the whole [B, T, U+1] lattice), and its N is logits_width = vocab + blank = 501.
-        # A bf16 tensor-core GEMM needs its N stride 16-byte aligned to reach the fast kernels;
-        # 501 * 2 bytes is not, so cuBLAS picks an alignment-2 fallback that measured 29 TFLOPS
-        # against 57 at N = 504. Rounding N up to a multiple of 8 is worth 14% of the whole
-        # training step. The padded columns carry a -inf bias, so exp() of their logit is exactly
-        # 0: every log-softmax, gather and softmax downstream is bit-for-bit the 501-wide result,
-        # their gradient is exactly 0, and the parameters stay 501-wide so checkpoints are
-        # unaffected. Kept out of `step()`, which is one cell wide and GEMM-bound by nothing.
+        # The readout is the step's largest GEMM and its N = 501 is not 16-byte aligned in bf16,
+        # so cuBLAS falls back to an alignment-2 kernel (29 vs 57 TFLOPS at N = 504). Padding N to a
+        # multiple of 8 with a -inf bias leaves every softmax bit-identical and the pad gradient 0;
+        # parameters stay 501-wide. Not applied in `step`, which is one cell wide.
         self._pad = -model.logits_width % 8
 
     def _readout(self, h: torch.Tensor) -> torch.Tensor:
@@ -35,12 +30,19 @@ class TransducerJoiner(nn.Module):
             F.pad(self.out.bias, (0, self._pad), value=float("-inf")),
         )
 
-    def forward(self, enc: torch.Tensor, pred: torch.Tensor) -> torch.Tensor:
-        # enc [B, T, De], pred [B, U', Dp] -> [B, T, U', V] via broadcast over the (T, U') grid.
+    def forward(
+        self, enc: torch.Tensor, pred: torch.Tensor, band_cols: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """enc [B, T, De], pred [B, U+1, Dp] -> [B, T, U+1, V'] or, with band_cols [B, T, W'] (the
+        label state of each band cell), [B, T, W', V']. V' is the aligned readout width."""
         e = self.enc_proj(enc).unsqueeze(2)  # [B, T, 1, J]
-        p = self.pred_proj(pred).unsqueeze(1)  # [B, 1, U', J]
-        return self._readout(torch.tanh(e + p))
+        p = self.pred_proj(pred)  # [B, U+1, J]
+        if band_cols is None:
+            return self._readout(torch.tanh(e + p.unsqueeze(1)))
+        b, t, w = band_cols.shape
+        rows = p.gather(1, band_cols.reshape(b, t * w, 1).expand(-1, -1, p.shape[-1]))
+        return self._readout(torch.tanh(e + rows.view(b, t, w, -1)))
 
     def step(self, enc_t: torch.Tensor, pred_u: torch.Tensor) -> torch.Tensor:
-        # enc_t [B, De], pred_u [B, Dp] -> [B, V] for a single decode cell.
+        # enc_t [..., De], pred_u [..., Dp] -> [..., V] for decode cells.
         return self.out(torch.tanh(self.enc_proj(enc_t) + self.pred_proj(pred_u)))

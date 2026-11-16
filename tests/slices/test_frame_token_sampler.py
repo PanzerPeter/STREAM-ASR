@@ -38,56 +38,11 @@ def _alternating_manifest(tmp_path, n=40, short=40, long=400):
     return str(p)
 
 
-def _lattice_cells(sampler):
-    # What the full [B, T, U+1, V] objective is charged: B x max(frames) x max(transcript).
-    return sum(
-        len(b) * max(sampler._frames[i] for i in b) * max(sampler._tokens[i] for i in b)
-        for b in sampler._batch_list()
-    )
-
-
-def test_order_defaults_to_a_pure_duration_sort(tmp_path):
-    # token_sort_window defaults to 1 (off), and off must mean off: transcript length does not
-    # influence the order at all, so the batch stream is the one every measured recipe used.
+def test_order_is_a_pure_duration_sort(tmp_path):
+    # Transcript length never influences the order: with the band the lattice no longer scales
+    # with U, so there is no U padding to sort away.
     p = _alternating_manifest(tmp_path)
     s = FrameBucketSampler(p, max_frames_per_batch=400, max_tokens_per_batch=880)
-    assert s._order == sorted(range(40), key=lambda i: s._frames[i])
-
-
-def test_token_sort_window_cuts_lattice_padding(tmp_path):
-    # The full [B,T,U+1,V] lattice is charged at the batch's *max* transcript length, not its mean,
-    # so mixing a 120-char utterance with 40-char ones costs 3x on every one of them. Re-sorting by
-    # transcript length inside a duration window makes a batch homogeneous in U -- and every
-    # utterance must still be emitted exactly once.
-    p = _alternating_manifest(tmp_path, n=2000, short=40, long=120)
-    budgets = dict(max_frames_per_batch=10**9, max_tokens_per_batch=480)
-
-    off = FrameBucketSampler(p, token_sort_window=1, **budgets)
-    on = FrameBucketSampler(p, token_sort_window=500, **budgets)
-    assert _lattice_cells(on) < 0.75 * _lattice_cells(off)
-    assert sorted(i for b in on for i in b) == list(range(2000))  # nothing lost or duplicated
-
-
-def test_token_sort_window_must_exceed_the_batch_size_to_do_anything(tmp_path):
-    # The footgun. The re-sort only pays off where a whole batch fits inside one homogeneous run of
-    # the window; a window of the same order as the batch just interleaves the two lengths again and
-    # buys nothing. On train_sp2 the mean batch is ~22 utterances, which is why the candidate values
-    # are in the hundreds and 1 means off.
-    p = _alternating_manifest(tmp_path, n=2000, short=40, long=120)
-    budgets = dict(max_frames_per_batch=10**9, max_tokens_per_batch=480)  # ~6-12 utts per batch
-
-    off = _lattice_cells(FrameBucketSampler(p, token_sort_window=1, **budgets))
-    narrow = _lattice_cells(FrameBucketSampler(p, token_sort_window=8, **budgets))
-    wide = _lattice_cells(FrameBucketSampler(p, token_sort_window=500, **budgets))
-    assert narrow > 0.99 * off  # a window the size of a batch is inert
-    assert wide < 0.75 * off
-
-
-def test_token_sort_window_is_inert_without_a_token_budget(tmp_path):
-    # The window re-sorts by a quantity no budget is tracking, so without max_tokens_per_batch it
-    # would perturb the batch stream for nothing. Guard that it stays a plain duration sort.
-    p = _alternating_manifest(tmp_path)
-    s = FrameBucketSampler(p, max_frames_per_batch=400, token_sort_window=8)
     assert s._order == sorted(range(40), key=lambda i: s._frames[i])
 
 

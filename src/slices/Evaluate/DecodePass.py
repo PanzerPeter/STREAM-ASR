@@ -28,6 +28,7 @@ from src.slices.Evaluate.EvaluateCorpus_Command import EvaluateCorpus_Command
 from src.slices.Evaluate.EvaluateCorpus_Handler import EvaluateCorpus_Handler, subsample
 from src.slices.Evaluate.EvaluateCorpus_Response import EvaluateCorpus_Response
 from src.slices.Evaluate.Progress import Progress
+from src.slices.Evaluate.WordTiming import emission_latencies, reference_word_ends
 
 # Per-utterance rescore state a tuning pass returns: (reference, acoustic n-best with its terms).
 RescoreCache = list[tuple[str, list[NbestEntry]]]
@@ -127,8 +128,23 @@ def _decoder_for(job: DecodePassJob) -> StreamingDecoder_Handler:
     return _DECODERS[key]
 
 
+def _latency_probe(decoder: StreamingDecoder_Handler, tok: SentencePieceTokenizer):
+    def probe(wave: torch.Tensor, ref: str, resp) -> list[float]:
+        ends = reference_word_ends(decoder.model, tok, wave, ref, decoder.frame_s)
+        if ends is None:
+            return []
+        return emission_latencies(ref, resp.text, ends, resp.token_ids, resp.token_emit_s, tok)
+
+    return probe
+
+
 def _score(job: DecodePassJob, decoder: StreamingDecoder_Handler) -> EvaluateCorpus_Response:
-    return EvaluateCorpus_Handler(decoder, label=job.label).run(
+    # The latency probe runs an offline encoder pass for the forced alignment, so it stays out of
+    # the serial timing pass, whose RTF must be the decoder's alone.
+    probe = None
+    if job.mode == "streaming" and not job.measure_timing:
+        probe = _latency_probe(decoder, _model_and_tok(job)[1])
+    return EvaluateCorpus_Handler(decoder, label=job.label, latency_probe=probe).run(
         EvaluateCorpus_Command(
             manifest_path=job.manifest,
             mode=job.mode,

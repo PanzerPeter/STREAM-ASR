@@ -204,8 +204,7 @@ def _tune_rescore_weights(
         wer_by_point = _sweep(prepared, alpha_grid, beta_grid, lb_grid)
         best = min(wer_by_point, key=lambda p: wer_by_point[p])
         acoustic = wer_by_point.get((0.0, 0.0, 0.0))
-        # v1.0 selected alpha at the top of its grid in all four sweeps and never noticed. A weight
-        # sitting on its own ceiling means the grid, not the data, chose it.
+        # A weight sitting on its own ceiling means the grid, not the data, chose it.
         for name, value, grid in (
             ("alpha", best[0], alpha_grid),
             ("beta", best[1], beta_grid),
@@ -262,6 +261,25 @@ def _print_table(rows: list[EvaluateCorpus_Response]) -> None:
             f"{r.num_utts:>7}   {r.num_word_errors}/{r.num_ref_words}"
         )
     log("")
+    # Where the errors sit (first 2 / middle / last 2 words, deletions in brackets) and how late a
+    # correct word is shown after it ends, in audio seconds (streaming only).
+    log(f"{'stage':<18}{'mode':<10}{'first-2':>14}{'middle':>14}{'last-2':>14}{'emit p50/p90':>16}")
+    log("-" * 86)
+    for r in rows:
+
+        def edge(err: float, dele: float) -> str:
+            return f"{100 * err:.1f} ({100 * dele:.1f})".rjust(14)
+
+        emit = (
+            "-"
+            if r.emission_latency_median_s is None
+            else f"{r.emission_latency_median_s:.2f}/{r.emission_latency_p90_s or 0.0:.2f}s"
+        )
+        log(
+            f"{r.stage:<18}{r.mode:<10}{edge(r.first_err, r.first_del)}"
+            f"{edge(r.middle_err, r.middle_del)}{edge(r.last_err, r.last_del)}{emit:>16}"
+        )
+    log("")
 
 
 def main() -> None:
@@ -285,9 +303,8 @@ def main() -> None:
         const="other",
         help="test-other, tuned on dev-other",
     )
-    # The averaged tail, not transducer_best.pt: `_best` is one step picked by the ~1k-word dev
-    # probe, so part of its lead over its neighbours is sampling noise. Run
-    # scripts/average_checkpoints.py after training.
+    # The averaged tail, not transducer_best.pt: `_best` is one validation's minimum, so part of
+    # its lead over its neighbours is noise. Run scripts/average_checkpoints.py after training.
     ap.add_argument("--checkpoint", default="data/checkpoints/transducer_avg.pt")
     ap.add_argument("--tokenizer", default="data/tokenizer/bpe500.model")
     ap.add_argument(
@@ -353,10 +370,18 @@ def main() -> None:
         "reports null RTF/latency)",
     )
     ap.add_argument("--report", default=None, help="report path; default eval.report_path")
+    ap.add_argument(
+        "--on-dev",
+        action="store_true",
+        help="score the split's DEV manifest instead of its test set, with fixed weights "
+        "(tuning on the set you score is circular); for comparing decode settings",
+    )
     args = ap.parse_args()
 
     cfg = get_config()
     sp = _SPLITS[args.split]
+    if args.on_dev:
+        sp = replace(sp, name=f"{sp.name}-dev", test_manifest=sp.dev_manifest)
     workers = args.workers if args.workers is not None else cfg.eval.workers
     probe_n = args.rtf_probe if args.rtf_probe is not None else cfg.eval.rtf_probe_utts
     stages = args.stages.split(",") if args.stages else list(cfg.eval.ablation_stages)
@@ -379,6 +404,7 @@ def main() -> None:
     log(f"  device    {device} ({gpu})")
     log(
         f"  decode    beam={cfg.decode.beam_size} chunk={cfg.decode.chunk_size} "
+        f"left={cfg.decode.left_context} tail={cfg.decode.tail_chunks} "
         f"max_symbols={cfg.decode.max_symbols} length_bonus={cfg.decode.length_bonus}"
     )
     log(f"  stages    {', '.join(stages)} x {', '.join(_MODES)}")
@@ -386,7 +412,8 @@ def main() -> None:
     log("=" * 78)
 
     t_start = time.perf_counter()
-    fixed = args.no_tune or args.lm_weight is not None or args.ilm_weight is not None
+    fixed_weight = args.lm_weight is not None or args.ilm_weight is not None
+    fixed = args.on_dev or args.no_tune or fixed_weight
     tuning: dict[str, dict[str, float | None]] = {}
     if any(stage_uses_lm(s) for s in stages) and not fixed:
         tuning = _tune_rescore_weights(
@@ -495,6 +522,8 @@ def main() -> None:
                 "tokenizer": args.tokenizer,
                 "beam_size": cfg.decode.beam_size,
                 "chunk_size": cfg.decode.chunk_size,
+                "left_context": cfg.decode.left_context,
+                "tail_chunks": cfg.decode.tail_chunks,
                 "weights": {
                     m: {
                         "lm_weight": weights[m][0],

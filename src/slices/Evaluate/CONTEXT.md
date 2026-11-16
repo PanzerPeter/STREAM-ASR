@@ -2,7 +2,9 @@
 
 ## Purpose
 Produce the project's final quality and latency numbers: corpus WER/CER plus RTF, first-partial
-latency and finalize cost, across an ablation of the single-pass transducer decoder.
+latency and finalize cost, across an ablation of the single-pass transducer decoder; plus where the
+errors sit (first-2 / middle / last-2 word error and deletion rates) and, in streaming mode, per-word
+emission latency against a CTC forced alignment of the reference (`MODEL_ARCHITECTURE.md` §8.3).
 
 ## Entry Point
 - Type: CLI (`evaluate.py` → `EvaluateCorpus_Handler`; GPU, user-run)
@@ -26,6 +28,14 @@ The slice reuses the Decode slice's `StreamingDecoder_Handler` per utterance. Th
 are the artifact contract, and no trainer internals are imported. `Metrics.word_errors/char_errors`
 return raw counts (the summed-counts identity with `corpus_wer`/`corpus_cer` is test-locked), and
 `EvaluateCorpus_Handler` aggregates over the manifest and drives the heartbeat in `Progress.py`.
+
+**Edges and emission latency** (`WordTiming.py`). `EdgeCounts` reads jiwer's word alignment per
+utterance. Emission latency is, per correctly recognised word, the audio time its first token was
+shown (the end of the chunk its emission frame belongs to, from `StreamingDecode_Response
+.token_emit_s`) minus that word's end in `torchaudio.functional.forced_align` over the model's own
+offline CTC posteriors. It costs one extra offline encoder pass, so `DecodePass` attaches the probe
+to streaming QUALITY passes only, never to the serial timing pass whose RTF must be the decoder's
+alone.
 
 **Split selection.** `--clean` / `--other`, exactly one, with no default. A split is an acoustic
 condition rather than a file, so each one binds all three paths together:

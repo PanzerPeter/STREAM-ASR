@@ -1,1076 +1,731 @@
-# MODEL_ARCHITECTURE.md: STREAM ASR, every operator and what bounds it
+# MODEL_ARCHITECTURE.md: STREAM ASR v2.0
 
-Ground truth for the acoustic model's shapes, math and amplitude budget. `CLAUDE.md` says what the
-project is and what has gone wrong; `VSA.md` governs structure; **this file says what the model
-computes**, operator by operator, so a failure can be located by reading rather than by loading
-five checkpoints and diffing them.
+What the v2.0 acoustic model computes, operator by operator, why each choice was made, and how it is
+trained, decoded and measured. `config/` holds the authoritative values; this document explains
+them. Numbers marked **MEASURED** were run on one RTX 5070 (torch 2.11, CUDA 12.8).
 
-Numbers below are the effective config (`get_config()`, authoritative) plus measurements from named
-checkpoints. Parameter counts are regenerated from `TransducerModel()` and were last verified
-2026-08-22; the config values are from `config/{audio,model,transducer,training,optim,pretrain,decode,augment,features,lm,eval}.yaml`.
+Names used throughout: the encoder is the **S2 encoder**, its block the **FusedBranch block**, the
+transducer loss the **banded RNN-T**.
 
-**Read [§0 Debug playbook](#0-debug-playbook) and [§5 Amplitude ledger](#5-amplitude-ledger) first
-when diagnosing.** Every failure this model has had was an amplitude failure, and four of them were
-invisible in the metrics that existed at the time.
-
----
-
-## 0. Debug playbook
-
-Start from the symptom. Each row says what to read *first*, and what that reading means. The
-right-hand column is the section with the mechanism.
-
-| Symptom | Read, in this order | What it usually is | § |
-|---|---|---|---|
-| `train/grad_norm` climbing, loss fine | `train/grad_norm_guarded` → `stack_mix/*_trunk` → `train/trunk_gain_max` | Almost always ONE scalar gate; the global norm is ~95-99 % `stacks.*.bypass`. Two runs were aborted on this as false positives. If `grad_norm_guarded` is flat, nothing is wrong with the weights, but check the trunk anyway, because a rising gate gradient is what an inflating trunk *looks* like | §11, §5 |
-| dev ctc-WER turns upward mid-run | `stack_mix/*_trunk` (all 6) → `stack_mix/*_residual` → `train/gains_at_ceiling` | A trunk RMS rising superlinearly, or a `bypass` approaching its 0.1 floor. Both collapses in 2026-08-2x turned dev WER at the exact step `bypass₂` hit its floor | §5.1, §3.1 |
-| a stack's `1 − b` at 0.00 or 1.00 | `stack_mix/{i}_trunk`, then load the checkpoint and check `bypass` | `b → 0.1` means 90 % of that stack's output is bare unnormalised `in_proj`; below the floor it would be an absorbing state with 0 gradient into 10.6 M params. `b → 1` drops the skip: the upsample is `repeat_interleave`, so the stack's output becomes piecewise-constant over its own `factor` base-rate frames and the trunk is the only path carrying detail inside that window. Benign at `factor = 2` (v1.0 runs stack 5 at 1.00) and not at `factor = 8` (v1.0 runs stack 3 at 0.62, both 2026-08-2x collapses at 0.97-0.99). Read it as a **symptom** of an inflated trunk: a pre-normed branch loses relative influence as the residual grows, and `b` rises to compensate | §3.1 |
-| `train/gains_at_ceiling` warns | `stack_mix/{i}_processed` per stack → dev ctc-WER | A branch is amplifying as hard as it is allowed. Led the 2026-08-09 divergence by ~25k steps. A bad regime, not yet a diverged one, so the trainer warns rather than aborts | §5.1, §11 |
-| `train/trunk_gain_max` pinned at 10.0 | `train/trunk_stable_rank_min` → `stack_mix/*_trunk` | The projection is binding every step. σ₁ is a worst-case bound, so pinned ≠ broken (v1.0 sits at 9.73 with realized trunk RMS 1.5-2.7), but it never plateaued on its own in any diverged run, and while it is pinned **σ₁ is constant by construction and can tell you nothing more**. Read the stable rank instead | §5.2, §5.5, §8.5 |
-| `train/trunk_stable_rank_min` falling | `stack_mix/*_trunk` → `train/trunk_gain_max` | The trunk is collapsing toward a rank-1 amplifier. Healthy: 64-95 at the BEST-RQ warm start, 100-120 for stacks that never bind. It halved every ~20k steps in 2026-08-24 while σ₁ read exactly 10.00 at every checkpoint | §5.5 |
-| OOM mid-run, periodic | `oom_skips` count in the log → `max_lattice_per_batch` | The RNN-T lattice on the epoch's densest bucket. The trainer drops the batch and continues; persistent skips mean the budgets are too high for the free VRAM | §9.2, §10.2 |
-| peak VRAM looks like a ceiling | whether `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` is set | Allocator fragmentation: 5.25 GiB allocated vs 9.71 reserved on the default allocator, 7.41 vs 7.51 with expandable segments | §13 |
-| streaming WER ≫ offline WER | `dev/ctc_wer_stream_gap` through the anneal | The WSD anneal sharpens against whatever context it is given. A widening gap while `dev/ctc_wer` falls means the schedule is buying offline accuracy at streaming's expense | §11, §4 |
-| dev/transducer_wer moved a lot | ignore it; read `dev/ctc_wer` | ~1k words, σ ≈ 0.008, and its sampling has changed between runs. Never compare it across runs | §11 |
-| loss NaN / inf | `train/rnnt` vs `train/ctc` vs `train/interctc` separately | CTC uses `zero_infinity=True` so it cannot produce inf; RNN-T on an empty transcript returns `−Σ log p(blank)`, not 0 (unlike torchaudio's CUDA kernel) | §6.3 |
-| checkpoint won't load | `lm.d_model` for the LM | The LM's `d_model` is load-bearing at inference | §13 |
-| step time regressed hours into a run | log for a dynamo recompile-limit warning | Exceeding the per-code-object recompile limit does not raise; dynamo silently demotes that function to eager **for the rest of the process**. `_RECOMPILE_LIMIT = 32` exists for this | §9.5 |
-| a metric contradicts another | §11's "blind to" column | `stack_mix/*_residual` and `*_processed` both describe the PROCESSED half and read *healthier* at the 2026-08-22 collapse than 20k steps before it | §11 |
-
-**The one-line rule this model keeps teaching: a parameter bound is not an activation bound.** Four
-consecutive fixes bounded a parameter and the amplitude found the next unbounded path. The quantity
-that actually failed every time is `stack_mix/*_trunk`, the realized RMS of what each `in_proj`
-emits.
+| § | Contents |
+|---|---|
+| [1](#1-overview) | Overview and headline results |
+| [2](#2-shapes-and-rates) | Shape and rate ledger, parameter counts |
+| [3](#3-front-end) | Log-mel, CMVN and mean fill, the subsampling frontend |
+| [4](#4-encoder) | U-Net layout, the FusedBranch block, gates, attention |
+| [5](#5-amplitude-by-construction) | Why no activation can grow without bound |
+| [6](#6-heads-and-loss) | CTC head, predictor, joiner, objective, banded RNN-T |
+| [7](#7-streaming) | Streaming contract, bounded cache, tail chunk |
+| [8](#8-decoding-and-evaluation) | Label-looping greedy, beam, LM rescoring, evaluation metrics |
+| [9](#9-training) | Data, optimisation, schedule, step mechanics, validation |
+| [10](#10-observability-and-debugging) | Logged scalars and a debug playbook |
+| [11](#11-invariants) | Rules that keep the design correct |
+| [12](#12-results) | Test-set results, timing, budget curve |
+| [13](#13-design-notes) | How the recipe was chosen, open directions, references |
 
 ---
 
-## 1. Shape and rate ledger
+## 1. Overview
 
-One utterance of `S` samples at 16 kHz, batch `B`, vocabulary `V = 501` (500 BPE + blank 500).
+A from-scratch streaming transducer for English read speech, trained on LibriSpeech 960 h:
+
+* **S2 encoder**, 35.56 M parameters: a three-rate U-Net with blocks at 25 Hz and 12.5 Hz, output at
+  12.5 Hz (80 ms per frame). Each block is gated attention followed by a conv-gated MLP.
+* **Stateless predictor + additive joiner** over BPE-500, plus a CTC head. 36.73 M parameters total.
+* **One set of weights decodes offline and streaming** (320 ms chunks, 5.12 s bounded left context).
+* **Banded RNN-T**: the joiner runs on 17 lattice cells per frame around the CTC head's cumulative
+  occupancy instead of the full lattice.
+* **Amplitude bounded by construction**: every stack entry is a weightless RMSNorm and the only
+  learnable residual-path scale is a floored gate. No parameter is ever projected or clamped.
+* **STREAM-LM** (44.7 M, separate slice) rescores the beam's n-best with internal-LM estimation.
+
+Headline (test-clean / test-other WER, beam 10 + LM + ILME, MEASURED, §12):
+
+| | offline | streaming 320 ms |
+|---|---|---|
+| test-clean | **2.64 %** | **3.18 %** |
+| test-other | **6.51 %** | **8.87 %** |
+
+Training: 600,000 loader batches (24 passes over the 1,933 h speed-perturbed corpus) in **15.1 h**
+on one RTX 5070, peak 4.3 GiB allocated.
+
+---
+
+## 2. Shapes and rates
+
+One utterance of `S` samples at 16 kHz, batch `B`, `V = 501` (500 BPE pieces + blank 500).
 
 | # | Stage | Op | Shape out | Rate |
 |---|---|---|---|---|
-| 0 | audio | `soundfile` load, `AudioIO_Adapter` | `[S]` | 16 kHz |
-| 1 | log-mel | `LogMel_Transform`, `n_fft=400 win=400 hop=160 n_mels=80` | `[T₀, 80]`, `T₀ = S/160` | 100 fps |
-| 2 | CMVN | `(x - cmvn_mean) / cmvn_std`, per mel bin, buffers on the encoder | `[B, T₀, 80]` | 100 fps |
-| 3 | frontend | `Conv2dSubsampling` ×2 in time, ×4 in freq | `[B, T₁, 192]`, `T₁ = (T₀-1)//2+1` | 50 fps = **base rate** |
-| 4 | stacks 0-5 | `ZipformerStack`, each length-preserving | `[B, T₁, dᵢ]` | base rate in/out |
-| 5 | final | `SimpleDownsample(2)` | `[B, T₂, 256]`, `T₂ = ⌈T₁/2⌉` | ~25 fps |
-| 6 | out_norm | `BiasNorm(256)` | `[B, T₂, 256]` = **encoder memory** | ~25 fps |
-| 7a | CTC head | `Linear(256 → 501)` | `[B, T₂, 501]` | ~25 fps |
-| 7b | InterCTC | `Linear(dᵢ → 501)` off stacks 3 and 4 | `[B, T₁, 501]` | base rate |
-| 8 | predictor | `StatelessPredictor` on blank-prefixed labels | `[B, U+1, 512]` | per label |
-| 9 | joiner | `TransducerJoiner` | `[B, T₂, U+1, 501]` lattice | n/a |
-| 10 | loss | `RnntLoss` + CTC + 2×InterCTC | scalar | n/a |
-
-Total frame reduction audio → memory: 160 samples/frame × 2 × 2 = **640 samples ≈ 40 ms per memory
-frame**.
-
-Per-stack geometry (`encoder_dims / downsampling / layers / heads`):
-
-| stack | dim | internal ÷ | blocks | heads | head_dim | SwiGLU hidden | params | `in_proj` |
-|---|---|---|---|---|---|---|---|---|
-| 0 | 192 | 1 | 2 | 4 | 48 | 512 | 1,711,759 | `Identity` (dim_in == dim) |
-| 1 | 256 | 2 | 2 | 4 | 64 | 688 | 3,101,841 | `Linear(192→256)` |
-| 2 | 384 | 4 | 3 | 6 | 64 | 1024 | 10,321,178 | `Linear(256→384)` |
-| 3 | 512 | 8 | 4 | 8 | 64 | 1368 | 24,432,549 | `Linear(384→512)` |
-| 4 | 384 | 4 | 3 | 6 | 64 | 1024 | 10,419,482 | `Linear(512→384)` |
-| 5 | 256 | 2 | 2 | 4 | 64 | 688 | 3,150,993 | `Linear(384→256)` |
-
-**55,267,106 parameters total** in **609 `state_dict` keys**: encoder 53,778,637 (frontend 640,576
-+ stacks 53,137,802 + `final_downsample` 2 + `out_norm` 257), predictor 258,561, joiner 651,253,
-CTC head 128,757, InterCTC heads 449,898. 98 `BiasNorm` modules (97 in the encoder + 1 in the
-predictor). 16 blocks in the encoder, 96 `BiasNorm` calls per encoder forward plus `out_norm`.
-
-Dropout is `model.encoder_dropout = 0.1`, and it appears in exactly two places per block:
-`RotaryAttention` (on the attention weights in train mode, and on its output projection) and
-`SwiGluFfn` (after `w_down`). `ConvModule` has none. `BiasNorm.eps` is `audio.cmvn_eps = 1e-5`,
-shared with CMVN. It is a numerical floor, not an amplitude bound, and floors nothing at the
-scales §5 is about.
-
----
-
-## 2. Front end
-
-### 2.1 `LogMel_Transform`
-80-bin log-mel, 25 ms window / 10 ms hop. Computed on the fly from FLAC, or read from the fp16
-mmap cache in `data/features/mel/`, whose row order **is** the manifest row order, so a
-`manifest_fingerprint` in the cache header rejects a mismatched pair at dataset construction (§10.1).
-
-### 2.2 CMVN
-`x ← (x − mean) / std` with per-bin statistics from `data/features/cmvn.pt`, applied **inside**
-`ZipformerEncoder.forward`, i.e. downstream of the mel cache. Raw log-mel is mean −5.65, std 4.06;
-anything that fabricates values in mel space (BEST-RQ's mask fill, §7.2) must de-normalise through
-these statistics or it writes a constant plateau the encoder never sees again. Missing `cmvn.pt`
-falls back to mean 0 / std 1 inside `ZipformerEncoder`: correct for tests, and harmless at
-inference, where the statistics are `state_dict` buffers a checkpoint restores. **Both trainers now
-raise instead of reaching it** (`_require_cmvn`): a fresh run that did would train on raw log-mel
-with nothing in the loop reporting it, and in the BEST-RQ stage the mask fill de-normalises through
-the same statistics, so the fallback additionally rebuilds the +1.46 σ plateau §7.2 exists to
-prevent. `cmvn_path=""` opts out deliberately.
-
-### 2.3 `Conv2dSubsampling`
-```
-x:[B,T,80] → [B,1,T,80]
-conv1: Conv2d(1→128, k=3, stride=(2,2), pad=(0,1)), left time-pad 2 → ReLU     80 → 40 freq bins
-conv2: Conv2d(128→128, k=3, stride=(1,2), pad=(0,1)), left time-pad 2 → ReLU   40 → 20 freq bins
-reshape [B, T₁, 128*20 = 2560] → linear: Linear(2560 → 192)
-out_lengths = (lengths - 1)//2 + 1
-```
-Time padding is **left only**, so an output frame reads no future input; frequency padding stays
-symmetric (frequency is not streamed). `streaming_forward` keeps a two-level cache (`in_tail` for
-conv1's window, `mid_tail` for conv2's) and is exact from frame 0; chunks shorter than
-`2*time_pad = 4` frames are rejected with a clear error, because below that the cache silently
-under-fills and conv2 fails two chunks later.
-
-**`frontend.linear` is a trunk operator with no normaliser after it and no projection on it.** It
-is the one amplitude path `ZipformerStack.project` does not reach; measured 3.47 → 9.98 across the
-two BEST-RQ pretrains. `stack_mix/0_trunk` reports it (stack 0's `in_proj` is an `Identity`, so its
-logged trunk value *is* the frontend's output). See §5.
-
----
-
-## 3. Encoder
-
-### 3.1 `ZipformerStack`: the mix
-```
-residual = in_proj(input)                     # [B, T₁, d]   ← THE TRUNK
-x        = downsample(residual)               # ÷ factor, learnable softmax pooling
-x        = block_k(... block_0(x) ...)        # value residual: block 0's v feeds every deeper block
-x        = upsample(x, out_len=T₁)            # repeat_interleave, trimmed
-b        = clamp(bypass, stack_bypass_min, 1)
-out      = residual + b * (x - residual)      # = (1-b)*residual + b*x
-```
-Two independent amplitude paths meet here and only one of them is normalised:
-
-* the **processed** half `x` exits `blocks[-1].norm_out`, a `BiasNorm`, so it is bounded;
-* the **residual** half is `in_proj(input)` and passes through **no normaliser at all**.
-
-`forward` writes `self.trunk_rms` (an fp32 vector-norm of the detached residual, no extra copy),
-which is what `stack_mix/{i}_trunk` logs. Padded frames carry `in_proj.bias` rather than 0 and are
-counted; at ~0.2 % frame padding that is below the quantity's step-to-step noise.
-
-`bypass` is a single learnable scalar per stack, initialised 0.5, clamped in `forward` (the value
-used) and projected after every optimizer step (the value stored). Floor `0.1`, never 0: at `b = 0`
-every block parameter is multiplied by zero and receives no gradient, an absorbing state measured
-on `transducer_step81000.pt` as 0 of 105 block parameters with a gradient and `d(loss)/d(bypass)`
-still pressing downward.
-
-The chunk mask is built here, not in the block: `chunk_size` arrives in base-rate frames and is
-rescaled to the stack's own rate as `max(1, chunk_size // downsample.factor)`, so all six stacks see
-the same wall-clock chunk boundary. `chunk_size = 0` means full context and builds no mask at all.
-
-### 3.2 `ZipformerBlock`: macaron
-```
-x = x + 0.5 * ffn1(norm_ffn1(x))
-h, v = attn(norm_attn(x), pad_mask, attn_visible, value_residual)
-x = x + h
-x = x + conv(norm_conv(x), pad_mask)
-x = x + 0.5 * ffn2(norm_ffn2(x))
-return norm_out(x), v
-```
-Six `BiasNorm` per block (`ffn1, attn, conv, conv.norm, ffn2, out`). Every branch is **pre-normed**,
-so each contributes an O(1) correction regardless of the residual it is added to. That is the
-mechanism behind every collapse in this model: a branch's work falls off as 1/RMS² of its input.
-MEASURED on a fresh block, `1 − cos(in, out)` against input RMS: 0.060 at 1, 0.009 at 2.72, 0.0004
-at 12.18, 0.00007 at 30.
-
-### 3.3 `BiasNorm`
-```
-sq      = mean(x², dim=-1)
-centred = mean((x - bias)², dim=-1)
-inv_rms = rsqrt(max(centred, sq / max_amplification²) + eps)
-gain    = exp(clamp(log_scale, log_scale_min, log_scale_max))
-out     = x * (inv_rms * gain)
-```
-`bias` is per channel, `log_scale` is a **single scalar per module**. Window `[-2.0, +1.0]`,
-asymmetric on purpose: only amplification silences the next stack, and the healthy population runs
-low (p05 = −1.54 over 97 encoder norms). The three config values are read once in `__init__` and
-cached on the instance, because a `get_config()` call inside `forward` would break inductor's graph
-(§9.5).
-
-It divides by the RMS of `x − bias` but scales `x`, so without the floor its output RMS is
-`exp(log_scale) · rms(x)/rms(x−bias)` and the second factor is a free parameter's distance from the
-data, measured at **68.7×** with `log_scale` pinned inside its bound. `max_amplification = 4.0`
-floors the normaliser at `rms(x)/4`, bounding output RMS at `4·exp(log_scale) ≤ 10.87`. Past the
-cap the denominator no longer depends on `bias`, so the escape direction stops receiving gradient
-while the gain itself keeps training, the same projected-gradient argument as the bound on
-`log_scale`.
-
-The whole module is one pass over `x`: the reciprocal and the gain fold into the `[.., 1]`
-statistic rather than being applied to the activation. There are 96 of these per encoder forward and
-all of them are bandwidth-bound, so the pass count *is* the cost.
-
-### 3.4 `SwiGluFfn`
-`hidden = round8(dim * 4 * 2/3)`; `w_down(silu(w_gate(x)) * w_up(x))` then dropout 0.1. The 2/3
-keeps the SwiGLU parameter count near a dense FFN's; the round-to-8 is tensor-core alignment.
-
-### 3.5 `RotaryAttention`
-`qkv: Linear(d → 3d)` → `[B, H, T, d/H]`; RoPE applied to q and k
-(`inv_freq = base^(-i/half)`, `base = 10000`, `pos_offset` carries chunk-local position in
-streaming); `F.scaled_dot_product_attention` with `attn_mask = ~pad_mask & attn_visible`, scale
-`1/√head_dim`, dropout on the weights in train mode; `out: Linear(d → d)` + dropout. SDPA is fused
-(flash / mem-efficient under bf16 autocast), so the `[B,H,T,T]` score matrix is never materialised,
-which is also why this module stays eager (§9.5).
-
-Returns `(out, v)`, where `v` is block 0's value tensor, injected into deeper blocks as
-`v + res_lambda * v₀`, **before** attention and before caching, so a cached value already carries
-the residual. `res_lambda` initialises from `encoder_value_residual_lambda = 0.0`; that is an
-**init, not a disable** (gates learn −1.40 to +0.47 across the 16 tensors). Block 0's own
-`res_lambda` never receives gradient and exists only so `load_state_dict` matches.
-
-### 3.6 `ConvModule`
-```
-x = glu(pointwise1(x))            # Conv1d k=1 run as F.linear, d → 2d → d
-x = x.masked_fill(pad_mask, 0)    # padding must not enter the conv window
-x = depthwise(left_pad(x, k-1))   # k = 15, groups = d, NO future frames
-x = silu(norm(x))                 # BiasNorm, PER FRAME over channels
-x = pointwise2(x)                 # Conv1d k=1 run as F.linear
-```
-The per-frame norm is load-bearing: a GroupNorm over time would tie the output to the whole
-sequence and break streaming equivalence. `streaming_forward` carries the last `k-1` frames of the
-**glu output** (not the input), which is the tensor the depthwise conv actually consumes.
-
-Both kernel-1 convs are executed as `F.linear` through a squeezed view of the same parameter: a 1×1
-Conv1d insists on `[B,C,T]` while the block carries `[B,T,C]`, so running it as a convolution costs
-two transposes, a cuDNN copy of the non-contiguous result, and an implicit-GEMM path slower than
-cuBLAS. The module, its `state_dict` keys and every checkpoint (including the BEST-RQ warm start)
-are unchanged: the parameter stays canonical and only the call site reshapes.
-
-**Their storage class is load-bearing for the optimizer, not just for cuDNN.** `partition_params`
-routes `nn.Linear.weight` with `ndim == 2` to Muon; these are `nn.Conv1d` weights of shape
-`[out, in, 1]`, so all **6,807,552** of them (12 % of the model) sit on **AdamW** and take weight
-decay, on `ndim` alone. Re-declaring them as `nn.Linear`, the obvious cleanup once they are already
-called through `F.linear`, would silently move an eighth of the model onto the optimizer §5.2 names
-as the trunk-inflation mechanism. See §8.1 and invariant 12.
-
-### 3.7 `SimpleDownsample` / `SimpleUpsample`
-Downsample: softmax over a learnable `[factor]` weight vector, weighted sum over each window,
-`out_lengths = ⌈lengths/factor⌉`, time zero-padded up to a multiple of `factor` first. Zero-init →
-uniform pooling. Upsample: `repeat_interleave` trimmed to the pre-downsample length. Both are
-per-frame linear, hence streaming-transparent. The 6 `weights` tensors are excluded from weight
-decay: they are pre-softmax logits, so decaying them toward 0 forces uniform pooling.
-
----
-
-## 4. Streaming contract
-
-`ZipformerEncoder.streaming_forward(chunk)` is **exactly** equal to the batched `forward` with
-`chunk_size = B`, no re-forward fallback, all frames covered, gated by
-`test_streaming_forward_equivalence` at 100 frames with random init. It holds because the only three
-time-coupling ops are made causal or per-frame:
-
-1. `Conv2dSubsampling`: left time-pad only, two-level cache (`in_tail`, `mid_tail`).
-2. `ConvModule.depthwise`: left pad `k-1`, `ConvCache.left` on the glu output.
-3. `RotaryAttention`: KV cache per head per layer, `pos_offset = cache.seen`.
-
-`BiasNorm` and `ConvModule.norm` are per frame; downsample/upsample/bypass are per-frame linear.
-Training samples `chunk_size ∈ {0, 16, 32}` base-rate frames per batch (0 = full context), so one
-set of weights serves offline and streaming decode. BEST-RQ pretraining samples the same pool
-(§7.4), so the encoder meets limited right-context before the supervised stage rather than during it.
-
-`chunk_lcm()` = lcm(1,2,4,8,4,2,2) = **8**. A decode `chunk_size` must be a multiple of it, and the
-handler feeds the encoder `2 * chunk_size` **feature-rate** frames per step (the default 16 base-rate
-→ 32 feature frames → 320 ms).
-
-**The attention KV cache is never evicted.** `AttnCache.k/v` grow at every step at all 16 blocks,
-but a block runs at **its stack's** rate, not the base rate, so a block in stack 3 caches
-`chunk/8` frames. Per base-rate frame of audio the whole encoder caches
-`Σᵢ blocksᵢ · 2 · dᵢ / fᵢ` = 768 + 512 + 576 + 512 + 576 + 512 = **3,456 elements** (≈ 346 KB per
-second of audio at bf16, ~12 MB for a 35 s utterance); counting all 16 blocks at base rate
-overstates it by 3.3×. The growth is still unbounded, and that is exactly what makes streaming
-bit-equal to full-context `forward`: memory grows linearly and attention cost quadratically in
-utterance length. Fine for LibriSpeech's ≤ 35 s utterances; it is the thing to bound first for
-genuinely open-ended streaming.
-
----
-
-## 5. Amplitude ledger
-
-**The diagnostic table.** Every operator that can change the activation scale, what normalises it,
-what bounds it, and the value it takes in a model that works.
-
-| Operator | Normalised by | Bounded by | Healthy value (v1.0 `step174000`, 3.43 % WER) |
-|---|---|---|---|
-| `frontend.conv1/conv2/linear` | n/a | none (weight decay only) | frontend output RMS **4.08** |
-| `stacks.i.in_proj` (the TRUNK) | n/a | `stack_in_proj_max_sigma = 10.0`, projected | σ₁ 5.91 / 9.73 / 6.65 / 5.23 / 5.12; realized trunk RMS **2.68 / 2.24 / 1.51 / 2.69 / 2.25** |
-| `bypass` | n/a | `stack_bypass_min = 0.1`, projected | 0.96 / 0.92 / 0.88 / 0.62 / 0.83 / 1.00 |
-| every `BiasNorm` (97 in encoder) | itself | `log_scale ∈ [-2, +1]` and `max_amplification = 4` | output RMS ≤ 10.87 by construction |
-| block branches (ffn/attn/conv) | pre-norm | inherited from their `BiasNorm` | `1 − cos(in,out)` over 16 blocks: min 0.215, median 0.402, max 0.982 |
-| `out_norm` | itself | same window | encoder memory RMS **0.359** |
-| predictor `BiasNorm` | itself | same window, projected in both trainers | n/a |
-| joiner `enc_proj`/`pred_proj`/`out` | n/a | none (tanh bounds the pre-readout activation to ±1) | n/a |
-
-### 5.1 The failure family, in one sentence each
-
-1. **2026-08-09**. `BiasNorm.log_scale` unbounded: one stack amplified to RMS 12 and silenced the
-   next. Fixed by the `[-2, +1]` window. *A one-sided cap at 2.5 bought 25k steps and the same
-   collapse happened.*
-2. **2026-08-21**. bounding `log_scale` bounds nothing: the module divides by `rms(x − bias)` and
-   scales `x`; that free ratio reached 68.7× with the gain pinned inside its window. Fixed by
-   `biasnorm_max_amplification = 4.0`.
-3. **2026-08-22**. every `BiasNorm` is on a **branch**; the trunk (`in_proj`) had no bound at all.
-   Fixed by projecting `in_proj` and flooring `bypass`.
-4. **2026-08-22 (second)**. that trunk bound was on the **wrong norm**. `‖W‖_F/√n_out` is the gain
-   against isotropic input; the inflation is anisotropic. Fixed by projecting σ₁ instead.
-
-The pattern to recognise: **a parameter bound is not an activation bound.** Each fix bounded a
-parameter and the amplitude found the next unbounded path. What actually failed every time is the
-realized activation RMS, now logged directly as `stack_mix/*_trunk`.
-
-Three paths still carry no bound, by design or by omission: `frontend.linear` (no projection
-reaches it), `in_proj.bias` (an offset, not a gain: measured RMS 0.21-0.70 against a trunk at
-25-570), and the joiner's projections (the `tanh` bounds what reaches the readout).
-
-### 5.2 Why the trunk inflates
-
-Muon's Newton-Schulz sets every singular value of the update to 1, so a direction the loss cannot
-feel takes the same size step as one it can. At step 81k `stacks.3.in_proj`'s raw gradient had
-condition number 61,148 and a radial component of 2.5e-5 against a Muon step of 0.226. Weight
-decay's equilibrium is `√min(m,n)·√max(1,m/n)/wd` = 1960 at `wd = 1e-2`, which is 175× the init it would
-have to bind at. Nothing opposes the drift; only a projection does. Scaling `in_proj` ×2 at step 81k
-moved dev CTC by −0.015 and ×0.5 by +0.081: flat upward, restoring downward, i.e. a diffusion that
-only goes one way.
-
-### 5.3 Reference measurements (same 4 dev utterances, CPU, `scripts`-free probe)
-
-realized trunk RMS after `in_proj`, stacks 1-5:
-
-| checkpoint | frontend | trunk 1-5 | encoder out |
-|---|---|---|---|
-| OLD `bestrq_encoder.pt` (v1.0 warm start) | 3.47 | 3.14 2.32 2.22 3.59 3.34 | 2.350 |
-| **v1.0 `step174000`, 3.43 % test-clean** | **4.08** | **2.68 2.24 1.51 2.69 2.25** | **0.359** |
-| NEW `bestrq_encoder.pt` (2026-08-20 overhaul) | 9.98 | 13.05 5.68 12.83 16.95 13.98 | 2.874 |
-| 600k run, step 43,200 | 7.21 | 5.23 9.97 **43.19** 3.06 3.92 | 0.370 |
-| 600k run, step 48,265 (stopped) | 7.17 | 7.33 35.58 **337.75** 3.76 3.91 | 0.387 |
-
-`in_proj` spectral norm σ₁ over the same checkpoints:
-
-| checkpoint | σ₁ stacks 1-5 | `bypass` 0-5 |
-|---|---|---|
-| OLD bestrq | 3.42 3.53 2.56 2.19 2.28 | 0.60 0.72 0.42 0.26 0.63 0.99 |
-| v1.0 `step174000` | 5.91 9.73 6.65 5.23 5.12 | 0.96 0.92 0.88 0.62 0.83 1.00 |
-| NEW bestrq | 5.63 4.09 3.65 3.52 3.54 | 0.54 0.84 0.20 0.60 0.77 0.94 |
-| 600k step 43,200 | 9.85 11.36 9.79 5.01 6.04 | 0.98 0.90 0.35 0.97 0.77 0.98 |
-| 600k step 48,265 | 10.25 **20.05** 14.46 5.63 6.18 | 0.98 0.87 **0.10** 0.99 0.78 0.98 |
-
-At step 48,265 `bypass₂` is resting **exactly on its 0.1 floor**. Without the floor it would be at
-0.0 and stack 2's 10.6 M block parameters would have stopped receiving gradient. The floor keeps
-them trainable; it does not stop the 90 % of the output that is now bare `in_proj` at σ₁ = 20.
-
-σ₁/isotropic ran 2.1-3.7 across the five stacks and rose at every checkpoint (fresh init 1.8-2.2),
-which is why the Frobenius bound of 4.0 projected **zero** matrices in 43,200 steps.
-`stack_in_proj_max_sigma = 10.0` is calibrated on that table: inert on both pretrains and on the
-shipped model, clips 3 of 5 matrices on the diverged one. **The bound cannot be retro-fitted**:
-projecting `step81000` takes the joint loss 2.40 → 7.13.
-
-**σ₁ does not rank matrices by the quantity that fails, either.** Read the two tables above at the
-same step 43,200: the trunk that had already inflated 7× past healthy is stack 3's, at RMS 43.19,
-and its σ₁ is **9.79, inside the 10.0 ball**. The one matrix the bound would have projected at that
-step is stack 2's, at σ₁ 11.36 with a trunk of 9.97. A worst-case gain caps how far a matrix can
-eventually travel; it does not say which one is travelling. So `stack_in_proj_max_sigma` is the last
-line and not the first: the first is `stack_mix/*_trunk` at `log_every`, with superlinear growth read
-as the abort condition. Neither the σ₁ bound nor the `bypass` floor has yet survived a full GPU run.
-
-### 5.4 The bound this ledger did not try until 2026-08-24: now taken
-
-> **TAKEN.** `model.trunk_norm` is on. What follows is the argument for it, then the measured cost
-> of adopting it mid-run. §5.5 and §5.6 are why it stopped being optional.
-
-Every fix in §5.1 bounds a **parameter**, and §5.3 is the fourth measurement in a row showing that
-the realized activation escaped anyway. The intervention none of them is: **normalise the trunk**.
-One `BiasNorm` on `in_proj`'s output (257 params, one bandwidth-bound pass, 6 more against the 96
-already run per forward) makes `stack_in_proj_max_sigma`, `stack_bypass_min`, `train/trunk_gain_max`
-and all six `stack_mix/*_trunk` redundant, because the quantity that failed four times would be
-normalised by construction rather than watched.
-
-It is not free and it is not a mid-run patch:
-
-* it stops being Zipformer's bypass: `b` currently interpolates against an *unnormalised* residual,
-  and every downstream `bias` and gain in the model is calibrated against that scale;
-* it invalidates both BEST-RQ warm starts and the shipped model's amplitude ledger, so adopting it
-  costs a fresh pretrain (~6 h 20 m) before the transducer stage can start;
-* `frontend.linear` would still be unbounded (§2.3), so it removes the failure family, not the last
-  unnormalised operator.
-
-Recorded here so the fifth amplitude failure does not re-derive it. Until it is taken, this model is
-**monitored, not controlled**: the projections cap the tail, and noticing the trunk move is the job.
-
-**What it actually cost.** A `BiasNorm` on each of the five `Linear` `in_proj` outputs, ~1,800
-params, `model.trunk_norm_log_scale_max = 1.2` so the trunk may not exceed RMS `exp(1.2) = 3.32`.
-Stack 0 keeps an `Identity` (no inter-stack operator, nothing upstream to compound from), so
-`frontend.linear` remains unnormalised and `stack_mix/0_trunk` remains its output. Calibration and
-insertion cost are measured in `config/model.yaml` and §5.6; the short version is that the ceiling
-sits at the knee of the cost curve, and 82-89 % of the insertion cost falls on InterCTC, a linear
-head calibrated to the old amplitude that re-fits in a few hundred steps.
-
-Two of the three objections above survive and are simply accepted: `b` now interpolates against a
-*normalised* residual, which is no longer Zipformer's bypass, and `frontend.linear` is still
-unbounded. The third, that adopting it costs a fresh pretrain, did not hold: a mid-run insertion
-is a checkpoint migration (the one-off script that did it for the 600k run is in git history), and a warm start from a pretrain that
-predates the norms simply starts them at gain 1.0.
-
-### 5.5 The fifth failure: the projection ate the matrix (2026-08-24)
-
-§5.4's warning was written one run early. The fifth failure is not another escape past a bound. It
-is **the bound's own enforcement**, and it needed no new mechanism beyond the one §5.2 already
-describes.
-
-`ZipformerStack.project` implemented `σ₁ ≤ c` as a uniform rescale, `W *= c/σ₁`. That trims every
-singular direction by the same factor while the gradient re-inflates only the top one, so it is
-harmless exactly as long as it fires rarely, which is what its own docstring assumed. MEASURED on
-the 600k run warm-started 2026-08-24: `train/trunk_gain_max` reached 10.0 at step **71,000** and
-bound on **99.2 %** of every logged step after it. What that did to `stacks.3.in_proj`:
-
-| | warm start | 75.6k | 86.4k | 97.2k |
-|---|---|---|---|---|
-| σ₁ | 3.32 | **10.00** | **10.00** | **10.00** |
-| ‖W‖_F/√n_out | 1.18 | 3.09 | 2.52 | 2.06 |
-| σ₂/σ₁ | 0.988 | 0.843 | 0.793 | 0.719 |
-| **stable rank** ‖W‖_F²/σ₁² | **64.4** | **48.9** | **32.6** | **21.7** |
-| realized trunk RMS | n/a | ~5.0 | 6.3 | 9.6 |
-
-σ₁ frozen on the ceiling, Frobenius norm *falling*, stable rank halving every ~20k steps out of 384
-available directions. And the realized amplitude climbed on the same clock: 2.02 (10k) → 4.45 (70k)
-→ **12.34** (102k) against **1.51** for the model that shipped 3.43 % test-clean, because the two
-are the same event: an operator collapsing toward rank 1 pulls its own input into the one direction
-it has left, so the gain the data gets rises toward the worst case while the worst case sits still.
-Stack 2 began the same climb at exactly step 70k, as the pressure migrated. At 102k, stack 3
-(24.4 M params, **45.4 %** of the encoder) sat on a residual stream at RMS 12.34, where the measured
-1/RMS² law leaves its blocks ~0.7 % of their RMS-1 work, and stack 2 (19.2 %) at RMS 5.42 → 3.4 %.
-
-Reproduced from the real `step81000` weights, 2,000 projections under one inflating gradient:
-
-| projection | σ₁ | stable rank 0 → 2,000 steps |
-|---|---|---|
-| uniform rescale (old) | 10.000 throughout | 38.4 → 30.9 → 5.6 → **1.1** |
-| top-direction deflation (new) | 10.000 throughout | 38.4 → **39.3**, flat |
-
-The fix is the minimal projection onto the ball, `W −= (σ₁ − c)·u₁v₁ᵀ`, at the cost of one rank-1
-update: the power iteration already computes `v₁`, and one extra matvec gives the matched `u₁`. See
-§8.5. **The rule this adds to the family: a projection that binds continuously is not a bound, it is
-an operator applied 100,000 times, and what it does to the directions it was not aimed at is part of
-the model.** `train/trunk_stable_rank_min` exists because σ₁ resting on its ceiling is constant by
-construction and therefore reports nothing. Every scalar the trainer logged was blind to this, in
-the same way §5.3's four predecessors were blind to the realized activation.
-
-### 5.6 The sixth failure: bounded in gain, so it inflated in RANK (2026-08-24)
-
-§5.5's fix worked on exactly what it was aimed at and made the real problem faster, which is how
-this ledger closed. Resumed from step 81,000 with the deflating projection:
-
-| stack 3 `in_proj` | 81.0k | 86.4k | 91.8k | 97.2k |
-|---|---|---|---|---|
-| σ₁ | 10.000 | 10.000 | 10.054 | 10.164 |
-| **stable rank** | **38.4** | 46.5 | 53.6 | **62.2** |
-| ‖W‖_F | 61.94 | 68.22 | 73.63 | **80.14** |
-| σ₂/σ₁ | 0.796 | 0.982 | 0.995 | 0.994 |
-
-The rank collapse is gone (the spectrum re-expands toward the warm start's 64.4) and dev is
-better at the same step (ctc-WER 0.1001 vs 0.1011, transducer probe 0.0792 vs 0.0801, stream gap
-0.0276 vs 0.0304). **But the realized trunk went 5.85 → 21.94 over those same 19k steps, doubling
-every 9.4k against ~20k under the old projection.** The rescale had been an accidental brake: it
-crushed ‖W‖_F while it destroyed the matrix. With the matrix preserved, ‖W‖_F was free and grew
-29 %, σ₂/σ₁ went to 0.994, and the operator started inflating in **rank** at gain 10 rather than in
-gain, a direction a σ₁ bound cannot see, and one where σ₁ itself stops being enforceable one
-direction at a time (it reads 10.164).
-
-**The calibration that ended the argument.** v1.0's five `in_proj`, the model that shipped 3.43 %:
-
-| | 1 | 2 | 3 | 4 | 5 |
-|---|---|---|---|---|---|
-| σ₁ | 5.91 | 9.73 | 6.65 | 5.23 | 5.12 |
-| **‖W‖_F/√n_out** | **2.77** | **2.84** | **2.76** | **2.70** | **3.11** |
-
-σ₁ ranges 5.1-9.7; the isotropic gain is uniform at ~2.8. So §5.3's conclusion was half wrong:
-the isotropic bound was not the wrong *norm*, it was the wrong *value*: 4.0 sits 45 % above the
-level the working model runs at, which is exactly why it clipped nothing in 43k steps. Bound σ₁
-alone and the inflation goes to Frobenius; bound Frobenius loosely and it goes anisotropic.
-
-**And bounding both would still not have been the fix.** Realized trunk RMS factors as
-`input RMS × isotropic gain × alignment`. At stack 3, this run at 97.2k against v1.0: the isotropic
-gain is 3.54 vs 2.76, a factor of **1.28**, but `input × alignment` is 6.19 vs 0.55, a factor of
-**11.3**. The per-matrix gain is a tenth of the problem. Five per-stack bounds of 10.0 multiply to
-10⁵, and nothing in the parameter space reaches the compounding. That is §5.4, and it is why the
-seventh member of this family is a normaliser instead of a bound.
-
----
-
-## 6. Predictor, joiner, RNN-T
-
-### 6.1 `StatelessPredictor`
-```
-padded = left_pad(labels, context-1, value=blank)      # context = 2
-emb    = Embedding(501, 512)(padded)
-out    = Conv1d(512, 512, k=context, groups=512)(emb)  # depthwise, causal, NO recurrence
-return BiasNorm(512)(out)
-```
-The embedding table is `logits_width = 501` wide, so `blank_id = 500` is a valid id and doubles as
-the sequence-start symbol. Padding happens in **token-id space** with `blank_id`, not as a zero-pad
-of the embeddings, which is what makes `step()` bit-equal to this batched `forward`. Streaming state
-is the last `context-1` token ids (`init_state` fills them with `blank_id`); `step()` evaluates one
-position and returns the state **after** consuming the token, so reuse it verbatim and never re-derive it
-by calling `step` again with the just-emitted token.
-
-### 6.2 `TransducerJoiner`
-```
-forward: readout(tanh(enc_proj(enc)[:, :, None] + pred_proj(pred)[:, None]))   # [B,T,U+1,501]
-step:    out(tanh(enc_proj(enc_t) + pred_proj(pred_u)))                        # one (t,u) cell
-```
-`readout` pads the output width to a multiple of 8 with a **−inf bias** on the pad columns:
-`exp(-inf) = 0`, so every log-softmax, gather and gradient downstream is the 501-wide result and the
-pad columns' own gradient is exactly 0. Parameters stay 501-wide (checkpoints unaffected).
-Reason: `N = 501` is not 16-byte aligned in bf16 and cuBLAS fell to an alignment-2 kernel at
-29 TFLOPS against 57 at `N = 504`, worth 14 % of the training step. `step()` is left unpadded (one
-cell wide, GEMM-bound by nothing).
-
-`enc_proj` and `pred_proj` are hidden 2-D matrices and go to **Muon**; `joiner.out` is a vocab-width
-readout and is held on **AdamW** by the head patterns (§8.1).
-
-### 6.3 `RnntLoss`: own forward-backward
-Graves recursion on the `[B, T, U+1]` alignment grid:
-```
-α[0,0] = 0
-α[t,u] = logaddexp(α[t-1,u] + blank_lp[t-1,u],  α[t,u-1] + label_lp[t,u-1])
-β[t,u] = logaddexp(blank_lp[t,u] + β[t+1,u],    label_lp[t,u] + β[t,u+1])
-cost   = -(α[T-1,U] + blank_lp[T-1,U])
-```
-Scanned over **anti-diagonals** `t+u = d`: `T+U` vectorised steps instead of `T·U`. Reversed in both
-axes β obeys α's recursion, so both stack along the batch dim and share every kernel launch; the
-`U`-shift comes from a `-inf` sentinel column instead of a `cat`; the accepting state enters as a
-`logaddexp` against a `-inf` plane. Two ops per diagonal for both variables instead of five each.
-
-Locked against `torchaudio` to fp32 round-off plus a float64 `gradcheck`; 4.3× faster on the kernel
-(191 → 45 ms, then 27.3 → 13.1 ms after the merged scan). Also fixes a torchaudio CUDA bug where an
-empty transcript returns cost 0.0 instead of `−Σ log p(blank)`.
-
-The lattice reaches the loss as **bf16** under autocast, and the loss promotes to fp32 inside its own
-log-softmax, so the bf16 lattice is the only `[B,T,U+1,V]` tensor that has to survive until backward.
-Materialising an fp32 copy would double the step's largest allocation.
-
-Reduction is `"sum"` at the loss and divided by `token_lengths.sum()` in
-`TransducerModel.rnnt_loss` is normalised **per token**, matching CTC. A per-utterance mean under-weighted the
-aux CTC terms ~30× and was the first run's divergence.
-
-A pruned objective (icefall's two-stage, band-only joiner) was built, locked bit-identical to this
-at full band width in fp64, and removed: 30 % slower end to end, because its frame loop ran through
-plain autograd (82,937 launches/step at 5.4 µs against 20,166 at 17.1 µs). See git history.
-
-### 6.4 Total loss
-```
-total = rnnt + 0.2 * ctc + 0.15 * interctc[3] + 0.15 * interctc[4]
-```
-CTC over encoder memory at ~25 fps; InterCTC taps stacks 3 and 4 at base rate (~50 fps), both with
-`blank = 500`, `zero_infinity=True`. CTC targets are passed in their padded `[B, S]` 2-D form,
-concatenating the rows instead would cost `B` device→host syncs per CTC call, and this path runs
-3× a step. `train/interctc` logs the **raw mean** over the taps, not the weighted sum, so a climb is
-attributable to the encoder rather than to the weight.
-
-SpecAugment (`apply_spec_augment_batch`) is a train-only GPU batch op applied to the features inside
-`joint_loss`, gated on both `training.transducer.spec_augment` and `self.training`. Policy
-(`config/augment.yaml`, the "LD" policy at designed strength): 2 frequency masks of width
-`U{0..27}`, up to 10 time masks with count and span both scaled by the utterance's own valid length
-at ratio 0.05. Fully vectorised as `[B,K]` geometry reduced into one boolean mask, so it costs a
-fixed handful of kernels and never `.item()`s a length.
-
----
-
-## 7. BEST-RQ pretrain: where the warm start comes from
-
-`data/checkpoints/bestrq_encoder.pt` is the transducer's default `warm_start`, and §5.3 shows the
-handoff amplitude decides how the supervised run behaves. This stage is therefore part of the
-acoustic model's ground truth, not a preamble to it.
-
-### 7.1 `BestRqModel`
-```
-masked, mask = apply_span_mask(mel, lengths, p, span, noise_std, cmvn_mean, cmvn_std)
-enc, out_len = encoder(masked, lengths, chunk_size)             # the SAME ZipformerEncoder
-mel_n        = (mel - cmvn_mean) / cmvn_std                     # CLEAN, normalised
-stacked      = stack_frames(mel_n, stack)                       # stack = 2 * final_downsample = 4
-tgt_mask     = any(mask over each group of `stack` frames)
-select       = tgt_mask & (position < out_len)
-targets      = [q(stacked[select].float()) for q in quantizers] # [S, N], frozen, fp32
-logits       = pred_head(enc[select]).view(-1, N, codebook_size)
-loss         = cross_entropy(logits, targets)   # mean over the N codebooks
-```
-Encoder + 4 frozen quantizers + one `Linear(256 → 4·8192 = 32,768)` head. **62,200,013 trainable
-parameters**: encoder 53,778,637 + head **8,421,376**, plus 544,768 frozen quantizer buffers,
-62,744,941 elements over 602 `state_dict` keys. The head is 13.5 % of the stage and scales with
-`num_codebooks` (one codebook is 2.1 M), which is the other reason §7.1 evaluates it on selected
-positions only. It is discarded at warm start; only `encoder.*` is saved to `bestrq_encoder.pt`
-(592 keys, `extra={"quantizer_seed": seed}`). The encoder's 592 keys carry 53,778,797 elements,
-the 160 extra over the parameter count are the `cmvn_mean`/`cmvn_std` buffers, which is why a
-checkpoint restores its own normalisation and only a *fresh* run can be hurt by a missing
-`cmvn.pt` (§2.2).
-
-Head and quantizers are evaluated **only on the selected positions** (~45 % of the grid), which is
-what makes 4 codebooks affordable: both are 8192-wide readouts, and computing them on the full grid
-threw away more than half of the stage's two largest GEMMs. The boolean index is the step's one
-device→host sync, and it is cheaper than the `select.any()` probe it replaced.
-
-Targets are computed in **fp32 regardless of autocast**: the quantizer is an argmax over 8192
-near-ties, so a bf16 projection would resolve some of them differently step to step and feed the
-encoder label noise. It is 0.3 GFLOP and frozen.
-
-### 7.2 `apply_span_mask`
-Span starts are drawn per frame at `mask_prob` (only where a span still fits, which also keeps
-starts off the padding), expanded by a left-window max-pool of width `mask_span`. An utterance that
-drew no start gets one forced, computed unconditionally because branching on `starts.any()` costs
-a sync.
-
-**The fill is specified in CMVN-normalized space** and de-normalized here as
-`cmvn_mean + cmvn_std * N(0, noise_std)`. Drawing `N(0, 0.1)` in raw log-mel, which is what this did through
-v1.0, puts masked frames at +1.46 σ of the data with 0.024 σ of spread, i.e. a constant
-high-energy plateau in a region of input space the encoder never sees again at fine-tune time.
-
-`mask_prob × mask_span` sets a **task**, not just a coverage number. Current `0.02 × 30` (300 ms,
-the paper's streaming recipe) masks 0.455 of frames with ~17 % of masked frames touching an unmasked
-neighbour; the previous `0.05 × 10` masked a similar 0.478 with 39.9 % touching, i.e. solvable by
-local interpolation.
-
-### 7.3 `RandomProjectionQuantizer`
-Frozen `xavier_uniform` projection `[stack*n_mels → 16]` and a frozen L2-normed random codebook
-`[8192, 16]`, both seeded (`seed + i` per codebook). Forward is normalise → cosine similarity →
-argmax; both operands are unit-norm so max cosine ≡ nearest L2. Nothing trains.
-
-`num_codebooks = 4` is USM's multi-softmax: one codebook makes the whole pretraining signal a single
-frozen random draw, and across 20 seeds the target code entropy spans 7.64-8.90 bits (this repo's
-seed 42 draws 7.93, below the mean). Averaging N independent draws replaces one sample of that
-distribution with its mean.
-
-### 7.4 The stage's loop, and how it differs from the transducer's
-* **No gradient accumulation.** `step += 1` per loader batch and one optimizer step per batch, so
-  `pretrain.total_steps` counts optimizer updates here and loader batches there.
-* `max_frames_per_batch = 20000`, looser than the transducer's 28,000 because there is no RNN-T
-  lattice to bound: encoder + head only.
-* `encoder_lr_scale` is **overridden to 1.0** (`model_copy(update=...)`) and `pretrain.lr_scale`
-  (0.5) is applied uniformly to every group's peak instead. `BestRqModel.encoder` matches the
-  `encoder.` prefix `build_optimizer` keys on, so the transducer's knob would otherwise run 53.8 M
-  of the stage's 62.2 M trainable params at half LR while only the 8.4 M head ran at full. Held by
-  `test_pretrain_does_not_apply_encoder_lr_scale`. **Any new stage that names a submodule `encoder`
-  inherits this trap.**
-* Same two-set gradient clip and same `project_constraints` call as the transducer, so
-  `stack_in_proj_max_sigma`, `stack_bypass_min` and the `log_scale` window are all enforced here too.
-* Same `chunk_sizes` pool `{0, 16, 32}`.
-* **Dev probe**: `dev_batches = 16` fixed batches materialised once on the host, masked under a
-  pinned seed (`_DEV_MASK_SEED = 1234`, RNG saved and restored around it) at full context. Without
-  the pinned mask two probes differ by which frames they happened to hide as much as by anything the
-  encoder learned. `pretrain/loss` is over targets drawn from the same utterances the encoder just
-  saw; `dev/loss` and `dev/acc` are the only generalisation signal in the stage.
-* Watch `pretrain/acc` and `dev/acc`, **not** the loss: random-projection targets have an
-  irreducible entropy floor that makes the loss curve plateau long before the representation does.
-
-### 7.5 The handoff, and this stage's observability gap
-`pretrain.lr_scale = 0.5` restores the effective encoder LR of the pretrain that produced the only
-model this project has shipped. Removing the `encoder_lr_scale` accident doubled it, and trunk gains
-scale ≈ √LR per stack:
-
-| in_proj gain `‖W‖_F/√n_out` | stack1 | stack2 | stack3 | stack4 | stack5 | product |
+| 0 | audio | `soundfile` load | `[S]` | 16 kHz |
+| 1 | log-mel | `LogMel_Transform`, 25 ms window, 10 ms hop, 80 bins | `[T₀, 80]` | 100 fps |
+| 2 | SpecAugment | train only, fill = per-bin CMVN mean in raw space (§9.1) | `[B, T₀, 80]` | 100 fps |
+| 3 | pad + CMVN | pad `T₀` to a multiple of 16 with the CMVN mean, then `(x − mean)/std` | `[B, ⌈T₀/16⌉·16, 80]` | 100 fps |
+| 4 | frontend | `DwSepSubsampling` ×4 time, ×4 freq, weightless RMSNorm | `[B, T₁, 256]`, `T₁ = ⌈T₀/4⌉` | 25 fps |
+| 5 | S0 | 4 FusedBranch blocks | `[B, T₁, 256]` | 25 fps |
+| 6 | S1 | pool ↓2, 8 blocks | `[B, T₂, 384]`, `T₂ = ⌈T₁/2⌉` | 12.5 fps |
+| 7 | S2 | pool ↓2, linear path (no blocks) | `[B, T₃, 512]`, `T₃ = ⌈T₂/2⌉` | 6.25 fps |
+| 8 | S3 | upsample ↑2 + U-Net skip from S1, 8 blocks | `[B, T₂, 384]` | 12.5 fps |
+| 9 | memory | weightless RMSNorm | `[B, T₂, 384]` | 12.5 fps |
+| 10a | CTC head | `Linear(384 → 501)` | `[B, T₂, 501]` | 12.5 fps |
+| 10b | predictor | `StatelessPredictor` | `[B, U+1, 512]` | per label |
+| 11 | joiner | additive, on the band only | `[B, T₂, 17, 501]` | |
+| 12 | loss | banded RNN-T + 0.5 · CTC | scalar | |
+
+Total reduction: 160 × 4 × 2 = **1,280 samples = 80 ms per memory frame**.
+
+**Parameters (MEASURED).** `hf` is the conv-gated MLP width, `⌊8d/3⌋` rounded down to a multiple of 8.
+
+| stack | rate | d | blocks | heads | hf | params |
 |---|---|---|---|---|---|---|
-| old pretrain (0.5×, → 3.43 %) | 1.90 | 1.60 | 0.68 | 0.65 | 0.92 | 1.2 |
-| new pretrain (1.0×, 2026-08-20) | 3.10 | 1.31 | 1.02 | 1.01 | 1.30 | 5.4 |
+| frontend | 50 → 25 Hz | 256 | | | | 0.67 M |
+| S0 | 25 Hz | 256 | 4 | 4 | 680 | 3.45 M |
+| S1 | 12.5 Hz | 384 | 8 | 6 | 1024 | 15.57 M |
+| S2 | 6.25 Hz | 512 | 0 | | | 0.20 M (its projections) |
+| S3 | 12.5 Hz | 384 | 8 | 6 | 1024 | 15.67 M |
+| **encoder** | | | **20** | | | **35.56 M** |
+| CTC head / predictor / joiner | | | | | | 0.19 / 0.26 / 0.72 M |
+| **total** | | | | | | **36.73 M** |
 
-Realized trunk RMS at handoff went 2.2-3.6 → 5.7-17.0, against 1.5-2.7 for the *trained* model that
-works (the transducer stage started ~5× louder than where a healthy run ends) and `bypass₂` went
-0.42 → 0.20. Stack 2 is the one that collapsed in both 2026-08-2x runs. The pre-overhaul encoder
-survives at `data/backup/bestrq_encoder.pt` (identical 592 keys, same step 180,000, drop-in
-`--warm-start`).
+Each block takes two residual steps with their own gates, so the trunk is 40 sequential residual
+steps deep.
 
-**This stage logs neither `train/trunk_gain_max` nor `stack_mix/*`**, only `pretrain/{loss,acc,lr}`,
-`train/{grad_norm,grad_norm_guarded,branch_gain_max}` and `dev/{loss,acc}`. The amplitude the
-transducer inherits is therefore invisible while it is being built, and the table above had to be
-reconstructed from checkpoints after the fact. That is the largest known observability gap in the
-pipeline.
+**Why 12.5 Hz output is safe for BPE-500 (MEASURED).** A transducer needs no more than one frame per
+token per emission step, and CTC needs `T ≥ U + repeats`. On 20,000 training utterances:
 
----
+| output rate | blank fraction | max U/T | p99.9 U/T | CTC-infeasible utterances |
+|---|---|---|---|---|
+| 25 Hz | 78.7 % | 0.38 | 0.34 | 0 % |
+| **12.5 Hz** | **57.3 %** | 0.77 | 0.68 | **0 %** |
+| 8.33 Hz | 35.9 % | 1.18 | 1.03 | 0.195 % |
+| 6.25 Hz | 14.4 % | 1.57 | 1.37 | 17.4 % |
 
-## 8. Optimization
-
-### 8.1 Parameter partition (`Optimizer_Adapter.partition_params`)
-2-D `nn.Linear.weight` that is **not** in a head pattern (`frontend, ctc_head, pred_head, interctc,
-joiner.out`) → **Muon**, everything else → **AdamW**.
-Verified: **135 tensors / 46,481,408 params on Muon, 472 tensors / 8,785,698 on AdamW**.
-The partition keys on the **declared module type**, not on what the forward pass does: 6.81 M of
-that AdamW total is `ConvModule.pointwise1/2`, `nn.Conv1d` weights executed as `F.linear` (§3.6),
-held off Muon by their `ndim == 3` and nothing else.
-Tied weights (STREAM-LM ties its readout to the embedding) surface under two module names; first
-placement wins, so the same tensor is never stepped twice.
-
-Groups are bucketed by `(lr, weight_decay)`, because a param group carries only hyperparameters, so
-bucketing is exactly equivalent to per-parameter groups and is what lets the fused/multi-tensor
-kernels work: the transducer's 472 AdamW parameters collapse to 4 groups and the AdamW step drops
-6.1 ms → 0.6 ms. AdamW runs `betas=(0.9, 0.98)`, fused on CUDA.
-
-`weight_decay` applies only to `ndim ≥ 2`, so the 415 scalar/bias tensors (160,418 elements, 0.3 %
-of the model) are exempt: **289** `bias`, **98** `BiasNorm.log_scale`, **16** `res_lambda`, **6**
-`ZipformerStack.bypass`, **6** `SimpleDownsample.weights`. For each of those, 0 is a specific
-degenerate setting (value residual disabled, stack skipped, uniform pooling), not a neutral shrink
-target. `log_scale` is the exception that proves the rule (0 there *is* unit gain) and is exempted
-for a different reason: at this model's LRs decay is far too weak to be the mechanism holding the
-gain down (equilibrium `|log_scale| ~ 93` at the measured 0.93 sign-coherence), and leaving it off
-keeps decay and the projection from being confused for each other.
-
-### 8.2 `Muon`
-```
-buf   = momentum * buf + grad                       # momentum 0.95, one _foreach pass per group
-U     = newton_schulz(buf, ns_steps=5)              # fp32, batched by shape, all σ → 1
-U    *= sqrt(max(1, rows/cols))                     # Jordan's fan scaling, folded into the batch
-p    *= (1 - lr * weight_decay)
-p    -= lr * U
-```
-Quintic coefficients `(3.4445, -4.7750, 2.0315)`, iterating on the wide orientation after a
-spectral-norm normalisation. Batched over same-shaped matrices keyed on `(shape, ns_steps)`: 22
-shape classes, ~2700 launches → ~440. fp32 and not bf16, because bf16 moves the update direction ~7 %
-against fp64 where fp32/TF32 moves it 0.09 %. Rejects any non-2-D parameter outright.
-
-### 8.3 LR (`LrSchedule.lr_at`)
-Linear warmup to `peak`, then WSD: hold, then anneal over the last `decay_frac` (0.25) of the
-budget with a `1 − √frac` profile down to `peak * min_ratio` (0.01). Raising `total_steps` mid-run
-only moves the decay window. Under the cosine schedule WSD replaced, `total` *was* the curve, so
-bumping it re-heated the LR at the resume step, which is how the 120k → 175k bump that produced the
-v1.0 checkpoint accidentally became a two-cycle schedule.
-
-The function returns a **shape multiplier**; each trainer snapshots every group's calibrated peak at
-build time and applies the shape per group per step, so Muon's much larger base LR is never
-clobbered by a single absolute overwrite.
-
-Peaks: `muon_lr = 2e-2`, `adamw_lr = 1.5e-3`, `encoder_lr_scale = 0.5` on `encoder.*` in the
-transducer stage. BEST-RQ overrides `encoder_lr_scale` to 1.0 and applies its own uniform
-`pretrain.lr_scale = 0.5` instead (§7.4).
-
-**`total_steps` counts loader batches in the transducer stage, not optimizer updates** (`step += 1`
-is outside the `grad_accum` window). Convert before reasoning:
-`total_steps × max_frames_per_batch / 100 / 3600` hours. 600,000 × 28,000 = 46,667 h = **24.1
-passes** over the 1,933 h `train_sp2` corpus, in 200,000 updates at `grad_accum = 3` (that is the
-budget's ceiling: a batch that closes on the token or lattice cap carries fewer frames). In the BEST-RQ stage
-there is no accumulation, so its `total_steps` *is* updates (§7.4).
-
-### 8.4 Gradient clipping (`GradientClipping`)
-Two disjoint sets, clipped differently:
-* `guarded_parameters` (`ndim ≥ 2`): one group-norm clip; this is what `train/grad_norm_guarded`
-  reports and the only set whose norm tracks model health.
-* `unguarded_parameters` (`ndim < 2`): `clip_grads_per_tensor`, each bounded against **its own**
-  norm in 3 `_foreach` launches, returning the group's pre-clip norm for `train/grad_norm`.
-
-Order in the loop matters: the guard norm is read **before** its clip, so it sees the true gradient
-rather than a rescaled one.
-
-A single global clip is wrong here: ~99.9 % of the global norm is the scalar gates, so one gate
-decided the factor every weight matrix's gradient was scaled by, swinging ~100× per step. Muon's
-Newton-Schulz is scale-invariant within a step but `momentum_buffer` is an EMA across steps, so a
-per-step-varying rescale reweights it. Measured, Muon's momentum norms collapsed 1.30 → 0.19
-(`frontend.conv1` 0.98 → 0.12) while the raw matrix gradient never moved. **Splitting the clip in two
-only relocated the coupling**: `encoder.stacks.3.bypass` then sat at exactly 4.9998 against a
-`grad_clip` of 5.0 while the other gates were at 0.007-0.025, i.e. one gate ate the whole scalar
-budget every step and rescaled all 414 other scalars. Hence per-tensor.
-
-`grad_clip = 5.0` is a **diagnostic, not a safety bound**: Newton-Schulz renormalises Muon's update
-regardless of gradient size, so clipping protects none of the encoder's capacity, and Adam is near
-scale-invariant too. The LR is the only lever live mid-run, which makes *noticing* the failure the
-whole job.
-
-### 8.5 Projection (`ParameterProjection.project_constraints`)
-Called after every optimizer step in **both** trainers; walks `model.modules()` and calls any
-`project()` it finds, duck-typed so the shared kernel needs no slice imports (this is also what
-reaches the stacks through `_Checkpointed` and the predictor's `BiasNorm`). Projected-gradient
-descent, not clamping in `forward` alone: `clamp`'s gradient is exactly 0 past a bound, so a
-parameter pushed outside would never receive gradient again, while one resting **on** the bound
-still trains. MEASURED 2026-08-05: `stacks.5.bypass` sat at 1.0020-1.0049 across a 22k-step window
-with AdamW `exp_avg` at −2.3e-22, frozen out of training.
-
-It is deliberately **not** done inside `forward`: an in-place write to a leaf between two forwards
-that share one backward invalidates the first forward's saved tensor.
-
-* `BiasNorm.project`: `log_scale.clamp_(-2.0, 1.0)`
-* `BiasNorm.project` on each stack's `trunk_norm`: the same clamp against the wider trunk window,
-  `model.trunk_norm_log_scale_max = 1.2`. Reached by the same `project_constraints` walk, since a
-  trunk norm is a `BiasNorm`; it carries its own `log_scale_max`, so one walk enforces two windows.
-  `branch_gain_params` excludes them for the opposite reason: the trunk ceiling is above the
-  branch ceiling `gains_at_ceiling` counts against, so including them would report five gains
-  permanently pinned.
-* `ZipformerStack.project`: `bypass.clamp_(0.1, 1.0)`; `in_proj` clipped to
-  `σ₁ ≤ stack_in_proj_max_sigma` by deflating the top singular direction,
-  `W −= (σ₁ − c)·u₁v₁ᵀ`, which is the minimal (Frobenius-nearest) projection onto that ball and
-  costs one rank-1 update because the power iteration already holds a matched `u₁`/`v₁`. Over
-  `σ₁ > c·1.05` (reachable only by loading a weight saved without this constraint, where the
-  spectrum can be flat enough that deflating the top value merely promotes the second) it falls
-  back to an exact `min(σᵢ, c)` clip through one SVD.
-  **This was a uniform rescale `W *= c/σ₁` until 2026-08-24 and that is the fifth collapse**: a
-  rescale trims every direction by the same factor while the gradient re-inflates only the top one,
-  so it is harmless exactly as long as it fires rarely, and the 600k run made it fire on 99.2 % of
-  steps from 71k on. See §5.5.
-  σ₁ by 2 power iterations warm-started across steps (400 on the first call after a load, since
-  `sigma_v` is `persistent=False`). Measured accuracy: ≥ 0.99999 of the true σ₁ warm, 1.00000 cold
-  at 400 iterations on the flattest matrix in the model. `in_proj.bias` is left alone.
+Over all 562,482 rows of `train_sp2` the 12.5 Hz maximum U/T is **0.943** and the smallest CTC slack
+`T − (U + repeats)` is 2 frames: still feasible everywhere, with almost no margin. A lower output
+rate, or a speed factor above 1.1, breaks feasibility. 6.25 Hz is not a legal CTC rate, which is why
+no CTC tap sits on S2. BPE-500 carries 5.32 tokens per second of speech (p99 7.62).
 
 ---
 
-## 9. Training loop mechanics (`TransducerTrainer_Handler`)
+## 3. Front end
 
-### 9.1 One optimizer update
+### 3.1 Log-mel, CMVN and the mean fill
+
+80-bin log-mel at 100 fps, computed once into an fp16 mmap cache (ExtractFeatures). CMVN is the
+encoder's first op: `x ← (x − mean)/std` per bin, with the statistics from `data/features/cmvn.pt`
+held as `state_dict` buffers, so a checkpoint carries its own normalisation.
+
+**The only constant ever written into raw log-mel is the per-bin CMVN mean.** SpecAugment's masks,
+the batch padding, the stride pad and the streaming tail all write `mean` in raw space, which is
+exactly 0 after CMVN. A raw `0.0` would land at a median +1.5 σ after CMVN (+0.54 to +2.33 σ per
+bin, MEASURED): a loud, spectrally shaped plateau where the model should see "nothing here". Writing
+the mean before normalising keeps one encoder entry point that takes raw features in training,
+offline decode and streaming alike.
+
+**Pad to the total stride.** `forward` pads time to a multiple of 16 mel frames (×4 frontend, ×2,
+×2 pooling) with the mean fill, so every pooling step averages frames computed from real or
+mean-filled input, never an activation-space zero. Without it, an utterance's last 6.25 Hz frame
+would depend on whether it is the longest in its batch, and differ again in streaming.
+
+### 3.2 `DwSepSubsampling` (×4 time)
+
 ```
-lr_shape = lr_at(step, ...)               → applied to every group's snapshotted peak
-chunk    = random.choice({0, 16, 32})     → one chunk size per BATCH, not per utterance
-autocast(bf16):  total, rnnt, ctc, ictc, cr, simple = model.joint_loss(batch, chunk, step)
-loss = total / grad_accum ;  loss.backward()
-accumulated += 1
-if accumulated == grad_accum:
-    last_guard_norm = grad_norm_of(guard_params)          # BEFORE the clip
-    last_grad_norm  = clip_grads_per_tensor(gate_params, grad_clip)
-    clip_grad_norm_(guard_params, grad_clip)
-    for opt in optimizers: opt.step(); opt.zero_grad(set_to_none=True)
-    project_constraints(model)
-    accumulated = 0
-step += 1                                  # NOTE: outside the accumulation window
+x:[B,T,80] → [B,1,T,80]                          # T a multiple of 16
+conv1: Conv2d(1→128, k=3, stride=2, pad=(0,1)), left time-pad 1 → ReLU             50 Hz, 40 bins
+dw2:   Conv2d(128→128, k=3, stride=2, pad=(0,1), groups=128), left time-pad 1      25 Hz, 20 bins
+pw2:   Conv2d(128→128, k=1) → ReLU
+reshape [B, T₁, 128·20 = 2560] → Linear(2560 → 256) → rms_norm (no weight)
 ```
-`accumulated` is tracked explicitly rather than inferred from `step % grad_accum`, because an OOM
-drops a partial window and the counter must reset with it.
 
-### 9.2 OOM policy
-`torch.OutOfMemoryError` around the forward/backward drops the batch: `oom_skips += 1`, the whole
-accumulation window is discarded (a partial backward left gradients on only some params),
-`zero_grad`, `empty_cache`, warn, continue. The RNN-T lattice is the run's largest allocation, so a
-dense frame×token bucket is what fails first when another process takes part of the card. Occasional
-skips are a transient; persistent skips mean the budgets in `config/training.yaml` are too high for
-the free VRAM.
+Depthwise-separable subsampling (FastConformer's idea) costs 9.0 M MAC per second of audio, where a
+dense 3×3 second conv would cost 147.5 M, and it delivers 25 Hz directly.
 
-### 9.3 Validation and checkpoint selection
-`_dev_metrics` every `val_every` (10,000) steps produces four numbers:
-* `dev/ctc_wer`: greedy-CTC over the **whole** dev set (~54k words, σ ≈ 0.0011), full context.
-* `dev/ctc_wer_stream`: the same, re-decoded at `decode.chunk_size` (the *deployed* chunk, not one
-  of the training pool), and `dev/ctc_wer_stream_gap` = stream − full.
-* `dev/transducer_wer`: greedy transducer over a `dev_wer_utts = 200` subsample (~1k words,
-  σ ≈ 0.008). The subsample is strided evenly across the loader, because `FrameBucketSampler` emits
-  duration-sorted batches and the leading 200 utterances are the shortest clips in dev.
-* `dev/blank_frac`: fraction of CTC frames decoding to blank.
-
-**`transducer_best.pt` is selected on `dev/ctc_wer`, not on the transducer probe.** Selecting on the
-probe picks the luckiest noise trough: the 175k run picked step 152k, mid-anneal, whose full-dev
-ctc-WER was 0.0680 against 0.0610 at 174k, and that checkpoint decoded 0.60 WER points worse on
-test-clean than the tail average. Validation runs under
-`torch.compiler.set_stance("force_eager")`, because it is eval/no-grad/fp32, a mode training never uses, and
-letting dynamo trace it would build a second full set of graphs (§9.5).
-
-### 9.4 Checkpoints, resume, and the guard
-* Every write is `torch.save` to `.tmp` + `os.replace`, so an interrupt never truncates a checkpoint.
-* Payload: `model`, per-optimizer `state_dict`s, `step`, `best_wer`, `resume_count`, `kind`, RNG
-  (python + torch CPU + all CUDA devices) and an `extra` dict.
-* `extra` carries the two things a guard must not relearn on resume: `guard_norm_floor` and the
-  `GainCeilingWatch` baseline. The 600k run resumed 16 times; a guard relearning its reference from
-  the state it resumes *into* would adopt a diverged regime as normal.
-* Resume bumps `resume_count` and reseeds the sampler (`seed + resume_count`) for a fresh epoch
-  order rather than replaying the pre-interrupt batch stream.
-* Rolling snapshots: `transducer_step{N}.pt` every `ckpt_every = 5400`, `keep_last_n = 5`, i.e. a
-  27k-step window. **A long anneal rolls the pre-anneal snapshot off the end**, so preserving one is a
-  manual copy. Snapshots are byte copies of `transducer_last.pt`, so they carry optimizer moments
-  and RNG and resume cleanly.
-* `GradNormGuard` is fed `grad_norm_guarded` at `log_every` (where the value is already synced), and
-  is **not armed until `warmup_steps`**: `guard_window * log_every` = 5,000 < warmup 7,500, so
-  otherwise its running-minimum floor, the reference for the whole run, would be latched from the
-  LR ramp against a freshly initialised joiner. It trips when the window median exceeds
-  `guard_trend_factor` (4.0) × the run's quietest median for `guard_patience` (3) consecutive
-  windows, and then **aborts without checkpointing**, because `transducer_last.pt` is at most
-  `ckpt_every` steps old and healthier than the moment of the trip. It is one-sided: it cannot fire
-  on a gradient *collapse*, which is the other failure signature the checkpoints show.
-* `SignalGuard` wraps the loop so SIGINT/SIGTERM finishes the current step and saves cleanly.
-* `_seed_all` seeds python/torch/CUDA; torch's seed also fixes the DataLoader workers'.
-  `use_deterministic_algorithms` is deliberately not set, because cuDNN's CTC has no deterministic kernel.
-
-### 9.5 Selective compilation
-`compile_hot_modules` hands exactly four leaf modules to inductor: `BiasNorm` (−5.3 %),
-`TransducerJoiner` (−3.7 %), `ConvModule` (−1.5 %), `SwiGluFfn` (−1.0 %), via `nn.Module.compile`
-at `dynamic=True`. Measured together: 183.7 → 160.5 ms/step (−12.6 %), peak 6.96 → 5.98 GiB,
-20,008 → 14,683 launches, ~8 s of one-off warmup.
-
-The dividing line is `get_config()`, SDPA and data-dependent control flow. Compiling
-`ZipformerBlock` instead measured the same −11.5 % but took 135 s of warmup and produced 49 graphs
-against 16, because `RotaryAttention` reaches `rotary_tables`, which calls `get_config()`.
-`torch.compile` on the whole model additionally hits this build's dynamic-shape tiling assert.
-
-`nn.Module.compile` installs a compiled `_call_impl` on the instance rather than wrapping it, so
-`state_dict` keys are unchanged (609, none polluted) and a checkpoint written with compilation on
-loads into the eager decode/eval path, and the setting can be toggled across a resume.
-
-**`_RECOMPILE_LIMIT = 32`.** Dynamo's recompile limit is per *code object*, and one code object
-serves every instance, so `BiasNorm.forward` alone needs one graph per distinct width (192/256/384/
-512) per (dtype, requires-grad) mode. That is exactly torch's default of 8, and exceeding it does
-not raise. Dynamo logs one warning and silently demotes that function to eager **for the rest of the
-process**, turning a −12.6 % step back into −7 % at the first validation, hours into a run.
+**Stride-aligned causality: left pad 1, not 2.** With a left pad of 2, output `i` of a stride-2,
+k = 3 conv reads inputs `2i−2 … 2i`; stacked twice, 25 Hz frame `j` reads mel frames `4j−6 … 4j`, so
+30 ms of each 40 ms frame's own audio is deferred to the next frame. With a left pad of 1 it reads
+`4j−3 … 4j+3`: its whole group of four. The look-ahead stays inside a 4-frame group and every chunk
+is a whole number of groups (§7), so this adds no streaming latency and keeps streaming ≡ batched.
+The cache is two levels (`in_tail`, `mid_tail`) of 1 frame each.
 
 ---
 
-## 10. Data path
+## 4. Encoder
 
-### 10.1 Cache binding
-`data/features/mel/{split}.{f16,index.npy,header.json}`: one flat fp16 memmap per split, indexed by
-**manifest row order**. The header carries the five front-end params (`sample_rate, n_mels, n_fft,
-win_length, hop_length`) and a `manifest_fingerprint`: a SHA-1 over every row's `(uttid, speed)`.
-`LibriSpeechDataset` compares it at construction and raises. Without that check, pairing a clean-mel
-cache with a speed-perturbed manifest reads the right row count and the right shapes and trains on
-audio belonging to a different utterance, which nothing downstream would catch. **`--train-manifest`
-and `--train-cache-split` always move together.**
+### 4.1 Layout: a three-rate U-Net
 
-The header is written only after the last utterance of a split lands, so it doubles as a completion
-marker: an interrupted precompute leaves a short `.f16` under a stale or absent header, and a restart
-redoes only that split. Delete the header to force a rebuild.
+```
+f   = frontend(x)                                  # 25 Hz, d 256, RMS 1
+s0  = S0(f)                                        # 25 Hz, 4 blocks
+s1  = S1(avgpool2(s0))                             # 12.5 Hz, 8 blocks
+s2  = rms_norm(proj_512(avgpool2(s1)))             # 6.25 Hz, linear path, no blocks
+s3  = S3(upsample2(s2), skip = s1)                 # 12.5 Hz, 8 blocks
+mem = rms_norm(s3)                                 # encoder memory, RMS 1
+```
 
-### 10.2 `FrameBucketSampler`: three budgets
-Utterances are duration-sorted, then greedily filled into batches under three caps, any of which can
-close a batch:
-* `max_frames_per_batch` (28,000): a **sum** budget over frames.
-* `max_tokens_per_batch` (4,400): a **sum** budget over transcript *characters* (a cheap upper
-  bound on BPE tokens, so no tokenizer is needed in the sampler).
-* `max_lattice_per_batch` (1.1e7): a **product** budget, `B × max(frames) × max(chars)`.
+Every stack begins the same way:
 
-The two sum budgets bound the *average* batch and leave the tail free; the product budget bounds the
-*worst* batch, which is the one peak VRAM tracks (the densest batch of an epoch ran 1.7× the p99.9
-one, which is what produced periodic OOM drops). **All three move together, or the one left behind
-silently pins B**: raising frames 32k → 45k → 58k with tokens held at 4,000 produced B = 18, 19, 19
-and an identical 273 s of audio per step.
+```
+x = proj(x_in)                  # Linear(d_in → d), no bias; Identity when d_in == d
+x = rms_norm(x + skip)          # skip only on S3; weightless: the stack entry has RMS exactly 1
+```
 
-The batch list is built once and cached (a 562k-row pass per epoch, run in the main process with the
-loader stalled behind it, becomes one at first use). `shuffle` permutes the *batch order* per epoch
-from `seed + epoch`, preserving intra-batch length grouping; off, the stream is fully deterministic,
-which is what dev evaluation needs.
+`avgpool2` is a stride-2 mean over aligned pairs (the time axis is even at every rate because of the
+pad to 16 mel frames). `upsample2` is `repeat_interleave(2)` trimmed to the skip's length. Both are
+per-frame linear and chunk-aligned, hence transparent to streaming.
 
-`token_sort_window` (default 1 = off) re-sorts by transcript length inside a sliding window of the
-duration order, so a batch is homogeneous in U as well as T. Measured on `train_sp2`: window 256
-takes lattice waste 22.9 % → 5.6 % and epoch lattice work to 81.7 %. It is off because making every
-batch homogeneous in speaking rate is a training-semantics change no run has isolated, and the
-recipe that shipped 3.43 % did not have it.
+S2 holds no blocks but is not empty: S3's entry is `rms_norm(proj(upsample(s2)) + s1)`, a linear
+6.25 Hz low-pass path beside the skip. The release model was selected with it in place (§13).
 
-### 10.3 Batch and collation
-`FeatureCollator` pads to the batch max and yields a `FeatureBatch` of
-`(features, feature_lengths, tokens, token_lengths)`, pinned; the four H2D copies in `joint_loss` are
-`non_blocking=True` so they overlap the tail of the previous step. The pretrain stage uses the
-`FeatureCacheReader` itself as its dataset, with `collate_mels` (labels ignored).
+### 4.2 `FusedBranchBlock`: attention, then a conv-gated MLP
 
-Measured supply: the loader delivers 15,627× realtime against 1,426× needed, so **never chase the
-loader**.
+```
+q,k,v,g = rms_norm(x) @ W_in[q,k,v,g]                            # one GEMM, no bias
+q, k    = rope(γq ⊙ rms_norm_head(q)), rope(γk ⊙ rms_norm_head(k)) # QK-norm per head
+a       = SDPA(q, k, v, mask = chunk ∧ left window ∧ padding) ⊙ σ(g)
+x       = x + β_attn ⊙ rms_norm(a @ W_out[a])                     # residual step 1
+u,z     = rms_norm(x) @ W_in[u,z]                                 # one GEMM, no bias
+c       = dwconv_causal_k15(u) ⊙ silu(z)                          # conv-gated MLP, width hf
+x       = x + β ⊙ rms_norm(c @ W_out[c])                          # residual step 2
+β       = 0.05 + 0.95 · σ(b)                                      # per channel, in (0.05, 1)
+```
+
+What each piece is and why:
+
+* **Serial attention then MLP.** Two residual steps per block, each with one input norm, one input
+  GEMM and one output GEMM. Serial order doubles the sequential depth over a parallel block for the
+  same matrices.
+* **Conv-gated MLP** (E-Branchformer's cgMLP): the depthwise causal conv runs on the MLP's hidden
+  width, gated by SiLU. It replaces a separate convolution module and feed-forward pair.
+* **QK-norm** with learnable per-dim gains `γq, γk` (OLMo 2, Gemma 3): attention logits are bounded
+  by `‖γq‖∞ ‖γk‖∞ · √head_dim` whatever the residual's scale.
+* **Gated attention**: an elementwise sigmoid gate on the SDPA output (Qiu et al., NeurIPS 2025),
+  for stability at high LR and no attention sinks.
+* **Peri-LN output norm** (Gemma 2/3, OLMo 2; Kim et al. 2025): each step's contribution has RMS
+  exactly `β` per channel, whatever `W_out`'s scale is.
+* **Per-slice parameters.** `W_in` and `W_out` are one `nn.Parameter` per logical slice (q, k, v, g,
+  u, z; a, c) in a `ParameterDict`, concatenated in `forward` into the single GEMM, so Muon
+  orthogonalises each slice on its own scale (§9.2).
+* **No dropout, no macaron FFN, no value residual.** Dev WER was still falling at the end of the
+  release run (§12.3), with no over-fitting for dropout to fix.
+
+Every config value is read in `__init__`, never in `forward`, so a whole block is one
+`torch.compile` graph (§9.5).
+
+### 4.3 Norms and gates
+
+`rms_norm` is `F.rms_norm(x, (d,), eps=1e-6)` with **no weight**, everywhere except the QK-norm.
+A learnable gain on a residual-path norm is a free amplitude, and Adam drives a sign-coherent scalar
+into whatever bound is put on it. The only per-channel scales on the residual path are the `β`
+gates, whose range the sigmoid fixes.
+
+`b` starts at **−1.0** (`β₀ = 0.30`) and trains on AdamW with no weight decay. The floor of 0.05
+exists because a gate that can reach 0 is an absorbing state: the block's weights stop receiving
+gradient and never recover. With the floor, a block always sees at least 5 % of its gradient.
+Saturation of `b` itself is soft but real: simulated AdamW at `lr 1.5e-3` stalls a sign-coherent
+`b` at −15 to −20 after ~43k to 54k steps, so a gate on its floor rarely comes back. A rising
+`train/res_gate_floor_count` therefore reads as "blocks switching off for good" (§10).
+
+### 4.4 Attention
+
+`head_dim = 64` everywhere; RoPE with base 10000 at each stack's own frame index. SDPA gets a boolean
+mask (chunk-causal ∧ left-context window ∧ key padding), so it runs the memory-efficient kernel.
+
+The left-context window is **chunk-granular**, because a ring buffer holds whole chunks: query `i` in
+the chunk starting at `s(i)` sees key `j` iff `s(i) − L ≤ j < s(i) + C`, with `C` and `L` the chunk
+and left context at that stack's rate. A per-frame sliding window would give each query in a chunk a
+different window and break streaming ≡ batched. At full context (`chunk = 0`) the window is unlimited.
+
+**A padded query attends to itself.** With a bounded window, a pad query far past a short row's
+length can have no real key in view; SDPA returns NaN for an all-masked row, and `0 × NaN` would
+carry it into every real query that reads the pad frame's value. Real queries always see
+themselves, so only pad queries change.
+
+**RoPE positions are window-local in streaming.** Absolute positions grow without limit in a live
+session and fp32 `pos × inv_freq` loses relative-angle precision as they grow (MEASURED: 8e-4 rad
+between adjacent frames after 1 h, 2.8e-2 rad after 24 h at 12.5 Hz). RoPE scores depend only on
+`i − j`, so the ring caches **pre-RoPE** keys and rotates `[cache ∥ chunk]` with positions
+`0 … L + C − 1` every chunk: exact, bounded, one rotation of `L` keys per chunk.
 
 ---
 
-## 11. Observability: what each scalar can and cannot see
+## 5. Amplitude by construction
 
-### 11.1 Transducer stage
-All `train/*` are emitted every `log_every = 250` steps from a **single** device→host sync: 11
-scalars plus 3×`n_stacks` mix values are concatenated and `.tolist()`ed once, because every `.item()`
-drains the CUDA queue.
+Every operator that can change the activation scale and what bounds it. Every bound is a
+consequence of the forward pass; none is enforced by a projection, a clamp or a watchdog.
 
-| Tag | Quantity | Blind to |
+| Operator | Normalised by | Bound |
 |---|---|---|
-| `train/loss,rnnt,ctc,interctc` | loss terms, per token (`interctc` is the RAW mean over taps) | everything structural |
-| `train/lr` | AdamW group 0's LR (`optimizers[-1]` is always AdamW) | Muon's LR, which is 13× larger |
-| `train/grad_norm` | the **scalars'** group pre-clip norm (`ndim < 2`), not the old global | **it is ~95-99 % one scalar gate.** The old global is `√(1/share)` larger (+0.5 % at a 99 % share, +2.6 % at 95 %), so the two agree to 2-3 figures, not exactly. Two runs were aborted on this as false positives |
-| `train/grad_norm_guarded` | norm over `ndim ≥ 2` only, read **pre-clip** | the gates, by design; this is the health signal |
-| `train/guard_norm_median`, `train/guard_norm_floor` | `GradNormGuard`'s window median and its running minimum | emitted only once the window has filled; the floor is persisted through `extra` |
-| `train/branch_gain_max` | `max exp(log_scale)` over all 98 | it is a LEVEL: a warm start ships 6 gains on the ceiling, so it reads pinned from step 0 |
-| `train/gains_at_ceiling` | **count** at the ceiling (tolerance 1e-3, so a checkpoint written under a wider bound counts too) | n/a (this is the shape the branch failure had: 1 tensor → 3) |
-| `train/trunk_gain_max` | `max σ₁(in_proj)` over the 5 `Linear` stacks | realized amplitude. This is a worst-case bound; the shipped model sits at 9.73 while its trunk is at RMS 1.5-2.7. Free: it reads the value `project` just computed |
-| `stack_mix/i_residual` | `1 − b` | anything about `in_proj`; read *healthier* at the 2026-08-22 collapse than 20k steps before it |
-| `stack_mix/i_processed` | `b · exp(log_scale)` of the last `norm_out` | the branch's realized RMS, which is this times `rms(x)/rms(x−bias)` of that norm. That ratio is now capped at `max_amplification`, so the metric under-reads by **at most 4×** (and can over-read when the ratio is < 1); the 27× gap it showed in 2026-08-21 (2.34 logged against 64 emitted) is a pre-cap measurement and is no longer reachable |
-| **`stack_mix/i_trunk`** | **realized RMS of the trunk residual, POST `trunk_norm`** | nothing yet; stack 0's entry is the frontend's output, the one unbounded operator |
-| **`train/trunk_stable_rank_min`** | `min ‖W‖_F²/σ₁²` over the 5 `Linear` stacks, i.e. how many directions the flattest trunk operator still carries | which stack it is, and the realized amplitude. Free for the same reason as `trunk_gain_max`. It exists because σ₁ pinned on its bound is uninformative by construction, which is the blind spot 2026-08-24 went through |
-| `train/encoder_param_norm` | ‖encoder params‖, one fused `_foreach_norm` | direction, conditioning, per-tensor detail |
-| `dev/ctc_wer` | full-dev greedy CTC, ~54k words, σ ≈ 0.0011 | the transducer head directly (it tracks it closely enough to rank checkpoints) |
-| `dev/ctc_wer_stream`, `dev/ctc_wer_stream_gap` | the same at the deployed chunk, and the delta | it is a diagnostic, never the selection metric |
-| `dev/transducer_wer` | greedy transducer on 200 utts | ~1k words, σ ≈ 0.008. **Never compare across runs with different sampling** |
-| `dev/blank_frac` | CTC frames decoding to blank | n/a (a blank-collapse tell) |
+| frontend output | weightless `rms_norm` | RMS = 1 per frame |
+| stack entry (`proj` + skip) | weightless `rms_norm` | RMS = 1 per frame |
+| one residual step `β ⊙ rms_norm(y)` | Peri-LN output norm | per-frame RMS ≤ `max β` < 1 |
+| stack exit after `n` blocks (`2n` steps) | | RMS ≤ 1 + 2n coherent worst case, ≈ √(1 + Σβ²) if uncorrelated |
+| attention logits | QK-norm | ≤ `‖γq‖∞ ‖γk‖∞ · √64` |
+| encoder memory | weightless `rms_norm` | RMS = 1 per frame |
+| joiner input to `tanh` | `enc_proj`, `pred_proj` | linear maps of RMS-1 inputs; `tanh` bounds the readout input |
 
-`_train_utils.GainCeilingWatch` warns when the count at the ceiling reaches a new high-water mark,
-not on a level, and once per new level rather than once per window (the gains train *on* the bound,
-so the count rattles). `SignalGuard`/`GradNormGuard` reads `grad_norm_guarded`.
+Failure modes this rules out, by mechanism:
 
-### 11.2 BEST-RQ stage
-`pretrain/{loss,acc,lr}`, `train/{grad_norm,grad_norm_guarded,branch_gain_max}`, `dev/{loss,acc}`,
-and nothing else. Notably absent: `trunk_gain_max`, `gains_at_ceiling` and all of `stack_mix/*`, i.e.
-the amplitude the transducer inherits is not observed while it is built (§7.5). Read `dev/acc`, not
-`pretrain/loss`.
+| Failure | Path it needs | Here |
+|---|---|---|
+| a learnable norm gain amplifies one stack until the next is arithmetically silenced | a gain on a residual-path norm | no gain on any residual-path norm |
+| a norm that divides by `rms(x − bias)` but scales `x` | a free bias inside a norm | no bias in any norm |
+| an inter-stack projection inflates in gain, anisotropy or rank | an unnormalised inter-stack Linear | every stack entry is renormalised, so `W`'s scale, spectrum and rank cannot reach the activation |
+| a residual gate collapses to exactly 0 | a gate with a reachable 0 | `β ≥ 0.05` by parametrisation |
+| one scalar gate dominates the global gradient clip | scalar gradients ∝ activation scale | activations are bounded, and scalars are clipped per tensor anyway (§9.2) |
 
----
+What remains free, none of it able to move the trunk's amplitude:
 
-## 12. Decode and evaluation
-
-### 12.1 Search
-`TransducerBeamSearch` is a Graves A/B time-synchronous search over encoder memory: blank scored
-once per frame then the hypothesis retires to `t+1`, at most `max_symbols = 5` emissions per frame,
-equal-prefix recombination (logadd merge) at every prune. Keeping blanked hyps in the live beam
-instead would charge an idling hypothesis up to `max_symbols` blank log-probs at a single frame, a
-systematic over-penalty that biases the search. The whole live beam is evaluated in one batched
-predictor+joiner call per symbol step (batch dim = beam width), so a frame costs a few GPU launches
-and one host sync rather than one per hypothesis. `greedy()` mirrors the trainer's dev probe exactly.
-
-Predictor-state contract: `step(state, token) → (out, new_state)` where `new_state` is already the
-context *after* consuming `token`. Both greedy and beam make exactly ONE `step` call per hypothesis
-per emission attempt; re-deriving the state would duplicate the emitted token into its own context.
-
-### 12.2 Rescoring
-When `decode.lm_weight > 0`:
-```
-score = acoustic + α · lm_seq − β · ilm_seq + length_bonus · len
-```
-one batched STREAM-LM forward over the n-best, plus one batched internal-LM forward. **n-best
-rescoring, not shallow fusion**, because per-emission fusion costs far more GPU time for a corpus decode.
-All three weights default to 0.0, which reproduces the pure-acoustic decoder exactly (the regression
-lock), and all three are swept together by `evaluate.py`'s dev sweep.
-
-`InternalLmScorer` (Meng et al., ILME) evaluates the joiner with the encoder memory set to zero, so
-only the joiner's bias and the predictor path survive, then renormalises over the **non-blank**
-labels (blank is the last column, so slicing it off leaves column *i* = token id *i*; the constructor
-asserts `blank_id == logits_width - 1`). With a stateless predictor the resulting prior conditions on
-`predictor_context` tokens, which is the low-order regime LODR argues is the right thing to subtract.
-The estimate has no EOS, so it covers the U emitted tokens only.
-
-STREAM-LM is a 512×16 deep-narrow causal Transformer (~44 M) sharing this repo's `BiasNorm`,
-`SwiGluFfn` and RoPE, plus GQA (8 query heads / 2 KV), QK-norm, tied embeddings and value residual
-(`lambda = 1.0`), trained with Muon+AdamW and softmax z-loss on document-masked packed windows.
-`lm.d_model` is load-bearing at inference: `lm_best.pt` must match it or `load_checkpoint` fails.
-
-### 12.3 Modes and the evaluation harness
-Streaming mode feeds feature-rate chunks (`2 * decode.chunk_size`) through `streaming_forward` with a
-carried `StreamCache`; offline mode runs the whole utterance in one encoder call. Both funnel into
-the same beam.
-
-`evaluate.py` runs the ablation `greedy → beam → beam+LM` cumulatively in both modes.
-`eval.workers = 4` decodes the six stage×mode passes **concurrently** in the QUALITY pass (a single
-decode leaves the GPU ~70 % idle because the beam is Python-bound; 1 → 6 workers measured
-96.0 s → 53.5 s, GPU 31 % → 85 %). Timing is a **separate serial pass** over `rtf_probe_utts = 200`
-evenly-strided utterances, so the reported RTF / first-partial latency / finalize cost are
-contention-free; audio IO sits outside the timer. Report goes to `runs/eval/report-{split}.json`,
-`{split}` filled from `--clean`/`--other` so one cannot overwrite the other.
+* **Scale-free slices**: `q`, `k` feed a per-head norm; the frontend `Linear` and stack `proj` feed a
+  weightless norm; `W_out` feeds the output norm. Their norms only set Muon's effective step size
+  (`train/weight_norm_max`).
+* **Scale-sensitive slices**: `g` feeds `σ`, `z` feeds SiLU, so their scale sets how saturated those
+  gates are. A `σ(g)` stuck at 0 switches a head off (`train/gate_sat_frac`). At S3's entry,
+  `‖proj‖` sets the deep-versus-skip mix (`stack_rms/3_skip_ratio`).
+* **The QK gains** (attention sharpness) and **the joiner projections**.
 
 ---
 
-## 13. Invariants
+## 6. Heads and loss
 
-1. `ZipformerEncoder.forward` signature `(features, lengths) → (encoded, out_lengths)` is frozen:
-   the CTC heads, the joiner and streaming inference all depend on it. `return_intermediates`
-   extends it to a 4-tuple; nothing else may.
-2. Every stack is length-preserving at base rate; only `frontend` and `final_downsample` change the
-   frame rate.
-3. `streaming_forward` ≡ `forward(chunk_size=B)`, bit-for-bit, tested. Decode `chunk_size` must be a
-   multiple of `chunk_lcm() = 8` base-rate frames.
-4. Blank id is `vocab_size` (500), logits width is 501, and blank is the **last** column. CTC,
-   InterCTC, the transducer and `InternalLmScorer`'s renormalisation all depend on it. The LM's
-   `decoder_vocab_size` is 502 (id 500 is an unused hole so `eos_id = 501` is addressable).
-5. A mel cache is bound to its manifest by fingerprint; `--train-manifest` and `--train-cache-split`
-   move together.
-6. `max_frames_per_batch`, `max_tokens_per_batch` and `max_lattice_per_batch` move together, or the
-   one left behind silently pins the batch size.
-7. Anything that sizes a VRAM budget must set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
-   **before the first CUDA allocation**, or it measures a different allocator than the run it is
-   sizing. All three trainers set it.
-8. Compile the four elementwise leaves (`BiasNorm`, `TransducerJoiner`, `ConvModule`, `SwiGluFfn`),
-   never the model. The dividing line is `get_config()`, SDPA and data-dependent control flow.
-9. `project_constraints` runs after **every** optimizer step in both acoustic trainers. A bound
-   enforced only in `forward` leaves the parameter in `clamp`'s dead zone permanently.
-10. `total_steps` counts loader batches in the transducer stage and optimizer updates in the BEST-RQ
-    stage. Convert to audio-hours before comparing any run to a published one.
-11. Any stage that names a submodule `encoder` inherits `optim.encoder_lr_scale`. Override it
-    deliberately or it silently halves that stage's LR (§7.4).
-12. `ConvModule`'s two kernel-1 convs stay `nn.Conv1d`. They are *called* as `F.linear`, but their
-    `ndim == 3` is what keeps 6.81 M params on AdamW; declaring them `nn.Linear` moves them to
-    Muon without touching a checkpoint key (§3.6, §8.1).
-13. A trainer refuses to start without `cmvn.pt` unless `cmvn_path=""` says so explicitly. The
-    encoder's mean 0 / std 1 fallback exists for tests and for inference, where the checkpoint
-    carries the real buffers (§2.2).
+### 6.1 CTC head
+`Linear(384 → 501)` on the memory at 12.5 Hz, blank 500 as the last column. It is an auxiliary loss,
+the source of the band (§6.5), and the cheap full-dev greedy WER probe. There are no intermediate
+CTC taps: S2 runs at 6.25 Hz, where 17.4 % of utterances are CTC-infeasible.
+
+### 6.2 `StatelessPredictor`
+Embedding 501 × 512, a depthwise causal Conv1d over the last 2 tokens, then a weightless
+`rms_norm`. Streaming state is the last token id.
+
+### 6.3 Joiner
+Additive: `readout(tanh(enc_proj(mem)[:, :, None] + pred_proj(pred)))`, `joiner_dim 512`, readout
+padded to 504 columns with a −inf bias on the pad (cuBLAS alignment). It is evaluated only on the
+band's cells (§6.5).
+
+### 6.4 Objective
+
+```
+N_tok = Σ token_lengths
+total = rnnt / N_tok + 0.5 · ctc / N_tok
+ctc   = F.ctc_loss(reduction = "sum")
+rnnt  = Σ_b −log p(y_b | x_b) over the banded lattice
+```
+
+Both terms are divided by the batch's **token** count, so their ratio does not move with batch
+composition or frame rate. The CTC weight of 0.5 was chosen by screening (§13).
+
+### 6.5 Banded RNN-T
+
+The RNN-T path at frame `t` sits near the number of tokens emitted so far, and the CTC head estimates
+that number for free:
+
+```
+p_nb(t) = 1 − p_ctc(blank | t)                       # detached
+c(t)    = Σ_{t' ≤ t} p_nb(t')                         # occupancy: expected tokens by frame t
+c(t)   ← c(t) · U / c(T−1)                            # rescale so the path ends at (T−1, U)
+W'      = min(W + 1, U + 1)                           # W = 16 → 17 cells, ±8 tokens
+lo(t)   = clamp(⌊c(t)⌋ − W//2, 0, U + 1 − W')
+lo(0)   = 0,  lo(T−1) = U + 1 − W'                    # both terminals inside the band
+k       = W' − 1                                      # the largest legal rise of lo per frame
+lo      ← cummin(lo − t·k) + t·k                      # (1) forward repair: rises ≤ k
+lo(T−1) = U + 1 − W'
+lo      ← max(lo, revcummax(lo − t·k) + t·k)          # (2) reverse repair: lift the tail
+band(t) = { lo(t), …, lo(t) + W' − 1 }
+```
+
+`c` is a cumulative sum of non-negative numbers, so `lo` starts monotone. Pass (1) is the largest
+`lo' ≤ lo` whose per-frame rise is at most `k`, which keeps the path connected. **Pass (1) alone is
+not enough**: it only lowers `lo`, so a burst of non-blank mass late in the utterance drags
+`(T−1, U)` out of the band. MEASURED on such a case (U = 90, T = 150, non-blank mass in the last 3
+frames): `lo(T−1) = 48` against the 74 required, a **finite** cost of 2e30 that no NaN guard catches,
+and an infinite arc posterior that poisons the batch's gradient. Pass (2) only raises `lo`, keeps
+every rise ≤ `k`, and cannot lift `lo(0)` off 0 while `U ≤ T·k` (always: U/T ≤ 0.943 against
+k = 16). The two passes held start, end, monotonicity and the rise bound on 20,000 adversarial
+random occupancies. `train/band_infeasible` counts any band that still misses a terminal and must
+read 0. A head with `c(T−1) < 0.5` (not yet emitting) falls back to the diagonal `c(t) = t·U/(T−1)`.
+
+**The band is in tokens**, so its time coverage does not depend on the frame rate: ±8 tokens is
+about ±1.5 s of speech at 5.3 tokens/s.
+
+**Lossless in practice (MEASURED).** `dev/band_loss_gap`, the banded minus the full RNN-T cost per
+token on a fixed dev batch, read **0.0000** at every validation of the release run and
+`train/band_infeasible` read 0 throughout. W = 16 keeps 31.5 % of the lattice cells on dev-other's
+average utterance and less on longer training batches, because the band is a fixed 17 cells against
+`U + 1`.
+
+**Warmup.** The first `band_warmup_steps` = 10,000 loader batches use the full lattice, because a
+fresh CTC head carries no alignment. The batch budgets are sized for that full lattice (§9.4).
+
+**Implementation.** One autograd function serves full and banded lattices: the joiner evaluates
+`[B, T, W', V]` at `u = lo + j` (predictor rows gathered after `pred_proj`), the log-softmax and arc
+gather run on the band, the two arc grids are scattered into `[B, T, U+1]` grids filled with a large
+negative constant, the anti-diagonal scan runs unchanged, and the backward gathers arc posteriors
+back to the band. The full lattice is `lo = 0, W' = U + 1` through the same code, so "banded at full
+width ≡ full" holds bit for bit, and both carry a float64 `gradcheck` (`test_rnnt_band`).
+
+Prior art: CTC-guided lattice reduction (Wang et al. 2022) bands around a CTC Viterbi alignment and
+alignment-restricted RNN-T (Mahadeokar et al. 2021) around an external one. The cumulative-occupancy
+band needs no alignment pass: it is one `cumsum` over a tensor the step already computes.
+
+---
+
+## 7. Streaming
+
+### 7.1 Contract
+
+`S2Encoder.streaming_forward(chunk, cache, n_valid)` equals the batched `forward` with the same
+`(chunk_size, left_context)` mask to fp32 round-off (gate `atol = 1e-4`, MEASURED 2.1e-6 to 2.7e-6),
+including a partial final chunk and the kept tail. The time-coupling ops:
+
+1. `DwSepSubsampling`: look-ahead confined to the 4-frame group, two 1-frame tails.
+2. Every block's causal conv: the last 14 frames of `u`.
+3. Every attention: a ring of the last `left_context` frames (at that stack's rate) of pre-RoPE `k`
+   and `v`, plus their validity mask.
+4. `avgpool2`: chunk boundaries align to pairs at every rate, so pooling never straddles one.
+
+Units: `chunk_size` and `left_context` count **25 Hz frames** (40 ms). `chunk_lcm = 4` (rates ÷1,
+÷2, ÷4), so a chunk is a multiple of 160 ms.
+
+| | training pool (sampled per batch) | decode default |
+|---|---|---|
+| `chunk_size` | {0 = full context, 8 (320 ms), 16 (640 ms)} | 8 (320 ms) |
+| `left_context` | {64 (2.56 s), 128 (5.12 s), unlimited} | 128 (5.12 s) |
+
+### 7.2 Bounded state
+
+At the default 5.12 s the whole streaming state is **1.32 M values, 5.3 MB in fp32** (MEASURED after
+30 chunks), constant for any stream length: the k/v rings are 4 × 2 × 256 × 128 values at S0 and
+16 × 2 × 384 × 64 at S1 and S3, plus the conv tails. Attention cost per chunk is constant too, so a
+live session can run indefinitely.
+
+### 7.3 Tail: finish the chunk, then decode one more
+
+At end of stream the final partial chunk is completed with the CMVN mean and **one further whole
+chunk** (`decode.tail_chunks: 1`, 320 ms) of mean fill follows. **Every output frame is kept**,
+including those produced from the fill; the pad positions are key-masked, so real frames never attend
+to fabricated ones. A transducer emits some final tokens a little late, and they need frames to land
+on: dropping the tail's frames costs about 0.5 points of dev-other streaming WER, almost all of it in
+the last two words. It costs one chunk of compute at finalize and no added latency on a live stream
+that endpoints on trailing silence.
+
+### 7.4 Optional: revise on endpoint
+
+When a stream endpoints, the demo re-runs the offline mode over the buffered utterance and replaces
+the streaming hypothesis. It costs one offline encoder pass at finalize. It is a product choice for
+the demo, and **reported streaming WER never uses it**.
+
+---
+
+## 8. Decoding and evaluation
+
+### 8.1 Greedy: label-looping
+
+While a hypothesis emits blanks its predictor state does not change, so the joiner is evaluated on
+the next 16 frames at once against that one state and the search jumps to the first frame whose
+argmax is non-blank (Bataev et al. 2024). That is exactly frame-by-frame greedy, with one joiner
+call per emitted token instead of one per frame (`test_label_looping_equals_framewise`). At 57 %
+blank frames it removes most of the per-frame Python loop.
+
+### 8.2 Beam and LM rescoring
+
+A Graves-style time-synchronous beam (A/B sets, prefix recombination), `beam_size 10`,
+`max_symbols 5` per frame (max U/T is 0.943 at 12.5 Hz). Each symbol step evaluates the whole live
+beam in one batched predictor + joiner call.
+
+With an LM attached the n-best is re-ranked by
+
+```
+score = acoustic + α · lm_seq − β · ilm_seq + λ · len
+```
+
+`lm_seq` is STREAM-LM's sequence log-probability. `ilm_seq` is the internal-LM estimate (Meng et al.
+2021): the joiner run with the encoder memory zeroed and renormalised over non-blank labels,
+subtracted because the predictor already carries a language prior from the training transcripts.
+`λ` offsets the transducer's deletion bias. All three weights default to 0 (the pure-acoustic
+regression lock) and are tuned on dev per split and mode (§12).
+
+### 8.3 Evaluation
+
+`evaluate.py --clean | --other` scores the test set with weights tuned on the matching dev set.
+Stages are cumulative (greedy → beam → beam + LM), each offline and streaming. Every row reports:
+
+* WER and CER with raw error and reference counts, so two runs can be compared without re-decoding.
+* **Edge error rates**: first-2 / middle / last-2 word error with the deletion share of each, to see
+  where streaming errors sit.
+* **Emission latency** (streaming): per correct word, the audio time its first token was shown (the
+  end of its chunk) minus the word's end in a CTC forced alignment of the reference; median and p90.
+* RTF, first-partial latency and finalize cost, from a separate serial timing pass on 200 strided
+  utterances, because concurrent decoding makes timing meaningless.
+* The n-best oracle WER on dev: the floor any rescoring could reach.
+
+---
+
+## 9. Training
+
+### 9.1 Data and augmentation
+
+* LibriSpeech `train-clean-100 + train-clean-360 + train-other-500`, each utterance paired with one
+  copy at 0.9× or 1.1× speed (`train_sp2`: 562,482 rows, 1,933 h). The speed factor is resampled in
+  the waveform at extraction and baked into the fp16 mel cache (157 GiB), which is bound to its
+  manifest by a fingerprint because row order is the cache index.
+* SpecAugment as a GPU batch op on raw log-mel with the CMVN-mean fill: 2 frequency masks of up to
+  27 bins; time masks by lhotse's rule at ×2.5 strength, up to 25 masks each ≤ 5 % of the
+  utterance and ≤ 37.5 % together. No time warp.
+* `FrameBucketSampler`: duration-sorted batches under three budgets (28,000 frames, 4,400
+  transcript characters, and `B · max(frames) · max(chars)` ≤ 11 M for the full lattice of the
+  warmup), shuffled per epoch.
+
+### 9.2 Optimisation
+
+| Tensor | Optimizer |
+|---|---|
+| `W_in` / `W_out` slices, stack `proj`, `frontend.linear`, joiner `enc_proj` / `pred_proj` | **Muon**, `lr 1e-2`, momentum 0.95, 5 Newton-Schulz steps, each slice orthogonalised on its own |
+| depthwise convs, frontend convs, CTC head, joiner readout, predictor embedding | AdamW, `lr 7.5e-4` |
+| gates `b`, QK gains, biases | AdamW, no weight decay |
+
+Weight decay 1e-2. Orthogonalising per slice matters: Newton-Schulz on the fused concatenation would
+couple the scales of unrelated projections.
+
+**Clipping** is two-set (`GradientClipping`): the matrices are clipped as a group, scalars and
+vectors per tensor. A vector parameter multiplies a whole `[B, T, C]` activation, so its gradient is
+sized by the batch, not the model; in one shared clip a single gate decides every matrix's factor
+and, through Muon's momentum EMA, reweights its steps.
+
+**Runaway guard.** Newton-Schulz renormalises every Muon update, so clipping bounds no matrix step.
+`GradNormGuard` watches the matrices' pre-clip norm and aborts, without checkpointing, when its
+windowed median stays above 4× the run's quietest median for 3 windows.
+
+### 9.3 Schedule and budget
+
+WSD: 5,000 batches of linear warmup, a constant phase, and a `1 − √frac` anneal to 1 % over the
+last 25 %. `grad_accum` 3. **`total_steps` counts loader batches, not optimizer updates.** The
+release budget is 600,000 batches, 46,667 h of encoder audio, 24 passes over `train_sp2`.
+
+**Branched cooldowns.** A WSD constant phase is uninformative on its own: most of the gain arrives
+in the anneal. The trainer keeps the trunk checkpoint at each configured branch point
+(`transducer_branch{225000,337500,450000}.pt`, the decay starts of a 300k, 450k and 600k budget),
+and each shorter budget is one anneal resumed from its file. That measures WER against compute for
+about 1.3 runs' cost (§12.3), and `transducer_branch450000.pt` is also the resume point for a longer
+budget.
+
+### 9.4 Step mechanics
+
+```
+lr        = peak · wsd(step)
+chunk, left ~ the §7.1 pool                          # one pair per batch
+autocast(bf16): terms = model.joint_loss(batch, chunk, left, use_band = step ≥ 10k)
+(terms.total / grad_accum).backward()
+every grad_accum batches: guard reads matrix norm → two-set clip → opt.step() → zero_grad
+```
+
+MEASURED on the release run: 0.078 s per loader batch in steady state (0.091 s averaged over the
+whole run including validation), peak 4.31 GiB allocated with `expandable_segments`. The banded
+lattice is small, so the encoder's activations set peak VRAM after the warmup. A batch that runs out
+of memory is dropped with a warning and its accumulation window discarded. The three budgets move
+together, or the one left behind silently pins `B`. `scripts/profile_transducer_step.py` measures
+step time, VRAM and kernel counts on the real loader.
+
+### 9.5 Compilation
+
+Every `FusedBranchBlock` is compiled with `torch.compile(dynamic=True)`, SDPA included; the whole
+model is not (this torch build hits a dynamic-shape tiling assert). The residual stream is fp32 from
+every stack entry, so one block code object serves 5 graphs (one per width × mask kind) rather than
+twice that. dynamo's recompile limit is per code object and exceeding it silently demotes the block
+to eager, so the trainer raises it to 64. Validation runs eager.
+
+### 9.6 Validation, checkpoints, averaging
+
+Every 10,000 batches, over full dev-clean and dev-other: greedy CTC and label-looping greedy
+transducer WER, offline and in the deployed streaming condition (320 ms chunks, 5.12 s left context,
+kept tail), plus `dev/band_loss_gap` and the attention-gate saturation on a fixed dev batch.
+`transducer_best.pt` is selected on **dev-other streaming greedy-transducer WER**.
+
+`transducer_last.pt` is written atomically every 5,400 batches with optimizer and RNG state; Ctrl-C
+checkpoints and exits at the next step. The newest 5 rolling `transducer_step{N}.pt` snapshots are
+averaged into `transducer_avg.pt`, the checkpoint every decode path loads.
+
+---
+
+## 10. Observability and debugging
+
+| Tag | Quantity |
+|---|---|
+| `train/loss`, `rnnt`, `ctc` | loss terms per token |
+| `train/lr` | AdamW group 0 (Muon follows the same shape) |
+| `train/grad_norm_guarded` | pre-clip norm over the weight matrices: the health signal |
+| `train/grad_norm` | pre-clip norm of the scalar/vector group |
+| `train/res_gate_min`, `res_gate_floor_count` | minimum `β` over all 40 gates; count with `σ(b) < 0.01` |
+| `stack_rms/{i}_exit` | realised RMS leaving each stack (entry is 1 by construction) |
+| `stack_rms/3_skip_ratio` | RMS of `proj(s2)` over RMS of the S1 skip at S3's entry |
+| `train/weight_norm_max` | max ‖W‖_F over Muon matrices (tracks Muon's effective step) |
+| `train/qk_gain_max` | max `‖γq ⊙ γk‖∞` |
+| `train/band_scale` | median `c(T−1)/U` before the rescale |
+| `train/band_infeasible` | bands missing a terminal after the repair; **must be 0** |
+| `train/gate_sat_frac` | fraction of attention-gate activations below 0.01, on the fixed dev batch |
+| `dev/band_loss_gap` | (banded − full) RNN-T cost per token on the fixed dev batch |
+| `dev/ctc_wer*`, `dev/transducer_wer*`, `dev/blank_frac` | full dev, greedy, offline and streaming, per split |
+
+Everything is emitted from one host sync per `log_every`.
+
+| Symptom | Read, in this order | Usually |
+|---|---|---|
+| dev WER turns upward mid-run | `stack_rms/*_exit` → `res_gate_floor_count` → `grad_norm_guarded` | Not amplitude (bounded by construction). A rising exit RMS means one block dominates its stack; gates on the floor mean blocks switching off |
+| `res_gate_floor_count` rising | per-stack `res_gate_min` | Blocks deciding they are useless; a capacity hint, not a divergence |
+| `dev/band_loss_gap` > 0.01 | `train/band_scale` → `dev/blank_frac` | The CTC head's token count drifting from the transducer's alignment; widen `band_width` or extend the warmup. The trainer warns |
+| `train/rnnt` ~1e28 or an inf gradient | `train/band_infeasible` | A band missing `(T−1, U)`: the repair was bypassed |
+| streaming last-word errors ≫ offline | `decode.tail_chunks` | The tail is being dropped (§7.3) |
+| streaming WER ≫ offline | `dev/ctc_wer_stream_gap` → decode left context | The decode window is one the training pool never sampled |
+| OOM mid-run | OOM-skip warnings → the three budgets | `max_frames_per_batch` too high for the densest batch |
+| step time regresses hours in | the log, for a dynamo recompile-limit warning | A block silently demoted to eager |
+| greedy disagrees with frame-wise greedy | `test_label_looping_equals_framewise` | A bug; label-looping is exact |
+
+---
+
+## 11. Invariants
+
+1. **No learnable scale on the residual path except the floored gates `β`.** Every residual-path
+   norm is weightless. A gain, a bias inside a norm or an unnormalised inter-stack operator re-opens
+   the failure modes of §5. If an experiment needs one, bound it by parametrisation, never by
+   projection.
+2. Every stack entry, the frontend output and the encoder memory are `rms_norm`ed.
+3. `S2Encoder.forward(features, lengths, chunk_size, left_context) → (memory, out_lengths)` takes
+   raw log-mel on every path; `streaming_forward` ≡ `forward` with the same mask (`atol 1e-4`),
+   tested. The left-context window is chunk-granular.
+4. `chunk_size` and `left_context` count 25 Hz frames and are multiples of 4.
+5. Blank is id 500, the last of 501 columns (CTC, transducer, internal-LM scorer).
+6. The only constant written into raw log-mel is the per-bin CMVN mean.
+7. Banded RNN-T at `W' = U + 1` is bit-identical to the full loss; both carry a float64 gradcheck.
+   The band is built with both repair passes and `train/band_infeasible` reads 0.
+8. The CTC posteriors that set the band are **detached** from it.
+9. `rnnt` and `ctc` are both divided by the batch's token count.
+10. `W_in` / `W_out` are orthogonalised per logical slice.
+11. The mel cache is bound to its manifest by fingerprint; the three batch budgets move together;
+    `expandable_segments` is set before the first CUDA allocation.
+12. `total_steps` counts loader batches; convert to audio-hours before comparing runs.
+13. The trunk checkpoint at each branch point is kept, never rolled off.
+14. Streaming decode feeds `decode.tail_chunks` extra chunks of mean fill and keeps their frames.
+15. The frontend pads time by 1 frame on the left per stride-2 stage.
+16. Compile the blocks, never the whole model.
+
+---
+
+## 12. Results
+
+`transducer_avg.pt` (mean of the snapshots at 577.8k to 599.4k of the 600k run), STREAM-LM
+`lm_best.pt`, beam 10, streaming at 320 ms chunks with 5.12 s left context and one kept tail chunk.
+From `runs/eval/report-{clean,other}.json`; rescoring weights tuned on the matching dev set, never on
+test. MEASURED 2026-11-15.
+
+### 12.1 Accuracy
+
+| Decoding | test-clean offline | test-clean streaming | test-other offline | test-other streaming |
+|---|---|---|---|---|
+| greedy | 3.17 % | 4.24 % | 7.91 % | 10.92 % |
+| beam 10 | 3.15 % | 4.24 % | 7.76 % | 10.48 % |
+| beam 10 + LM + ILME | **2.64 %** | **3.18 %** | **6.51 %** | **8.87 %** |
+| CER, beam + LM | 0.87 % | 1.13 % | 2.79 % | 4.03 % |
+
+| tuned (α, β, λ) | offline | streaming |
+|---|---|---|
+| clean | (0.4, 0.2, 0.5) | (0.6, 0.1, 1.0) |
+| other | (0.7, 0.2, 0.75) | (0.6, 0.3, 0.25) |
+
+Dev, at the tuned weights: clean 2.56 / 3.11 %, other 6.55 / 8.67 % (offline / streaming). n-best
+oracle on dev: clean 1.47 / 2.06 %, other 5.03 / 7.20 %, so 1 to 1.5 points remain for rescoring to
+win. Clean streaming selected λ = 1.0, the top of the grid: widening that axis may buy a little.
+
+Where the streaming errors sit (test-other, beam + LM, error % first-2 / middle / last-2 words):
+offline 7.4 / 5.5 / 6.5, streaming 12.0 / 7.3 / 7.4. The kept tail chunk holds the last words close
+to the middle; the remaining streaming penalty is spread through the utterance (the missing right
+context), with an extra cost on the first words, which have no left context to adapt from.
+
+### 12.2 Speed and latency
+
+Serial timing pass, 200 strided utterances, RTX 5070:
+
+| | RTF offline | RTF streaming | finalize |
+|---|---|---|---|
+| greedy | 0.003 | 0.032 | 0.01 s |
+| beam 10 | 0.018 | 0.048 | 0.11 to 0.12 s |
+| beam 10 + LM | 0.019 | 0.049 | 0.12 to 0.13 s |
+
+First partial 13 ms after a chunk arrives. Streaming emission latency per word, against a forced
+alignment: median **80 ms**, p90 **240 ms**.
+
+### 12.3 Budget curve (branched cooldowns)
+
+Trainer validation, full dev sets, greedy transducer, final weights of each branch (not averaged):
+
+| budget | GPU time of its own path | dev-clean off / stream | dev-other off / stream |
+|---|---|---|---|
+| 300k | ~7.3 h | 3.49 / 4.61 | 8.93 / 11.93 |
+| 450k | ~10.9 h | 3.21 / 4.21 | 8.36 / 11.43 |
+| **600k** (release) | **15.1 h** | **3.11 / 4.04** | **7.94 / 10.76** |
+
+The three points fit WER ∝ steps^−0.15 on dev-other streaming (−0.19 on dev-clean), and the
+450k → 600k step is the steepest of the two: the curve has not flattened. All three curves together
+cost 19.2 h.
+
+---
+
+## 13. Design notes
+
+### 13.1 How the recipe was chosen
+
+The design was validated on 60,000-batch proxy runs (full WSD, from scratch, scored on full dev)
+and 15,000-batch screens, before any full run. The first design put five blocks at 6.25 Hz
+(`[2, 4, 5, 4]`, conv-only S0, parallel attention ∥ MLP, CTC weight 0.1). Screens and a block
+knockout found the allocation inverted:
+
+| change (15k screens, dev-other streaming greedy) | effect |
+|---|---|
+| `[4, 8, 0, 8]` with attention in S0 | −4.3 points, the largest single gain |
+| serial attention then MLP | −0.8 |
+| CTC weight 0.1 → 0.3 | −0.6 (helps the CTC head most) |
+| all three together | −6.4 (−19 % relative), transferred exactly to the 60k proxy |
+| CTC weight 0.3 → 0.5 | −0.3, within screen noise, kept |
+| 25 Hz output (an extra 25 Hz stack) | no gain, +30 % wall clock |
+| 45 % wider stacks | −0.8 for +18 % wall clock |
+| a bounded (non-normalised) block output | +2.2 worse |
+| one more block per stack, or weight decay 0.1 | within noise |
+| peak LR ×2 | ~1.5 points worse at 60k |
+
+A block costs about the same compute at every rate here, but a 6.25 Hz block costs 4× the
+parameters of a 25 Hz one, and the knockout showed S2's blocks were the least used: removing all
+five cost +0.30 nats/token, removing one S0 block +0.47 to +0.68. Depth bought less than the same
+wall clock spent on steps.
+
+**Decided without a full-scale result:**
+
+* **No consistency regularisation (CR-CTC).** Built and tested, never measured at a scale where it
+  could pay: its published gain is compute-matched at ~150 data passes, this run is 24, and it
+  halves the distinct audio per batch. Off.
+* **No self-supervised pretraining.** On the proxy, a BEST-RQ warm start of the previous
+  architecture was level with training from scratch at 30k batches, so the release trains from
+  scratch and saves the pretrain's GPU hours.
+* **Band width 16** from `dev/band_loss_gap` = 0 throughout, rather than a sweep.
+* **5.12 s left context, no band offset, no dropout**: defaults, not swept.
+
+### 13.2 Open directions
+
+* **A longer budget.** The budget curve (§12.3) is still falling; resuming
+  `transducer_branch450000.pt` with `--total-steps 1200000` projects dev-other streaming greedy to
+  about 9.7 (−10 %) for ~17 more GPU hours.
+* **The streaming penalty** (2.4 points on test-other): a one-way full-context → streaming
+  distillation between two views of the same batch (dual-mode training) targets it directly.
+* **Consistency regularisation** at a long budget, judged against this recipe.
+* **Removing the empty S2 stage**, which would drop `chunk_lcm` to 2 (a model change that needs its
+  own run).
+* **Left-context sweep** (2.56 s / 5.12 s / unlimited) is decode-only on the release checkpoint.
+* **Cross-utterance context**: seed each utterance's cache from the previous segment of the same
+  chapter, aimed at the first-words penalty; it changes the evaluation protocol, so it would be
+  reported separately.
+
+### 13.3 References
+
+Zipformer (Yao et al., ICLR 2024); CR-CTC (Yao et al., ICLR 2025, arXiv 2410.05101); FastConformer
+(Rekesh et al. 2023); Branchformer / E-Branchformer; Peri-LN (Kim et al., ICML 2025); Gated
+Attention (Qiu et al., NeurIPS 2025); Muon (Jordan et al. 2024); WSD schedules (Hu et al. 2024);
+CTC-guided RNN-T lattice reduction (Wang et al. 2022, arXiv 2210.16481); Ar-RNN-T (Mahadeokar et
+al. 2021); label-looping decoding (Bataev et al. 2024, arXiv 2406.06220); ILME (Meng et al. 2021,
+arXiv 2011.01991); Dual-mode ASR (Yu et al., ICLR 2021); BEST-RQ (Chiu et al. 2022); SpecAugment
+(Park et al. 2019); LibriSpeech (Panayotov et al., ICASSP 2015).

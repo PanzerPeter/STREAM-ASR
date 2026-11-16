@@ -36,3 +36,8 @@ class StreamingDecode_Response:
     # Wall time to the first encoder output of a streaming session. None offline: an offline pass
     # emits no partials, and reporting 0.0 makes "not measurable" look like "instant".
     first_partial_latency_s: float | None
+    # The best hypothesis' token ids and, per token, the AUDIO time at which the decoder could
+    # first show it: the end of the chunk its emission frame belongs to (streaming), or the end of
+    # its frame (offline). Evaluate turns these into per-word emission latency.
+    token_ids: list[int]
+    token_emit_s: list[float]

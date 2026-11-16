@@ -38,10 +38,12 @@ tokenizer is trained on LibriSpeech's upper-case unpunctuated text, so a raw dec
 unpunctuated output and guessing them would misreport what the model said. It is display-only: the
 Decode slice still emits corpus-cased text, so Evaluate's WER stays comparable.
 
-Live partials come from the causal streaming encoder plus greedy RNN-T decoding
-(`StreamingSession`), so they appear mid-utterance. On endpoint the partials are replaced by the
-authoritative full-context beam-search result. The browser captures at a 16 kHz `AudioContext`,
-which keeps resampling off the live server path. The capture graph ends in a **muted** gain node:
+Live partials come from the causal streaming encoder (bounded `decode.left_context` cache) plus
+label-looping greedy RNN-T decoding (`StreamingSession`), so they appear mid-utterance. On endpoint
+the partials are replaced by the full-context beam-search result: the "revise on endpoint"
+policy (`MODEL_ARCHITECTURE.md` §7.4), a demo choice that is never part of a reported streaming WER.
+`chunk_ms` is `decode.chunk_size` 25 Hz frames x 40 ms. The browser captures at a 16 kHz
+`AudioContext`, which keeps resampling off the live server path. The capture graph ends in a **muted** gain node:
 a `ScriptProcessor` only fires while something downstream pulls it, but pulling through
 `ctx.destination` plays the microphone back through the speakers, which the model then transcribes
 alongside the speaker (and howls without headphones). A level meter reads the same stream through an
@@ -54,8 +56,8 @@ checkpoint, only sounds slightly worse. The strip is display-only, and the weigh
 so what the page reports is always what the process was started with.
 
 The weight flags default to `config/decode.yaml`, whose committed values are the `alpha = 0`
-regression lock. Pass the dev-tuned pair (`--lm-weight 0.6 --ilm-weight 0.2`, from `evaluate.py`'s
-automatic sweep) to hear the configuration the reported WER was measured at. Startup prints the
-resolved beam/LM settings, which makes a silent fallback to acoustic-only visible. Binds
+regression lock. Pass the dev-tuned pair from `evaluate.py`'s automatic sweep (`weights` in
+`runs/eval/report-clean.json`) to hear the configuration the reported WER was measured at.
+Startup prints the resolved beam/LM settings, which makes a silent fallback to acoustic-only visible. Binds
 `127.0.0.1` only, with no auth. Runs on GPU if available, else CPU, and the model is held resident
 for the process lifetime.

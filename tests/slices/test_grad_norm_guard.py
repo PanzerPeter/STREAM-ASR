@@ -9,7 +9,7 @@ from src.shared_kernel.GradientClipping import (
     guarded_parameters,
     unguarded_parameters,
 )
-from src.slices.TrainAcousticModel._train_utils import GradNormGuard
+from src.slices.TrainAcousticModel.GradNormGuard import GradNormGuard
 
 
 def _guard(window: int = 20, factor: float = 4.0, patience: int = 3, floor: float = 0.0):
@@ -110,8 +110,8 @@ def test_guarded_parameters_excludes_the_size_dominated_scalars():
     # activation carries a gradient summed over millions of terms, so it dominates the global norm
     # by a factor set by the batch shape rather than by anything about the model.
     model = torch.nn.Module()
-    model.gate = torch.nn.Parameter(torch.tensor(0.5))  # a ZipformerStack.bypass
-    model.bias = torch.nn.Parameter(torch.zeros(8))  # a bias / BiasNorm.log_scale
+    model.gate = torch.nn.Parameter(torch.tensor(0.5))  # a scalar gate
+    model.bias = torch.nn.Parameter(torch.zeros(8))  # a bias / a block's gate vector
     model.weight = torch.nn.Parameter(torch.zeros(8, 8))  # a real weight matrix
     names = {id(p): n for n, p in model.named_parameters()}
     assert [names[id(p)] for p in guarded_parameters(model)] == ["weight"]
@@ -221,3 +221,8 @@ def test_config_exposes_the_guard_knobs():
     assert tr.guard_window == 20
     assert tr.guard_trend_factor == 4.0
     assert tr.guard_patience == 3
+
+
+def test_window_zero_disables_the_guard():
+    guard = _guard(window=0)
+    assert all(guard.update(10.0**i) == (False, 0.0) for i in range(30))

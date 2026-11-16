@@ -2,15 +2,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.shared_kernel.BiasNorm import BiasNorm
 from src.shared_kernel.Config_Adapter import get_config
+from src.slices.TrainAcousticModel.FusedBranchBlock import rms_norm
 
 
 class StatelessPredictor(nn.Module):
     """icefall-style stateless RNN-T predictor: embed the prediction-input token, then a depthwise
     Conv1d over a small left context. No recurrence -> streaming state is just the last
-    `context-1` token ids, and the module is trivially causal. Output is BiasNorm-normalised to
-    match the encoder's normalisation idiom before the joiner."""
+    `context-1` token ids, and the module is trivially causal. Output is a weightless RMSNorm, the
+    same norm as every residual-path norm of the encoder."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -25,7 +25,6 @@ class StatelessPredictor(nn.Module):
         self.conv = nn.Conv1d(
             t.predictor_dim, t.predictor_dim, kernel_size=self.context, groups=t.predictor_dim
         )
-        self.norm = BiasNorm(t.predictor_dim)
 
     def forward(self, labels: torch.Tensor) -> torch.Tensor:
         # labels [B, U'] long (blank-prefixed prediction inputs) -> [B, U', D].
@@ -35,7 +34,7 @@ class StatelessPredictor(nn.Module):
         padded = F.pad(labels, (self.context - 1, 0), value=self.blank_id)
         emb = self.embed(padded).transpose(1, 2)  # [B, D, U'+context-1]
         out = self.conv(emb).transpose(1, 2)  # [B, U', D]
-        return self.norm(out)
+        return rms_norm(out)
 
     def init_state(self, batch_size: int, device: torch.device) -> torch.Tensor:
         return torch.full(
@@ -48,4 +47,4 @@ class StatelessPredictor(nn.Module):
         emb = self.embed(window).transpose(1, 2)  # [B, D, context]
         out = self.conv(emb).transpose(1, 2)[:, -1]  # [B, D] (single valid position)
         new_state = window[:, 1:] if self.context > 1 else state
-        return self.norm(out), new_state
+        return rms_norm(out), new_state

@@ -21,3 +21,15 @@ class EvaluateCorpus_Response:
     rtf: float | None
     latency_s: float | None
     finalize_s: float | None
+    # Error and deletion rate of the first 2 / middle / last 2 reference words
+    # (MODEL_ARCHITECTURE.md §8.3): where the tail chunk and the left context act.
+    first_err: float
+    middle_err: float
+    last_err: float
+    first_del: float
+    middle_del: float
+    last_del: float
+    # Per correctly recognised word, emission time minus its forced-alignment end, in seconds of
+    # audio. Streaming passes with a latency probe only; None elsewhere.
+    emission_latency_median_s: float | None
+    emission_latency_p90_s: float | None

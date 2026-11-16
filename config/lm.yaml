@@ -15,6 +15,12 @@ ffn_expansion: 4
 dropout: 0.0
 context_len: 256
 value_residual_lambda: 1.0   # inject layer-0 values into deeper layers; 0.0 = vanilla
+# BiasNorm window lm_best.pt was trained and evaluated under. Part of that checkpoint's function,
+# so it stays fixed while the checkpoint is in use.
+norm_log_scale_min: -2.0
+norm_log_scale_max: 1.0
+norm_max_amplification: 4.0
+norm_eps: 1.0e-5
 
 # training
 muon_lr: 2.0e-2              # Muon peak LR for the 2D block weight matrices (rest -> AdamW)
