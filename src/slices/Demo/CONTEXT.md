@@ -7,7 +7,8 @@ microphone and watch partial transcripts stream in.
 ## Entry Point
 - Type: CLI (`serve_demo.py`) → `DemoServer_Handler.build_app` (FastAPI/uvicorn)
 - Input: CLI flags `--checkpoint`, `--tokenizer`, `--host`, `--port`, `--lm-weight` (alpha),
-  `--ilm-weight` (beta, the ILME subtraction), `--beam-size`
+  `--ilm-weight` (beta, the ILME subtraction), `--length-bonus`, `--lm-checkpoint`,
+  `--lm-tokenizer`, `--beam-size`
 - Output: an HTTP/WebSocket service on `http://127.0.0.1:8000`
 
 | Route | Method | Flow |
@@ -19,7 +20,8 @@ microphone and watch partial transcripts stream in.
 
 ## Data Ownership
 - Consumes artifacts: `data/checkpoints/transducer_avg.pt`, `data/tokenizer/bpe500.model` (and
-  `data/checkpoints/lm_best.pt` when `--lm-weight > 0` turns on n-best rescoring).
+  `data/checkpoints/lm_best.pt` + `data/tokenizer/lm8k.model` when `--lm-weight > 0` turns on n-best
+  rescoring).
 - Produces: nothing on disk, since it is an interactive service.
 
 ## Shared Kernel

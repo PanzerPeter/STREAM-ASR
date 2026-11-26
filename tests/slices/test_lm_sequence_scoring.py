@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 
 from src.shared_kernel.Config_Adapter import get_config
 from src.slices.TrainLanguageModel.StreamLmModel import StreamLmModel
@@ -6,21 +7,21 @@ from src.slices.TrainLanguageModel.StreamLmModel import StreamLmModel
 
 def _lm() -> StreamLmModel:
     torch.manual_seed(0)
-    return StreamLmModel().eval()
+    lm = StreamLmModel().eval()
+    nn.init.normal_(lm.head.weight)  # the zero-init readout would make every score -len*ln(V)
+    return lm
 
 
-def test_sequence_logprob_starts_from_bos_which_is_eos():
-    # The start symbol must be the id the corpus actually trains ("previous line's EOS"), not a
-    # never-seen start row -- otherwise every hypothesis' first-token score is untrained noise.
+def test_sequence_logprob_scores_eos_plus_line():
+    # A hypothesis is scored as the row LmDataset trains every line as: input [EOS] + ids,
+    # targets ids + [EOS].
     lm = _lm()
-    m = get_config().model
+    eos = get_config().lm.eos_id
     ids = [3, 7, 42]
-    seq = torch.tensor([[m.bos_id] + ids])
     with torch.no_grad():
-        logp = torch.log_softmax(lm(seq)[0], dim=-1)
-    target = torch.tensor(ids + [m.eos_id])
+        logp = torch.log_softmax(lm(torch.tensor([[eos] + ids]))[0], dim=-1)
+    target = torch.tensor(ids + [eos])
     expected = float(logp[torch.arange(target.shape[0]), target].sum())
-    assert m.bos_id == m.eos_id
     assert abs(lm.sequence_logprob(ids) - expected) < 1e-4
 
 

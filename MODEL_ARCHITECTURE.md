@@ -1,6 +1,6 @@
-# MODEL_ARCHITECTURE.md: STREAM ASR v2.0
+# MODEL_ARCHITECTURE.md: STREAM ASR v2.5
 
-What the v2.0 acoustic model computes, operator by operator, why each choice was made, and how it is
+What the v2.5 acoustic model computes, operator by operator, why each choice was made, and how it is
 trained, decoded and measured. `config/` holds the authoritative values; this document explains
 them. Numbers marked **MEASURED** were run on one RTX 5070 (torch 2.11, CUDA 12.8).
 
@@ -16,7 +16,7 @@ transducer loss the **banded RNN-T**.
 | [5](#5-amplitude-by-construction) | Why no activation can grow without bound |
 | [6](#6-heads-and-loss) | CTC head, predictor, joiner, objective, banded RNN-T |
 | [7](#7-streaming) | Streaming contract, bounded cache, tail chunk |
-| [8](#8-decoding-and-evaluation) | Label-looping greedy, beam, LM rescoring, evaluation metrics |
+| [8](#8-decoding-and-evaluation) | Label-looping greedy, beam, LM rescoring, evaluation metrics, STREAM-LM |
 | [9](#9-training) | Data, optimisation, schedule, step mechanics, validation |
 | [10](#10-observability-and-debugging) | Logged scalars and a debug playbook |
 | [11](#11-invariants) | Rules that keep the design correct |
@@ -27,27 +27,30 @@ transducer loss the **banded RNN-T**.
 
 ## 1. Overview
 
-A from-scratch streaming transducer for English read speech, trained on LibriSpeech 960 h:
+A from-scratch streaming transducer for English speech, trained on LibriSpeech 960 h plus Common
+Voice 27.0 English (3,867 h after speed perturbation and trimming, §9.1):
 
-* **S2 encoder**, 35.56 M parameters: a three-rate U-Net with blocks at 25 Hz and 12.5 Hz, output at
+* **S2 encoder**, 61.78 M parameters: a three-rate U-Net with blocks at 25 Hz and 12.5 Hz, output at
   12.5 Hz (80 ms per frame). Each block is gated attention followed by a conv-gated MLP.
-* **Stateless predictor + additive joiner** over BPE-500, plus a CTC head. 36.73 M parameters total.
+* **Stateless predictor + additive joiner** over BPE-500, plus a CTC head. 63.08 M parameters total.
 * **One set of weights decodes offline and streaming** (320 ms chunks, 5.12 s bounded left context).
 * **Banded RNN-T**: the joiner runs on 17 lattice cells per frame around the CTC head's cumulative
   occupancy instead of the full lattice.
 * **Amplitude bounded by construction**: every stack entry is a weightless RMSNorm and the only
   learnable residual-path scale is a floored gate. No parameter is ever projected or clamped.
-* **STREAM-LM** (44.7 M, separate slice) rescores the beam's n-best with internal-LM estimation.
+* **STREAM-LM** (52.5 M, own 8k tokenizer, separate slice, §8.4) rescores the beam's n-best with
+  internal-LM estimation.
 
-Headline (test-clean / test-other WER, beam 10 + LM + ILME, MEASURED, §12):
+Headline (test WER, beam 10 + LM + ILME, MEASURED, §12):
 
 | | offline | streaming 320 ms |
 |---|---|---|
-| test-clean | **2.64 %** | **3.18 %** |
-| test-other | **6.51 %** | **8.87 %** |
+| test-clean | **2.29 %** | **2.88 %** |
+| test-other | **5.46 %** | **7.19 %** |
+| cv-test | **13.42 %** | **16.80 %** |
 
-Training: 600,000 loader batches (24 passes over the 1,933 h speed-perturbed corpus) in **15.1 h**
-on one RTX 5070, peak 4.3 GiB allocated.
+Training: 1,200,000 loader batches (about 24 passes over the 3,867 h) in **35.7 h** on one RTX
+5070, peak 5.07 GiB allocated.
 
 ---
 
@@ -61,13 +64,13 @@ One utterance of `S` samples at 16 kHz, batch `B`, `V = 501` (500 BPE pieces + b
 | 1 | log-mel | `LogMel_Transform`, 25 ms window, 10 ms hop, 80 bins | `[T₀, 80]` | 100 fps |
 | 2 | SpecAugment | train only, fill = per-bin CMVN mean in raw space (§9.1) | `[B, T₀, 80]` | 100 fps |
 | 3 | pad + CMVN | pad `T₀` to a multiple of 16 with the CMVN mean, then `(x − mean)/std` | `[B, ⌈T₀/16⌉·16, 80]` | 100 fps |
-| 4 | frontend | `DwSepSubsampling` ×4 time, ×4 freq, weightless RMSNorm | `[B, T₁, 256]`, `T₁ = ⌈T₀/4⌉` | 25 fps |
-| 5 | S0 | 4 FusedBranch blocks | `[B, T₁, 256]` | 25 fps |
-| 6 | S1 | pool ↓2, 8 blocks | `[B, T₂, 384]`, `T₂ = ⌈T₁/2⌉` | 12.5 fps |
-| 7 | S2 | pool ↓2, linear path (no blocks) | `[B, T₃, 512]`, `T₃ = ⌈T₂/2⌉` | 6.25 fps |
-| 8 | S3 | upsample ↑2 + U-Net skip from S1, 8 blocks | `[B, T₂, 384]` | 12.5 fps |
-| 9 | memory | weightless RMSNorm | `[B, T₂, 384]` | 12.5 fps |
-| 10a | CTC head | `Linear(384 → 501)` | `[B, T₂, 501]` | 12.5 fps |
+| 4 | frontend | `DwSepSubsampling` ×4 time, ×4 freq, weightless RMSNorm | `[B, T₁, 320]`, `T₁ = ⌈T₀/4⌉` | 25 fps |
+| 5 | S0 | 4 FusedBranch blocks | `[B, T₁, 320]` | 25 fps |
+| 6 | S1 | pool ↓2, 8 blocks | `[B, T₂, 512]`, `T₂ = ⌈T₁/2⌉` | 12.5 fps |
+| 7 | S2 | pool ↓2, linear path (no blocks) | `[B, T₃, 640]`, `T₃ = ⌈T₂/2⌉` | 6.25 fps |
+| 8 | S3 | upsample ↑2 + U-Net skip from S1, 8 blocks | `[B, T₂, 512]` | 12.5 fps |
+| 9 | memory | weightless RMSNorm | `[B, T₂, 512]` | 12.5 fps |
+| 10a | CTC head | `Linear(512 → 501)` | `[B, T₂, 501]` | 12.5 fps |
 | 10b | predictor | `StatelessPredictor` | `[B, U+1, 512]` | per label |
 | 11 | joiner | additive, on the band only | `[B, T₂, 17, 501]` | |
 | 12 | loss | banded RNN-T + 0.5 · CTC | scalar | |
@@ -78,14 +81,14 @@ Total reduction: 160 × 4 × 2 = **1,280 samples = 80 ms per memory frame**.
 
 | stack | rate | d | blocks | heads | hf | params |
 |---|---|---|---|---|---|---|
-| frontend | 50 → 25 Hz | 256 | | | | 0.67 M |
-| S0 | 25 Hz | 256 | 4 | 4 | 680 | 3.45 M |
-| S1 | 12.5 Hz | 384 | 8 | 6 | 1024 | 15.57 M |
-| S2 | 6.25 Hz | 512 | 0 | | | 0.20 M (its projections) |
-| S3 | 12.5 Hz | 384 | 8 | 6 | 1024 | 15.67 M |
-| **encoder** | | | **20** | | | **35.56 M** |
-| CTC head / predictor / joiner | | | | | | 0.19 / 0.26 / 0.72 M |
-| **total** | | | | | | **36.73 M** |
+| frontend | 50 → 25 Hz | 320 | | | | 0.84 M |
+| S0 | 25 Hz | 320 | 4 | 5 | 848 | 5.36 M |
+| S1 | 12.5 Hz | 512 | 8 | 8 | 1360 | 27.55 M |
+| S2 | 6.25 Hz | 640 | 0 | | | 0.33 M (its projections) |
+| S3 | 12.5 Hz | 512 | 8 | 8 | 1360 | 27.71 M |
+| **encoder** | | | **20** | | | **61.78 M** |
+| CTC head / predictor / joiner | | | | | | 0.26 / 0.26 / 0.78 M |
+| **total** | | | | | | **63.08 M** |
 
 Each block takes two residual steps with their own gates, so the trunk is 40 sequential residual
 steps deep.
@@ -134,7 +137,7 @@ x:[B,T,80] → [B,1,T,80]                          # T a multiple of 16
 conv1: Conv2d(1→128, k=3, stride=2, pad=(0,1)), left time-pad 1 → ReLU             50 Hz, 40 bins
 dw2:   Conv2d(128→128, k=3, stride=2, pad=(0,1), groups=128), left time-pad 1      25 Hz, 20 bins
 pw2:   Conv2d(128→128, k=1) → ReLU
-reshape [B, T₁, 128·20 = 2560] → Linear(2560 → 256) → rms_norm (no weight)
+reshape [B, T₁, 128·20 = 2560] → Linear(2560 → 320) → rms_norm (no weight)
 ```
 
 Depthwise-separable subsampling (FastConformer's idea) costs 9.0 M MAC per second of audio, where a
@@ -154,10 +157,10 @@ The cache is two levels (`in_tail`, `mid_tail`) of 1 frame each.
 ### 4.1 Layout: a three-rate U-Net
 
 ```
-f   = frontend(x)                                  # 25 Hz, d 256, RMS 1
+f   = frontend(x)                                  # 25 Hz, d 320, RMS 1
 s0  = S0(f)                                        # 25 Hz, 4 blocks
 s1  = S1(avgpool2(s0))                             # 12.5 Hz, 8 blocks
-s2  = rms_norm(proj_512(avgpool2(s1)))             # 6.25 Hz, linear path, no blocks
+s2  = rms_norm(proj_640(avgpool2(s1)))             # 6.25 Hz, linear path, no blocks
 s3  = S3(upsample2(s2), skip = s1)                 # 12.5 Hz, 8 blocks
 mem = rms_norm(s3)                                 # encoder memory, RMS 1
 ```
@@ -174,7 +177,7 @@ pad to 16 mel frames). `upsample2` is `repeat_interleave(2)` trimmed to the skip
 per-frame linear and chunk-aligned, hence transparent to streaming.
 
 S2 holds no blocks but is not empty: S3's entry is `rms_norm(proj(upsample(s2)) + s1)`, a linear
-6.25 Hz low-pass path beside the skip. The release model was selected with it in place (§13).
+6.25 Hz low-pass path beside the skip. The model was selected with it in place (§13).
 
 ### 4.2 `FusedBranchBlock`: attention, then a conv-gated MLP
 
@@ -206,7 +209,7 @@ What each piece is and why:
   u, z; a, c) in a `ParameterDict`, concatenated in `forward` into the single GEMM, so Muon
   orthogonalises each slice on its own scale (§9.2).
 * **No dropout, no macaron FFN, no value residual.** Dev WER was still falling at the end of the
-  release run (§12.3), with no over-fitting for dropout to fix.
+  1.2M run (§12.3), with no over-fitting for dropout to fix.
 
 Every config value is read in `__init__`, never in `forward`, so a whole block is one
 `torch.compile` graph (§9.5).
@@ -288,7 +291,7 @@ What remains free, none of it able to move the trunk's amplitude:
 ## 6. Heads and loss
 
 ### 6.1 CTC head
-`Linear(384 → 501)` on the memory at 12.5 Hz, blank 500 as the last column. It is an auxiliary loss,
+`Linear(512 → 501)` on the memory at 12.5 Hz, blank 500 as the last column. It is an auxiliary loss,
 the source of the band (§6.5), and the cheap full-dev greedy WER probe. There are no intermediate
 CTC taps: S2 runs at 6.25 Hz, where 17.4 % of utterances are CTC-infeasible.
 
@@ -347,7 +350,7 @@ read 0. A head with `c(T−1) < 0.5` (not yet emitting) falls back to the diagon
 about ±1.5 s of speech at 5.3 tokens/s.
 
 **Lossless in practice (MEASURED).** `dev/band_loss_gap`, the banded minus the full RNN-T cost per
-token on a fixed dev batch, read **0.0000** at every validation of the release run and
+token on a fixed dev batch, read **0.0000** at all 120 validations of the 1.2M run and
 `train/band_infeasible` read 0 throughout. W = 16 keeps 31.5 % of the lattice cells on dev-other's
 average utterance and less on longer training batches, because the band is a fixed 17 cells against
 `U + 1`.
@@ -392,9 +395,9 @@ Units: `chunk_size` and `left_context` count **25 Hz frames** (40 ms). `chunk_lc
 
 ### 7.2 Bounded state
 
-At the default 5.12 s the whole streaming state is **1.32 M values, 5.3 MB in fp32** (MEASURED after
-30 chunks), constant for any stream length: the k/v rings are 4 × 2 × 256 × 128 values at S0 and
-16 × 2 × 384 × 64 at S1 and S3, plus the conv tails. Attention cost per chunk is constant too, so a
+At the default 5.12 s the whole streaming state is **1.73 M values, 6.9 MB in fp32** (MEASURED after
+30 chunks), constant for any stream length: the k/v rings are 4 × 2 × 320 × 128 values at S0 and
+16 × 2 × 512 × 64 at S1 and S3, plus the conv tails. Attention cost per chunk is constant too, so a
 live session can run indefinitely.
 
 ### 7.3 Tail: finish the chunk, then decode one more
@@ -437,7 +440,7 @@ With an LM attached the n-best is re-ranked by
 score = acoustic + α · lm_seq − β · ilm_seq + λ · len
 ```
 
-`lm_seq` is STREAM-LM's sequence log-probability. `ilm_seq` is the internal-LM estimate (Meng et al.
+`lm_seq` is STREAM-LM's sequence log-probability of the hypothesis text (§8.4). `ilm_seq` is the internal-LM estimate (Meng et al.
 2021): the joiner run with the encoder memory zeroed and renormalised over non-blank labels,
 subtracted because the predictor already carries a language prior from the training transcripts.
 `λ` offsets the transducer's deletion bias. All three weights default to 0 (the pure-acoustic
@@ -445,7 +448,10 @@ regression lock) and are tuned on dev per split and mode (§12).
 
 ### 8.3 Evaluation
 
-`evaluate.py --clean | --other` scores the test set with weights tuned on the matching dev set.
+`evaluate.py --clean | --other | --cv` scores the test set with weights tuned on the matching dev
+set (`cv-dev2k` for cv). The (α, β, λ) sweep runs over a cached dev n-best, so its grid costs no
+decoding; a weight that lands on the edge of its grid is a bound, not an optimum, and the grid is
+widened rather than read as tuned.
 Stages are cumulative (greedy → beam → beam + LM), each offline and streaming. Every row reports:
 
 * WER and CER with raw error and reference counts, so two runs can be compared without re-decoding.
@@ -453,20 +459,71 @@ Stages are cumulative (greedy → beam → beam + LM), each offline and streamin
   where streaming errors sit.
 * **Emission latency** (streaming): per correct word, the audio time its first token was shown (the
   end of its chunk) minus the word's end in a CTC forced alignment of the reference; median and p90.
+  The alignment comes from the scored model's own CTC head, so this is the transducer's lag behind
+  its own alignment, quantised to 80 ms frames. It tracks one model across decode settings; it is
+  not comparable between two models.
 * RTF, first-partial latency and finalize cost, from a separate serial timing pass on 200 strided
   utterances, because concurrent decoding makes timing meaningless.
 * The n-best oracle WER on dev: the floor any rescoring could reach.
+* Provenance: the transducer, both tokenizers and the LM by path and SHA-256, since every training
+  run writes the same file names.
+
+### 8.4 STREAM-LM
+
+A 16-layer, 512-wide causal Transformer (52.5 M: 44.1 M in the blocks, 4.2 M each for the input
+table and the readout) trained on LibriSpeech-LM + FineWeb-Edu + cv-train sentences, every line in
+the acoustic output alphabet and every dev/test transcript held out.
+
+* **Own tokenizer.** Rescoring reads hypothesis text, so the LM uses an 8,192-piece SentencePiece
+  unigram trained on its corpus (`lm.tokenizer`) instead of the acoustic BPE-500: 1.23 tokens per
+  word against 2.24 (measured), so a 256-token window holds twice the text and a step trains on
+  twice the words. Each hypothesis is decoded to text and re-encoded, which also makes the score
+  independent of how the acoustic model split a word into pieces.
+* **Block.** Pre-norm with weightless RMSNorm (the acoustic stack's normaliser, no gain to grow):
+  `x + Attn(rms_norm(x))`, then `x + SwiGLU(rms_norm(x))`, final `rms_norm` before the readout.
+  Attention is GQA (8 query heads, 2 KV heads) with QK-norm and RoPE; K and V are separate matrices
+  so Muon orthogonalises each. Layer 0's values are mixed into every deeper layer as
+  `v + λ_l · v_0` with `λ_l` learned per layer (value residual, init 1.0). The SwiGLU FFN is
+  bias-free.
+* **Embeddings.** Untied, the readout zero-initialised, so step 0 starts at loss ln V. A readout
+  through the N(0, 1) input table would give logits of std ≈ √d and a step-0 loss of hundreds of
+  nats.
+* **Sentence boundaries.** The packed stream is `line + EOS` per line, and EOS doubles as BOS:
+  segment ids advance on each EOS, so the document mask trains every line as `[EOS] + line`, the
+  exact row a hypothesis is scored as (inputs `[EOS] + ids`, targets `ids + [EOS]`).
+* **Training.** Muon on the block matrices, AdamW on the tables and the `λ_l` scalars (no decay on
+  vectors or scalars), matrices clipped as one group and vectors per tensor. WSD with a 1-sqrt
+  anneal over the last 25 % of 140k steps of 64 × 256 tokens: 2.29e9 tokens, one pass over the
+  packed corpus, read as non-overlapping windows shuffled without replacement. `lm_branch52500.pt`
+  is the trunk at the decay start of a 70k budget, so one anneal from it measures what the second
+  half of the corpus buys. bf16 autocast, each block compiled; z-loss 1e-4. Selection is perplexity
+  over every window of `val.bin`, which is a proportional sample of all three sources.
 
 ---
 
 ## 9. Training
 
+The recipe below produced every number in §12: LibriSpeech plus Common Voice, 1.2M batches.
+
 ### 9.1 Data and augmentation
 
 * LibriSpeech `train-clean-100 + train-clean-360 + train-other-500`, each utterance paired with one
   copy at 0.9× or 1.1× speed (`train_sp2`: 562,482 rows, 1,933 h). The speed factor is resampled in
-  the waveform at extraction and baked into the fp16 mel cache (157 GiB), which is bound to its
+  the waveform at extraction and baked into the fp16 mel cache (104 GiB; `cv-train`'s is the same size), which is bound to its
   manifest by a fingerprint because row order is the cache index.
+* Common Voice Scripted Speech 27.0 English (CC0), `cv-train`: `validated.tsv` minus every dev/test
+  clip, speaker and sentence (1,335,344 clips, 2,031 h before trimming and 1,934 h after; the
+  sentence filter alone removes 557k clips, since each sentence is read by many speakers). Transcripts go through
+  `Transcript_Transform.normalise_transcript` (NFKD, upper-case `A-Z '`, a line with a digit or a
+  spoken symbol is rejected). Leading/trailing silence is trimmed conservatively
+  (`config/trim.yaml`: speech above floor + 25 % of the 10th-to-99th-percentile dB range, 0.5 s
+  margin, untrimmed below a 15 dB range or a 1 s span), stored as `start_sample` / `num_samples`
+  in the row and covered by the fingerprint. No speed perturbation.
+* The two sources are read side by side (`train_sources`: one dataset per (manifest, cache) pair
+  under a `ConcatDataset`, one sampler over their rows), so no cache is copied. The sampler buckets
+  the pooled rows by length, so each source weighs in by its hours.
+* Tokenizer (BPE-500 unigram) and CMVN are computed over both sources: the tokenizer over
+  `train` + `cv-train` transcripts, CMVN over `train_sp2` + `cv-train` as the trainer reads them.
 * SpecAugment as a GPU batch op on raw log-mel with the CMVN-mean fill: 2 frequency masks of up to
   27 bins; time masks by lhotse's rule at ×2.5 strength, up to 25 masks each ≤ 5 % of the
   utterance and ≤ 37.5 % together. No time warp.
@@ -498,14 +555,14 @@ windowed median stays above 4× the run's quietest median for 3 windows.
 
 WSD: 5,000 batches of linear warmup, a constant phase, and a `1 − √frac` anneal to 1 % over the
 last 25 %. `grad_accum` 3. **`total_steps` counts loader batches, not optimizer updates.** The
-release budget is 600,000 batches, 46,667 h of encoder audio, 24 passes over `train_sp2`.
+budget is 1,200,000 batches, at most 93,333 h of encoder audio (the 28,000-frame budget is a
+ceiling, not a fill), about 24 passes over `train_sp2` + `cv-train`.
 
 **Branched cooldowns.** A WSD constant phase is uninformative on its own: most of the gain arrives
-in the anneal. The trainer keeps the trunk checkpoint at each configured branch point
-(`transducer_branch{225000,337500,450000}.pt`, the decay starts of a 300k, 450k and 600k budget),
-and each shorter budget is one anneal resumed from its file. That measures WER against compute for
-about 1.3 runs' cost (§12.3), and `transducer_branch450000.pt` is also the resume point for a longer
-budget.
+in the anneal. The trainer keeps the trunk checkpoint at each configured branch point,
+and each shorter budget is one anneal resumed from its file. The 1.2M run keeps one,
+`transducer_branch450000.pt` (the decay start of a 600k budget), so the run also yields an
+equal-compute 600k model for 4.9 h more (§12.3).
 
 ### 9.4 Step mechanics
 
@@ -517,8 +574,8 @@ autocast(bf16): terms = model.joint_loss(batch, chunk, left, use_band = step ≥
 every grad_accum batches: guard reads matrix norm → two-set clip → opt.step() → zero_grad
 ```
 
-MEASURED on the release run: 0.078 s per loader batch in steady state (0.091 s averaged over the
-whole run including validation), peak 4.31 GiB allocated with `expandable_segments`. The banded
+MEASURED on the 1.2M run: 0.107 s per loader batch averaged over the whole run including
+validation (single process, no resume), peak 5.07 GiB allocated with `expandable_segments`. The banded
 lattice is small, so the encoder's activations set peak VRAM after the warmup. A batch that runs out
 of memory is dropped with a warning and its accumulation window discarded. The three budgets move
 together, or the one left behind silently pins `B`. `scripts/profile_transducer_step.py` measures
@@ -534,7 +591,8 @@ to eager, so the trainer raises it to 64. Validation runs eager.
 
 ### 9.6 Validation, checkpoints, averaging
 
-Every 10,000 batches, over full dev-clean and dev-other: greedy CTC and label-looping greedy
+Every 10,000 batches, over full dev-clean and dev-other and `cv-dev2k` (an evenly strided
+2,000-clip slice of cv-dev, tag suffix `_cv`): greedy CTC and label-looping greedy
 transducer WER, offline and in the deployed streaming condition (320 ms chunks, 5.12 s left context,
 kept tail), plus `dev/band_loss_gap` and the attention-gate saturation on a fixed dev batch.
 `transducer_best.pt` is selected on **dev-other streaming greedy-transducer WER**.
@@ -610,33 +668,60 @@ Everything is emitted from one host sync per `log_every`.
 
 ## 12. Results
 
-`transducer_avg.pt` (mean of the snapshots at 577.8k to 599.4k of the 600k run), STREAM-LM
-`lm_best.pt`, beam 10, streaming at 320 ms chunks with 5.12 s left context and one kept tail chunk.
-From `runs/eval/report-{clean,other}.json`; rescoring weights tuned on the matching dev set, never on
-test. MEASURED 2026-11-15.
+`transducer_avg.pt` (mean of the snapshots at 1,177.2k to 1,198.8k of the 1.2M run), STREAM-LM
+`lm_best.pt` (§8.4), beam 10, streaming at 320 ms chunks with 5.12 s left context and one kept tail
+chunk. From `runs/eval/report-{clean,other,cv}.json`; rescoring weights tuned on the matching dev
+set (cv: `cv-dev2k`), never on test. The one-setting row is from
+`report-{clean,other,cv}-shipped.json`. MEASURED 2026-11-26.
 
 ### 12.1 Accuracy
 
-| Decoding | test-clean offline | test-clean streaming | test-other offline | test-other streaming |
-|---|---|---|---|---|
-| greedy | 3.17 % | 4.24 % | 7.91 % | 10.92 % |
-| beam 10 | 3.15 % | 4.24 % | 7.76 % | 10.48 % |
-| beam 10 + LM + ILME | **2.64 %** | **3.18 %** | **6.51 %** | **8.87 %** |
-| CER, beam + LM | 0.87 % | 1.13 % | 2.79 % | 4.03 % |
+| Decoding | clean offline | clean stream | other offline | other stream | cv offline | cv stream |
+|---|---|---|---|---|---|---|
+| greedy | 2.83 % | 3.80 % | 6.55 % | 9.07 % | 15.69 % | 20.07 % |
+| beam 10 | 2.89 % | 3.76 % | 6.50 % | 8.75 % | 15.43 % | 19.31 % |
+| beam 10 + LM + ILME | **2.29 %** | **2.88 %** | **5.46 %** | **7.19 %** | **13.42 %** | **16.80 %** |
+| CER, beam + LM | 0.73 % | 0.99 % | 2.24 % | 3.13 % | 6.97 % | 8.99 % |
+| beam + LM at (0.8, 0.2, 0.5) on every split | 2.31 % | 2.83 % | 5.46 % | 7.19 % | 13.40 % | 16.75 % |
+| CER, same | 0.75 % | 0.96 % | 2.24 % | 3.13 % | 7.02 % | 8.98 % |
 
 | tuned (α, β, λ) | offline | streaming |
 |---|---|---|
-| clean | (0.4, 0.2, 0.5) | (0.6, 0.1, 1.0) |
-| other | (0.7, 0.2, 0.75) | (0.6, 0.3, 0.25) |
+| clean | (0.6, 0.1, 1.0) | (0.7, 0.0, 0.75) |
+| other | (0.8, 0.2, 0.5) | (0.8, 0.2, 0.5) |
+| cv | (0.9, 0.3, 1.0) | (1.0, 0.3, 0.5) |
 
-Dev, at the tuned weights: clean 2.56 / 3.11 %, other 6.55 / 8.67 % (offline / streaming). n-best
-oracle on dev: clean 1.47 / 2.06 %, other 5.03 / 7.20 %, so 1 to 1.5 points remain for rescoring to
-win. Clean streaming selected λ = 1.0, the top of the grid: widening that axis may buy a little.
+Dev at the tuned weights: clean 2.13 / 2.60 %, other 5.32 / 7.16 %, cv-dev2k 10.27 / 13.20 %
+(offline / streaming). n-best oracle on dev: clean 1.04 / 1.56 %, other 3.96 / 5.81 %, cv 7.48 /
+10.15 %. Of the gap between the acoustic-only n-best top and its oracle, rescoring closes 28 %
+(clean offline) to 56 % (other streaming). λ = 1.0 was the top of the
+grid these reports were tuned on (clean and cv offline), so those two entries are bounds; the grid
+now runs to 2.0.
 
-Where the streaming errors sit (test-other, beam + LM, error % first-2 / middle / last-2 words):
-offline 7.4 / 5.5 / 6.5, streaming 12.0 / 7.3 / 7.4. The kept tail chunk holds the last words close
-to the middle; the remaining streaming penalty is spread through the utterance (the missing right
-context), with an extra cost on the first words, which have no left context to adapt from.
+* **The LM's share.** Beam → beam + LM is −21 / −23 % relative on clean, −16 / −18 % on other and
+  −13 % on cv (offline / streaming). Without the LM the beam is level with greedy on LibriSpeech
+  (±0.06 points): its job is the n-best it hands the LM, so greedy is the decoder when no LM runs.
+* **One setting is enough.** The dev optima differ per domain (α 0.6 to 1.0, β 0.0 to 0.3), yet
+  dev-other's (0.8, 0.2, 0.5) on every split is within 0.05 points of them in all six cells, and
+  lower in three (clean streaming and both cv). Per-split tuning does not transfer a measurable gain
+  to test, so (0.8, 0.2, 0.5) is the recommended deployment setting.
+
+Where the errors sit (beam + LM, error % first-2 / middle / last-2 words, deletion share in
+brackets):
+
+| | offline | streaming |
+|---|---|---|
+| test-clean | 2.6 / 1.9 / 3.0 | 3.5 / 2.4 / 3.3 |
+| test-other | 6.8 / 4.5 / 5.6 | 10.0 / 5.9 / 6.6 |
+| cv-test | 12.1 / 11.2 / 14.9 (last 3.6 del) | 16.9 / 14.0 / 17.0 (last 4.9 del) |
+
+Streaming costs 1.4 points mid-utterance on test-other and 3.2 on the first two words, which have
+no left context to adapt from: the first-words penalty is the largest structural streaming loss
+left. The kept tail chunk holds the last words near the middle on LibriSpeech. On cv the last two
+words are the worst region even offline, and the LM trades tail substitutions for deletions (last-2
+deletions 3.3 → 3.6 % offline, 4.2 → 4.9 % streaming, at a lower tail error overall). The training
+trim keeps 0.5 s of margin, so it is not the cause; Common Voice recordings that stop on the last
+word are the likely one, unchecked.
 
 ### 12.2 Speed and latency
 
@@ -644,26 +729,29 @@ Serial timing pass, 200 strided utterances, RTX 5070:
 
 | | RTF offline | RTF streaming | finalize |
 |---|---|---|---|
-| greedy | 0.003 | 0.032 | 0.01 s |
-| beam 10 | 0.018 | 0.048 | 0.11 to 0.12 s |
-| beam 10 + LM | 0.019 | 0.049 | 0.12 to 0.13 s |
+| greedy | 0.003 | 0.030 to 0.032 | 0.01 s |
+| beam 10 | 0.016 to 0.018 | 0.045 to 0.048 | 0.09 to 0.12 s |
+| beam 10 + LM | 0.017 to 0.018 | 0.046 to 0.048 | 0.10 to 0.12 s |
 
-First partial 13 ms after a chunk arrives. Streaming emission latency per word, against a forced
-alignment: median **80 ms**, p90 **240 ms**.
+First partial 11 to 14 ms after a chunk arrives. Batch-1 streaming on this GPU is bound by kernel
+launches, not arithmetic, which is why the encoder's width does not show in the RTF. Emission
+latency against the model's own CTC alignment (§8.3): median 0 to 80 ms, p90 240 ms on LibriSpeech
+and 320 ms on cv.
 
 ### 12.3 Budget curve (branched cooldowns)
 
-Trainer validation, full dev sets, greedy transducer, final weights of each branch (not averaged):
+Trainer validation, greedy transducer, final weights of each run (not averaged); dev-clean and
+dev-other in full, cv on `cv-dev2k`:
 
-| budget | GPU time of its own path | dev-clean off / stream | dev-other off / stream |
-|---|---|---|---|
-| 300k | ~7.3 h | 3.49 / 4.61 | 8.93 / 11.93 |
-| 450k | ~10.9 h | 3.21 / 4.21 | 8.36 / 11.43 |
-| **600k** (release) | **15.1 h** | **3.11 / 4.04** | **7.94 / 10.76** |
+| budget | GPU time of its own path | dev-clean off / stream | dev-other off / stream | cv off / stream |
+|---|---|---|---|---|
+| 600k (branch from 450k) | 13.4 h + 4.9 h | 2.94 / 3.92 | 7.39 / 10.03 | 13.15 / 17.57 |
+| **1.2M** | **35.7 h** | **2.62 / 3.49** | **6.78 / 9.12** | **12.31 / 16.17** |
 
-The three points fit WER ∝ steps^−0.15 on dev-other streaming (−0.19 on dev-clean), and the
-450k → 600k step is the steepest of the two: the curve has not flattened. All three curves together
-cost 19.2 h.
+Doubling the budget fits WER ∝ steps^−0.14 on dev-other streaming, −0.17 on dev-clean and −0.12 on
+cv, the flattest. At the 450k branch point, still on the constant learning rate, dev-other
+streaming read 19.68 %; the 150k-batch anneal took it to 10.03 %. Two points fix an exponent and
+cannot show curvature: whether 2.4M keeps paying is a projection (about −9 % for another 36 h).
 
 ---
 
@@ -694,31 +782,40 @@ parameters of a 25 Hz one, and the knockout showed S2's blocks were the least us
 five cost +0.30 nats/token, removing one S0 block +0.47 to +0.68. Depth bought less than the same
 wall clock spent on steps.
 
+**Width, on the two-source data.** Two 60k proxies, identical but for `stack_dims`: the wide
+`[320, 512, 640, 512]` read 17.36 % dev-other streaming greedy against 18.81 % for
+`[256, 384, 512, 384]`, and 28.65 % against 30.23 % on `cv-dev2k`, for +17 % wall clock (1:49 vs
+1:33). The gate was ≥ 0.5 points with no cv loss; wide was adopted. The 60k screen cannot say how
+much of the margin survives 1.2M batches, and no full-scale base run exists to compare.
+
 **Decided without a full-scale result:**
 
 * **No consistency regularisation (CR-CTC).** Built and tested, never measured at a scale where it
   could pay: its published gain is compute-matched at ~150 data passes, this run is 24, and it
   halves the distinct audio per batch. Off.
 * **No self-supervised pretraining.** On the proxy, a BEST-RQ warm start of the previous
-  architecture was level with training from scratch at 30k batches, so the release trains from
+  architecture was level with training from scratch at 30k batches, so the recipe trains from
   scratch and saves the pretrain's GPU hours.
 * **Band width 16** from `dev/band_loss_gap` = 0 throughout, rather than a sweep.
 * **5.12 s left context, no band offset, no dropout**: defaults, not swept.
 
 ### 13.2 Open directions
 
-* **A longer budget.** The budget curve (§12.3) is still falling; resuming
-  `transducer_branch450000.pt` with `--total-steps 1200000` projects dev-other streaming greedy to
-  about 9.7 (−10 %) for ~17 more GPU hours.
-* **The streaming penalty** (2.4 points on test-other): a one-way full-context → streaming
+* **The first-words penalty** (§12.1: streaming adds 3.2 points on the first two words of
+  test-other, 1.4 in the middle). Decode-only first: a 640 ms first chunk followed by 320 ms ones
+  (both sizes are in the training pool, the mixed sequence is not), costing latency on the first
+  words only. Then cross-utterance context, which seeds each cache from the previous segment of the
+  same chapter; it changes the evaluation protocol, so it would be reported separately.
+* **The streaming penalty overall** (1.7 points on test-other): a one-way full-context → streaming
   distillation between two views of the same batch (dual-mode training) targets it directly.
+* **A longer budget.** 600k → 1.2M bought −9 % on dev-other streaming (steps^−0.14) and −8 % on cv;
+  2.4M is a projection of about −9 % more for another 36 h.
+* **STREAM-LM budget**: one anneal from `lm_branch52500.pt` measures what the second half of the
+  corpus buys.
 * **Consistency regularisation** at a long budget, judged against this recipe.
 * **Removing the empty S2 stage**, which would drop `chunk_lcm` to 2 (a model change that needs its
   own run).
-* **Left-context sweep** (2.56 s / 5.12 s / unlimited) is decode-only on the release checkpoint.
-* **Cross-utterance context**: seed each utterance's cache from the previous segment of the same
-  chapter, aimed at the first-words penalty; it changes the evaluation protocol, so it would be
-  reported separately.
+* **Left-context sweep** (2.56 s / 5.12 s / unlimited) is decode-only on the trained checkpoint.
 
 ### 13.3 References
 

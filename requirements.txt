@@ -16,6 +16,8 @@ loguru
 safetensors
 pydantic
 pyyaml
+# FineWeb-Edu parquet shards for the LM corpus (TrainLanguageModel.BuildLmCorpus)
+pyarrow
 pytest
 # dev tooling (lint/format/type)
 black

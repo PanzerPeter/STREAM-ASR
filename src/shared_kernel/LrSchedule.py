@@ -18,9 +18,9 @@ def lr_at(
 
     `min_ratio > 0` keeps the tail steps doing work and keeps the rolling snapshots that
     `scripts/average_checkpoints.py` means over meaningfully different from one another. Raising
-    `total` mid-run only moves the decay window. Under the cosine schedule this replaced, `total`
-    was the curve, so bumping it re-heated the LR at the resume step and silently turned one run
-    into a two-cycle schedule.
+    `total` mid-run only moves the decay window: the stable phase does not depend on it, so a
+    resumed run keeps its LR. A cosine curve is a function of `total`, and bumping it would
+    re-heat the LR at the resume step.
     """
     if step < warmup:
         return peak * step / max(1, warmup)

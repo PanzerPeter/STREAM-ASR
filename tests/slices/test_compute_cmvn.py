@@ -22,8 +22,8 @@ def _fixture(root: Path, n: int) -> str:
 def test_cmvn_sampled_is_deterministic(tmp_path):
     manifest = _fixture(tmp_path, 10)
     out = tmp_path / "cmvn.pt"
-    a = compute_cmvn(ComputeCmvnCommand(manifest, str(out), sample_frac=0.5, seed=1))
-    b = compute_cmvn(ComputeCmvnCommand(manifest, str(out), sample_frac=0.5, seed=1))
+    a = compute_cmvn(ComputeCmvnCommand((manifest,), str(out), sample_frac=0.5, seed=1))
+    b = compute_cmvn(ComputeCmvnCommand((manifest,), str(out), sample_frac=0.5, seed=1))
     assert a["mean"].shape == (80,) and a["std"].shape == (80,)
     assert bool((a["mean"] == b["mean"]).all())  # same seed -> same sample -> same stats
     assert bool(np.isfinite(a["mean"].numpy()).all())
@@ -33,7 +33,7 @@ def test_cmvn_sampled_is_deterministic(tmp_path):
     # manifest, and therefore produce different stats. If the sample_frac branch
     # were ever skipped (k collapses to len(rows)), a/b/c would be identical
     # despite the seed change, and this assertion would catch it.
-    c = compute_cmvn(ComputeCmvnCommand(manifest, str(out), sample_frac=0.5, seed=2))
+    c = compute_cmvn(ComputeCmvnCommand((manifest,), str(out), sample_frac=0.5, seed=2))
     assert not bool((a["mean"] == c["mean"]).all())  # different seed -> different sample
 
     # The handler persists exactly the returned stats dict via torch.save; round-trip

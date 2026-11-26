@@ -1,6 +1,7 @@
 # Audio load/resample adapter. torchaudio 2.11 removed its native decode backends (it delegates to
-# TorchCodec/FFmpeg), so every decode goes through soundfile, which reads FLAC via libsndfile with
-# no extra system deps; torchaudio is kept only for its pure-tensor resample kernel.
+# TorchCodec/FFmpeg), so every decode goes through soundfile, which reads FLAC and MP3 via
+# libsndfile (>= 1.1) with no extra system deps; torchaudio is kept only for its pure-tensor
+# resample kernel.
 import io
 import json
 from fractions import Fraction
@@ -48,12 +49,25 @@ def load_audio(path: str) -> torch.Tensor:
     return _decode(path)
 
 
+def load_row_audio(row: dict[str, Any]) -> torch.Tensor:
+    # The waveform a manifest row stands for. A trimmed row carries `start_sample` with
+    # `num_samples` as its span, counted at the config rate after resampling (where the trimmer
+    # measured it); speed perturbation applies to that span. Every reader of a training row goes
+    # through here, so the cache, the uncached loader and CMVN all see the same samples.
+    wave = _decode(row["audio_filepath"])
+    if "start_sample" in row:
+        start = int(row["start_sample"])
+        wave = wave[start : start + int(row["num_samples"])]
+    return speed_perturb(wave, float(row.get("speed", 1.0)))
+
+
 def load_audio_bytes(raw: bytes) -> torch.Tensor:
     # Decode an uploaded audio file held in memory (WAV/FLAC/OGG via libsndfile, no FFmpeg needed).
     return _decode(io.BytesIO(raw))
 
 
 def load_manifest(path: str) -> list[dict[str, Any]]:
-    # A LibriSpeech manifest is one JSON object per line (uttid, audio_filepath, text, num_samples).
+    # One JSON object per line: uttid, audio_filepath, text, num_samples, and optionally speed
+    # (speed-perturbed copies) and start_sample (silence-trimmed Common Voice clips).
     with open(path, "r", encoding="utf-8") as f:
         return [json.loads(line) for line in f if line.strip()]

@@ -14,11 +14,15 @@ class FrameBucketSampler(Sampler):
     epoch), so batch *order* varies while intra-batch length grouping (and thus padding
     efficiency) is preserved. Off (default) the batch stream is fully deterministic, which is
     what dev/val evaluation needs for comparable WER across steps.
+
+    Several manifests are read back to back, so index ``i`` is row ``i`` of their concatenation:
+    exactly the indexing of a ``ConcatDataset`` over one dataset per manifest, in the same order.
+    Bucketing then runs over the pooled rows, so a batch may mix sources of similar length.
     """
 
     def __init__(
         self,
-        manifest: str,
+        manifests: tuple[str, ...],
         max_frames_per_batch: int,
         shuffle: bool = False,
         seed: int = 0,
@@ -26,7 +30,7 @@ class FrameBucketSampler(Sampler):
         max_lattice_per_batch: int | None = None,
     ) -> None:
         hop_length = get_config().audio.hop_length
-        rows = [json.loads(line) for line in open(manifest, encoding="utf-8")]
+        rows = [json.loads(line) for m in manifests for line in open(m, encoding="utf-8")]
         self._frames = [r["num_samples"] // hop_length for r in rows]
         # Transcript char count is a cheap upper bound on subword tokens (BPE never expands past
         # chars), so it conservatively caps the RNN-T joiner lattice B*T*(U+1) without a tokenizer.

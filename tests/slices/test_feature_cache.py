@@ -1,9 +1,15 @@
+import json
+
 import numpy as np
 import pytest
 import torch
 
 from src.shared_kernel.Config_Adapter import get_config
-from src.slices.ExtractFeatures.FeatureCache import FeatureCacheReader, write_feature_cache
+from src.slices.ExtractFeatures.FeatureCache import (
+    FeatureCacheReader,
+    manifest_fingerprint,
+    write_feature_cache,
+)
 
 
 def test_cache_roundtrip(tmp_path):
@@ -64,3 +70,31 @@ def test_cache_rejects_a_manifest_it_was_not_built_for(tmp_path):
     FeatureCacheReader(str(tmp_path), "train", manifest_fingerprint(clean))  # matching: fine
     with pytest.raises(ValueError, match="manifest"):
         FeatureCacheReader(str(tmp_path), "train", manifest_fingerprint(perturbed))
+
+
+def test_fingerprint_is_unchanged_for_rows_without_a_span(tmp_path):
+    # The formula every existing cache header was written with. A row without start_sample must
+    # still hash this way, or every LibriSpeech cache (train_sp2 is 105 GB) would read as stale.
+    import hashlib
+
+    rows = [
+        {"uttid": "a", "num_samples": 10},
+        {"uttid": "a_sp0.9", "num_samples": 11, "speed": 0.9},
+    ]
+    manifest = tmp_path / "m.jsonl"
+    manifest.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    legacy = hashlib.sha1()
+    for r in rows:
+        legacy.update(f"{r['uttid']}:{r.get('speed', 1.0)}\n".encode())
+    assert manifest_fingerprint(str(manifest)) == legacy.hexdigest()
+
+
+def test_fingerprint_covers_the_trim_span(tmp_path):
+    def fingerprint(start: int, num: int) -> str:
+        path = tmp_path / f"m{start}_{num}.jsonl"
+        path.write_text(
+            json.dumps({"uttid": "a", "num_samples": num, "start_sample": start}) + "\n"
+        )
+        return manifest_fingerprint(str(path))
+
+    assert fingerprint(0, 100) != fingerprint(8, 100) != fingerprint(8, 90)

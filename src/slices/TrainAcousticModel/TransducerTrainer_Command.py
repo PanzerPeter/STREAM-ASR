@@ -11,14 +11,28 @@ class DevSplit:
 
 
 @dataclass(frozen=True)
-class TransducerTrainCommand:
-    # Paired 2x speed-perturbed 960 h manifest (562,482 rows, 1,933 h), cache baked at extraction.
+class TrainSource:
     # A cache is indexed by its manifest's row order and carries that manifest's fingerprint, so
     # the manifest and its cache split always move together.
-    train_manifest: str = "data/manifests/train_sp2.jsonl"
-    train_cache_split: str = "train_sp2"
+    manifest: str
+    cache_split: str
+
+
+@dataclass(frozen=True)
+class TransducerTrainCommand:
+    # Read side by side (one dataset per source, one sampler over their rows), so no cache is ever
+    # copied or merged. LibriSpeech 960 h paired 2x speed perturbed (562,482 rows, 1,933 h) and
+    # Common Voice cv-train (leakage-filtered, silence-trimmed). Sampling is per frame, so each
+    # source weighs in by its hours.
+    train_sources: tuple[TrainSource, ...] = (
+        TrainSource("data/manifests/train_sp2.jsonl", "train_sp2"),
+        TrainSource("data/manifests/cv-train.jsonl", "cv-train"),
+    )
+    # The last split is the fixed probe batch (band gap, gate saturation): dev-other, as before
+    # Common Voice joined. cv-dev2k is an evenly strided 2,000-clip slice of cv-dev.
     dev_splits: tuple[DevSplit, ...] = (
         DevSplit("clean", "data/manifests/dev.jsonl", "dev"),
+        DevSplit("cv", "data/manifests/cv-dev2k.jsonl", "cv-dev2k"),
         DevSplit("other", "data/manifests/dev-other.jsonl", "dev-other"),
     )
     cache_dir: str = "data/features/mel"
@@ -36,5 +50,7 @@ class TransducerTrainCommand:
     def __post_init__(self) -> None:
         if self.total_steps <= 0:
             raise ValueError(f"total_steps must be positive, got {self.total_steps}")
+        if not self.train_sources:
+            raise ValueError("at least one train source is needed")
         if not self.dev_splits:
             raise ValueError("at least one dev split is needed for checkpoint selection")

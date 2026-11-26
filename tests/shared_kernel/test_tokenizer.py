@@ -9,7 +9,9 @@ def test_tokenizer_trains_and_roundtrips(tmp_path):
     prefix = str(tmp_path / "bpe500")
     model = train_tokenizer(
         TrainTokenizerCommand(
-            manifest="data/manifests/train.jsonl", model_prefix=prefix, vocab_size=vocab_size
+            manifests=("data/manifests/train.jsonl",),
+            model_prefix=prefix,
+            vocab_size=vocab_size,
         )
     )
 

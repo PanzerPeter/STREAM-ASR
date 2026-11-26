@@ -1,11 +1,11 @@
-# S2 encoder (MODEL_ARCHITECTURE.md §2, §4): 35.56 M parameters, output at 12.5 Hz. Every
+# S2 encoder (MODEL_ARCHITECTURE.md §2, §4): 61.78 M parameters, output at 12.5 Hz. Every
 # residual-path norm is weightless; the floored per-channel gates are the only learnable scale on
 # the trunk (§5). No bound or projection exists anywhere: the amplitude is bounded by construction.
 frontend_channels: 128
 # Stack widths at 25 / 12.5 / 6.25 / 12.5 Hz (S0..S3). S3 takes a U-Net skip from S1.
-stack_dims: [256, 384, 512, 384]
-# Blocks per stack. S2 holds none: it is a linear 6.25 Hz path (pool, 384 -> 512, norm, upsample,
-# 512 -> 384) summed into S3's entry beside the skip (§4.1).
+stack_dims: [320, 512, 640, 512]
+# Blocks per stack. S2 holds none: it is a linear 6.25 Hz path (pool, 512 -> 640, norm, upsample,
+# 640 -> 512) summed into S3's entry beside the skip (§4.1).
 stack_blocks: [4, 8, 0, 8]
 head_dim: 64                 # heads = d / head_dim in every block
 conv_kernel_size: 15         # depthwise causal conv on the conv-gated MLP's hidden width

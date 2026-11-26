@@ -38,7 +38,7 @@ def partition_params(
     return muon, adamw
 
 
-def _lr_groups(params: list[nn.Parameter], lr: float, weight_decay: float) -> list[dict]:
+def lr_groups(params: list[nn.Parameter], lr: float, weight_decay: float) -> list[dict]:
     # Weight decay only on ndim >= 2. For every vector and scalar here (biases, the floored gate
     # pre-activations b, the QK-norm gains) 0 is not a neutral shrink target but a specific setting
     # (beta = 0.53, a QK gain that flattens attention), so decay would be a standing pull toward it.
@@ -54,14 +54,14 @@ def build_optimizer(model: nn.Module, cfg: OptimConfig) -> list[torch.optim.Opti
     fused = next(model.parameters()).is_cuda  # fused AdamW kernel on CUDA; False on CPU (tests)
     muon_p, adamw_p = partition_params(model)
     muon = Muon(
-        _lr_groups(muon_p, cfg.muon_lr, cfg.weight_decay),
+        lr_groups(muon_p, cfg.muon_lr, cfg.weight_decay),
         lr=cfg.muon_lr,
         momentum=cfg.muon_momentum,
         ns_steps=cfg.ns_steps,
         weight_decay=cfg.weight_decay,
     )
     adamw = torch.optim.AdamW(
-        _lr_groups(adamw_p, cfg.adamw_lr, cfg.weight_decay),
+        lr_groups(adamw_p, cfg.adamw_lr, cfg.weight_decay),
         weight_decay=cfg.weight_decay,
         betas=(0.9, 0.98),
         fused=fused,

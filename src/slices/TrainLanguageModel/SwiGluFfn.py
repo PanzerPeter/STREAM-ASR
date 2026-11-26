@@ -9,12 +9,14 @@ def _rounded_hidden(dim: int, expansion: int) -> int:
 
 
 class SwiGluFfn(nn.Module):
+    # Bias-free, as in current Transformer LMs (LLaMA, modded-nanogpt): the pre-norm input already
+    # fixes the operating point, so a bias is only an extra vector for the optimiser to carry.
     def __init__(self, dim: int, expansion: int, dropout: float) -> None:
         super().__init__()
         hidden = _rounded_hidden(dim, expansion)
-        self.w_gate = nn.Linear(dim, hidden)
-        self.w_up = nn.Linear(dim, hidden)
-        self.w_down = nn.Linear(hidden, dim)
+        self.w_gate = nn.Linear(dim, hidden, bias=False)
+        self.w_up = nn.Linear(dim, hidden, bias=False)
+        self.w_down = nn.Linear(hidden, dim, bias=False)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

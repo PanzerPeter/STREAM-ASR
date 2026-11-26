@@ -1,7 +1,8 @@
 # Train and dev loaders for the transducer stage.
 import os
+from typing import Any
 
-from torch.utils.data import DataLoader
+from torch.utils.data import ConcatDataset, DataLoader
 
 from src.shared_kernel.Config_Adapter import get_config
 from src.slices.ExtractFeatures.FeatureCache import FeatureCacheReader
@@ -25,9 +26,9 @@ def build_loaders(
 ) -> tuple[DataLoader, FrameBucketSampler, list[DevSet]]:
     tr = get_config().training.transducer
 
-    def sampler_for(manifest: str, shuffle: bool) -> FrameBucketSampler:
+    def sampler_for(manifests: tuple[str, ...], shuffle: bool) -> FrameBucketSampler:
         return FrameBucketSampler(
-            manifest,
+            manifests,
             tr.max_frames_per_batch,
             shuffle=shuffle,
             seed=tr.seed,
@@ -35,10 +36,15 @@ def build_loaders(
             max_lattice_per_batch=tr.max_lattice_per_batch,
         )
 
-    train_ds = LibriSpeechDataset(
-        cmd.train_manifest, tokenizer, _open_cache(cmd.cache_dir, cmd.train_cache_split)
+    # ConcatDataset and the sampler both index the sources' rows back to back in this order; each
+    # dataset still checks its own cache's fingerprint.
+    train_ds: ConcatDataset[Any] = ConcatDataset(
+        [
+            LibriSpeechDataset(src.manifest, tokenizer, _open_cache(cmd.cache_dir, src.cache_split))
+            for src in cmd.train_sources
+        ]
     )
-    sampler = sampler_for(cmd.train_manifest, shuffle=True)
+    sampler = sampler_for(tuple(src.manifest for src in cmd.train_sources), shuffle=True)
     train = DataLoader(
         train_ds,
         batch_sampler=sampler,
@@ -53,7 +59,7 @@ def build_loaders(
                 LibriSpeechDataset(
                     split.manifest, tokenizer, _open_cache(cmd.cache_dir, split.cache_split)
                 ),
-                batch_sampler=sampler_for(split.manifest, shuffle=False),
+                batch_sampler=sampler_for((split.manifest,), shuffle=False),
                 collate_fn=collate_features,
             ),
         )

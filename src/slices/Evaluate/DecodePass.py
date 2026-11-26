@@ -72,8 +72,8 @@ class DecodePassJob:
     label: str
 
 
-# Per-process caches: a worker that handles two jobs must not reload a 220 MB checkpoint or a
-# 350 MB LM to do it, and the parent reuses the same entries for its serial timing pass.
+# Per-process caches: a worker that handles two jobs must not reload a 220 MB checkpoint or the
+# LM to do it, and the parent reuses the same entries for its serial timing pass.
 _MODELS: dict[tuple[str, str], tuple[TransducerModel, SentencePieceTokenizer]] = {}
 _DECODERS: dict[tuple[str, str, str, float, float, float], StreamingDecoder_Handler] = {}
 

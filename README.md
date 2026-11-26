@@ -4,42 +4,46 @@
 [![Python](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.11%20%2B%20CUDA%2012.8-ee4c2c.svg)](https://pytorch.org/)
 
-**S**peech **T**ranscription via **R**egularized **E**ncoder-**A**coustic **M**odeling: a
-from-scratch streaming speech recognizer for English, trained end to end on LibriSpeech 960 h on a
-single 12 GB consumer GPU.
+**S**treaming **T**ransducer with **R**esidual-bounded **E**ncoder-**A**coustic **M**odeling: a
+from-scratch streaming speech recognizer for English, trained end to end on LibriSpeech 960 h and
+Common Voice English on a single 12 GB consumer GPU.
 
 * **One model, two modes.** The same weights decode offline and streaming (320 ms chunks).
-* **Small and fast.** 36.7 M parameters; streaming real-time factor 0.05 with beam search and LM
-  rescoring, 80 ms median emission latency, and a constant 5.3 MB streaming state for any stream
-  length.
-* **Cheap to train.** 15.1 h from scratch on one RTX 5070, with no pretrained weights and no
-  external data in the acoustic model.
+* **Small and fast.** 63.1 M parameters; streaming real-time factor 0.05 with beam search and LM
+  rescoring, 13 ms to a first partial after each 320 ms chunk, and a constant 6.9 MB streaming state
+  for any stream length.
+* **Cheap to train.** 35.7 h from scratch on one RTX 5070, with no pretrained weights: the acoustic
+  model sees only LibriSpeech and Common Voice.
 * **Pure PyTorch.** No k2, icefall or external decoder: the banded RNN-T loss, Muon optimizer,
   label-looping decoder and beam search are all in this repository.
 
 ## Results
 
-LibriSpeech test WER, v2.0 release (`transducer_avg.pt` + STREAM-LM). Rescoring weights are tuned on
-the matching dev set, never on test.
+Test WER (%, offline / streaming) of `transducer_avg.pt` + STREAM-LM. Rescoring weights are tuned on
+the matching dev set, never on test; Common Voice is the hard, accent-rich condition.
 
-| Decoding | test-clean offline | test-clean streaming | test-other offline | test-other streaming |
-|---|---|---|---|---|
-| greedy | 3.17 % | 4.24 % | 7.91 % | 10.92 % |
-| beam 10 | 3.15 % | 4.24 % | 7.76 % | 10.48 % |
-| beam 10 + LM + ILME | **2.64 %** | **3.18 %** | **6.51 %** | **8.87 %** |
+| Decoding | LibriSpeech test-clean | LibriSpeech test-other | Common Voice test |
+|---|---|---|---|
+| greedy | 2.83 / 3.80 | 6.55 / 9.07 | 15.69 / 20.07 |
+| beam 10 | 2.89 / 3.76 | 6.50 / 8.75 | 15.43 / 19.31 |
+| beam 10 + LM + ILME | **2.29 / 2.88** | **5.46 / 7.19** | **13.42 / 16.80** |
 
-Streaming is 320 ms chunks with 5.12 s of left context. On one RTX 5070: RTF 0.019 offline and 0.049
-streaming with the LM, 13 ms to first partial, 0.12 s to finalize. Full tables, the budget curve and
-the tuned weights are in [MODEL_ARCHITECTURE.md §12](MODEL_ARCHITECTURE.md#12-results).
+One fixed rescoring setting (α 0.8, β 0.2, length bonus 0.5) stays within 0.05 points of the tuned
+row on all six figures.
+
+Streaming is 320 ms chunks with 5.12 s of left context. On one RTX 5070: RTF 0.017 to 0.018 offline
+and 0.046 to 0.048 streaming with the LM, 11 to 14 ms to first partial, about 0.1 s to finalize.
+Full tables, the budget curve and the tuned weights are in
+[MODEL_ARCHITECTURE.md §12](MODEL_ARCHITECTURE.md#12-results).
 
 ## Quickstart: transcribe with the released weights
 
 ```bash
-git clone --branch v2.0 https://github.com/PanzerPeter/STREAM-ASR.git && cd STREAM-ASR
+git clone --branch v2.5 https://github.com/PanzerPeter/STREAM-ASR.git && cd STREAM-ASR
 uv venv .venv --python 3.12 && uv pip install -r requirements.txt
 
-V=release/stream-asr-v2.0
-gh release download v2.0 -D $V -p '*.safetensors'
+V=release/stream-asr-v2.5
+gh release download v2.5 -D $V -p '*.safetensors'
 (cd $V && sha256sum -c SHA256SUMS)
 
 .venv/bin/python -m src.slices.Decode.streaming_decode AUDIO.flac \
@@ -48,13 +52,16 @@ gh release download v2.0 -D $V -p '*.safetensors'
     --checkpoint $V/model.safetensors --tokenizer $V/bpe500.model             # offline
 ```
 
-Input is 16 kHz mono speech. [release/stream-asr-v2.0/README.md](release/stream-asr-v2.0/README.md)
-is the model card: files, LM rescoring, the local web demo, and limitations.
+Input is 16 kHz mono speech. [release/stream-asr-v2.5/README.md](release/stream-asr-v2.5/README.md)
+is the model card: files, LM rescoring (`--lm-weight` and the LM's own files), the local web demo,
+and limitations.
 
 ## Train from scratch
 
-Needs the LibriSpeech corpus under `data/{Train,Val,Test}`, about 250 GB of disk (the corpus plus a
-157 GiB feature cache) and a CUDA GPU. The recipe was built on an RTX 5070 (12 GB, Blackwell
+Needs the LibriSpeech corpus under `data/{Train,Val,Test}` and Common Voice Scripted Speech 27.0
+English extracted into `data/CommonVoice/`, about 350 GB of disk (both corpora, ~210 GB of feature
+cache, the LM corpus) plus 95 GB for the Common Voice archive until it is extracted, network access
+for the LM text (FineWeb-Edu), and a CUDA GPU. The recipe was built on an RTX 5070 (12 GB, Blackwell
 sm_120, CUDA 12.8 wheels); `verify_env.py` checks for exactly that card, so edit its expected
 capability on other hardware and re-run `scripts/profile_transducer_step.py` before trusting the
 batch budgets.
@@ -64,21 +71,27 @@ uv venv .venv --python 3.12 && source .venv/bin/activate
 uv pip install -r requirements.txt
 python scripts/verify_env.py
 
-# data: manifests, BPE-500 tokenizer, CMVN, 2x speed-perturbed manifest, fp16 mel cache
+# data: LibriSpeech + Common Voice manifests, BPE-500 tokenizer, 2x speed-perturbed manifest,
+# CMVN, fp16 mel cache
 PYTHONPATH=. python scripts/build_manifests.py
+PYTHONPATH=. python scripts/build_cv_manifests.py
 PYTHONPATH=. python scripts/train_tokenizer.py
-PYTHONPATH=. python scripts/compute_cmvn.py
 PYTHONPATH=. python scripts/build_speed_perturb_manifest.py
+PYTHONPATH=. python scripts/compute_cmvn.py
 PYTHONPATH=. python scripts/precompute_features.py
 
-# transducer: 600k batches, ~15 h on an RTX 5070, then average the last five snapshots
+# transducer: 1.2M batches, ~36 h on an RTX 5070, then average the last five snapshots
 python -m src.slices.TrainAcousticModel.train_transducer
 PYTHONPATH=. python scripts/average_checkpoints.py --last-n 5
 
-# STREAM-LM for rescoring, then evaluate (tunes the LM weights on dev, reports on test)
+# STREAM-LM for rescoring (~7 h), then evaluate (tunes the LM weights on dev, reports on test)
+python scripts/download_lm_text.py
+PYTHONPATH=. python scripts/build_lm_corpus.py && PYTHONPATH=. python scripts/train_lm_tokenizer.py
+PYTHONPATH=. python scripts/prepare_lm_data.py
 python -m src.slices.TrainLanguageModel.train_lm
 python -m src.slices.Evaluate.evaluate --clean
 python -m src.slices.Evaluate.evaluate --other
+python -m src.slices.Evaluate.evaluate --cv
 ```
 
 [COMMANDS.md](COMMANDS.md) has every command and flag, the LM data preparation, and the failure
@@ -88,10 +101,10 @@ modes worth knowing first.
 
 ```
 raw log-mel [B, T, 80] ──► CMVN, mean fill past each length, pad to 16 frames
-  └► DwSepSubsampling (x4, stride-aligned causal pad) ──► rms_norm            25 Hz, d 256
+  └► DwSepSubsampling (x4, stride-aligned causal pad) ──► rms_norm            25 Hz, d 320
        └► S0: 4 blocks                                                        25 Hz
-            └► pool ► S1: 8 blocks ─────────────────────── skip ──┐          12.5 Hz, d 384
-                 └► pool ► S2: linear path ► upsample ► (+) ◄─────┘          6.25 Hz, d 512
+            └► pool ► S1: 8 blocks ─────────────────────── skip ──┐          12.5 Hz, d 512
+                 └► pool ► S2: linear path ► upsample ► (+) ◄─────┘          6.25 Hz, d 640
                                               └► S3: 8 blocks ► rms_norm      12.5 Hz memory
 memory ─► CTC head (sets the band, auxiliary CTC loss)
        └► additive joiner on the band ◄── stateless predictor (BPE-500 + blank)
@@ -151,4 +164,6 @@ other open-source components:
 > licensed under Apache-2.0.
 
 That covers the code, the trained checkpoints and the derived data artifacts alike. LibriSpeech is
-distributed by its own authors under CC BY 4.0 and is not part of this repository.
+distributed by its own authors under CC BY 4.0, Common Voice by Mozilla under CC0 1.0, and the
+FineWeb-Edu text used for the language model under ODC-By 1.0; none of them is part of this
+repository ([NOTICE](NOTICE) has the details).

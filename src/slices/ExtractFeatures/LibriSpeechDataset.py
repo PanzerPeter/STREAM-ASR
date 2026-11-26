@@ -2,7 +2,7 @@ import json
 
 from torch.utils.data import Dataset
 
-from src.shared_kernel.AudioIO_Adapter import load_audio, speed_perturb
+from src.shared_kernel.AudioIO_Adapter import load_row_audio
 from src.shared_kernel.LogMel_Transform import compute_log_mel
 from src.slices.ExtractFeatures.FeatureCache import FeatureCacheReader, manifest_fingerprint
 
@@ -11,8 +11,9 @@ class LibriSpeechDataset(Dataset):
     """Yields (log-mel, token_ids). With a feature cache, __getitem__ is an mmap slice, so the epoch
     loop stays GPU-bound. Spectral augmentation happens later, as a GPU batch op in the trainer
     (`SpecAugmentBatch`). Speed perturbation is an audio-domain augmentation keyed off the row's
-    `speed` field (set by SpeedPerturbManifest); a cache is built PER MANIFEST and already carries
-    it, so the cached path must not re-apply it. The cache is bound to its manifest by a
+    `speed` field (set by SpeedPerturbManifest), and a trimmed row's `start_sample` span selects
+    its audio; a cache is built PER MANIFEST and already carries both, so the cached path must not
+    re-apply them. The cache is bound to its manifest by a
     fingerprint, checked here at construction."""
 
     def __init__(
@@ -42,6 +43,5 @@ class LibriSpeechDataset(Dataset):
         if self._cache is not None:
             mel = self._cache[index]
         else:
-            speed = row.get("speed", 1.0)
-            mel = compute_log_mel(speed_perturb(load_audio(row["audio_filepath"]), speed))
+            mel = compute_log_mel(load_row_audio(row))
         return mel, self._tokenizer.encode(row["text"])

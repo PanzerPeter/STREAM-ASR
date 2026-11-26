@@ -7,15 +7,15 @@ transducer:
   max_lattice_per_batch: 11000000  # B * max(frames) * max(chars)
   grad_accum: 3
   warmup_steps: 5000
-  # Loader BATCHES, not optimizer updates. 600k x 28k frames = 46,667 h of encoder audio, 24
-  # passes over train_sp2; 15.1 h on one RTX 5070 (§9.3).
-  total_steps: 600000
+  # Loader BATCHES, not optimizer updates. 1.2M x at most 28k frames = 93,333 h of encoder audio,
+  # ~24 passes over train_sp2 + cv-train; 35.7 h on one RTX 5070 (0.107 s/batch with validation).
+  total_steps: 1200000
   lr_decay_frac: 0.25            # WSD: 1-sqrt anneal over the last quarter
   lr_min_ratio: 0.01
-  # Branched cooldowns (§9.3): the trunk checkpoint at the WSD decay start of a 300k / 450k / 600k
-  # budget is kept as transducer_branch{N}.pt, never rolled off, so each shorter (or longer) budget
-  # is one anneal resumed from it.
-  branch_points: [225000, 337500, 450000]
+  # Branched cooldowns (§9.3): the trunk checkpoint at the WSD decay start of a 600k budget is kept
+  # as transducer_branch450000.pt, never rolled off, so the 600k model (the equal-compute
+  # comparison) is one anneal resumed from it.
+  branch_points: [450000]
   grad_clip: 5.0
   # GradNormGuard on train/grad_norm_guarded (weight matrices): aborts, without checkpointing, when
   # the median of the last guard_window log windows exceeds guard_trend_factor x the run's quietest

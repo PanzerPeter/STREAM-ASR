@@ -8,8 +8,9 @@ from src.slices.BuildManifest.TrainTokenizer_Command import TrainTokenizerComman
 
 
 def train_tokenizer(cmd: TrainTokenizerCommand) -> str:
-    if not os.path.isfile(cmd.manifest):
-        raise FileNotFoundError(cmd.manifest)
+    for manifest in cmd.manifests:
+        if not os.path.isfile(manifest):
+            raise FileNotFoundError(manifest)
 
     os.makedirs(os.path.dirname(cmd.model_prefix) or ".", exist_ok=True)
 
@@ -17,8 +18,9 @@ def train_tokenizer(cmd: TrainTokenizerCommand) -> str:
     with tempfile.NamedTemporaryFile(
         "w", suffix=".txt", delete=False, encoding="utf-8"
     ) as text_file:
-        for line in open(cmd.manifest, encoding="utf-8"):
-            text_file.write(json.loads(line)["text"] + "\n")
+        for manifest in cmd.manifests:
+            for line in open(manifest, encoding="utf-8"):
+                text_file.write(json.loads(line)["text"] + "\n")
         corpus_path = text_file.name
 
     spm.SentencePieceTrainer.Train(

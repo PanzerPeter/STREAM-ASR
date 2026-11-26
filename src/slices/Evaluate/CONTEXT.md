@@ -8,16 +8,19 @@ emission latency against a CTC forced alignment of the reference (`MODEL_ARCHITE
 
 ## Entry Point
 - Type: CLI (`evaluate.py` → `EvaluateCorpus_Handler`; GPU, user-run)
-- Input: `EvaluateCorpus_Command` (`--clean` / `--other` and the caps/grid/weight overrides)
+- Input: `EvaluateCorpus_Command` (`--clean` / `--other` / `--cv` and the caps/grid/weight
+  overrides)
 - Output: `EvaluateCorpus_Response`; side effect: `runs/eval/report-{split}.json`
 
 ## Data Ownership
 - Consumes artifacts: `data/manifests/*.jsonl`, `data/checkpoints/transducer_avg.pt`,
-  `data/checkpoints/lm_best.pt`, `data/tokenizer/bpe500.model`.
+  `data/checkpoints/lm_best.pt`, `data/tokenizer/bpe500.model`, `data/tokenizer/lm8k.model`.
 - Produces artifact: `runs/eval/report-{split}.json` (`EvalConfig.report_path`), one row per
   stage × mode, each carrying the raw `num_word_errors`/`num_ref_words` counts behind its rate so two
   runs can be compared for significance without re-decoding, plus full provenance (split,
-  checkpoint, beam size, per-mode weights, the whole dev sweep, and how timing was measured).
+  checkpoint, both tokenizers and the LM by path and SHA-256, beam size, per-mode weights, the whole
+  dev sweep, and how timing was measured). The digests matter because every run writes the same
+  file names: a path in an old report can point at a newer model.
 
 ## Shared Kernel
 - `Config_Adapter.get_config().eval`: ablation stages, report path, workers, RTF probe size.
@@ -33,17 +36,20 @@ return raw counts (the summed-counts identity with `corpus_wer`/`corpus_cer` is 
 utterance. Emission latency is, per correctly recognised word, the audio time its first token was
 shown (the end of the chunk its emission frame belongs to, from `StreamingDecode_Response
 .token_emit_s`) minus that word's end in `torchaudio.functional.forced_align` over the model's own
-offline CTC posteriors. It costs one extra offline encoder pass, so `DecodePass` attaches the probe
+offline CTC posteriors. The reference is the scored model's own alignment, so the number is the
+transducer's lag behind its own CTC head: it compares decode settings of one model, never two
+models. It costs one extra offline encoder pass, so `DecodePass` attaches the probe
 to streaming QUALITY passes only, never to the serial timing pass whose RTF must be the decoder's
 alone.
 
-**Split selection.** `--clean` / `--other`, exactly one, with no default. A split is an acoustic
+**Split selection.** `--clean` / `--other` / `--cv`, exactly one, with no default. A split is an acoustic
 condition rather than a file, so each one binds all three paths together:
 
 | Flag | Scored | Tuned on | Report |
 |---|---|---|---|
 | `--clean` | `data/manifests/test.jsonl` (test-clean, n=2,620) | `dev.jsonl` (dev-clean) | `runs/eval/report-clean.json` |
 | `--other` | `test-other.jsonl` (n=2,939) | `dev-other.jsonl` | `runs/eval/report-other.json` |
+| `--cv` | `cv-test.jsonl` (Common Voice test, n=16,402) | `cv-dev2k.jsonl` (strided 2,000 of cv-dev) | `runs/eval/report-cv.json` |
 
 Binding them removes three ways to publish a wrong number: weights tuned on the wrong acoustic
 condition, a test-other table overwriting the test-clean report, and a WER whose split you have to
@@ -93,9 +99,10 @@ slice: manifests are sorted by uttid, so `rows[:n]` is a couple of speakers read
 chapters.
 
 **Rescoring weights.** Tuning runs automatically whenever a stage uses the LM, unless `--no-tune` or
-an explicit `--lm-weight`/`--ilm-weight` is given. Dev is decoded once per mode acoustic-only. Each
+an explicit `--lm-weight`/`--ilm-weight`/`--length-bonus` is given (unset ones fall back to
+`decode.yaml`). Dev is decoded once per mode acoustic-only. Each
 utterance's n-best is cached with its `(acoustic, LM-sequence, internal-LM-sequence)` terms kept
-apart, and the whole `--lm-grid` × `--ilm-grid` is then swept over that cache for free, since
+apart, and the whole `--lm-grid` × `--ilm-grid` × `--lb-grid` is then swept over that cache for free, since
 neither weight moves the acoustic beam and so no grid point costs another decode. Alignment is done
 once per hypothesis too, so a grid point is an argmax plus a table lookup.
 

@@ -205,12 +205,12 @@ def test_stage_table_is_a_cumulative_ablation():
 
 
 def test_each_split_binds_its_own_dev_manifest_and_report_path():
-    # --clean/--other pick an acoustic condition, not a file: the dev manifest tuned on has to
-    # match the test manifest scored, and the two conditions must not share a report path.
+    # --clean/--other/--cv pick an acoustic condition, not a file: the dev manifest tuned on has to
+    # match the test manifest scored, and no two conditions may share a report path.
     from src.shared_kernel.Config_Adapter import get_config as _cfg
     from src.slices.Evaluate.evaluate import _SPLITS
 
-    assert set(_SPLITS) == {"clean", "other"}
+    assert set(_SPLITS) == {"clean", "other", "cv"}
     for name, split in _SPLITS.items():
         assert split.name == name
         assert ("other" in split.test_manifest) == (name == "other")

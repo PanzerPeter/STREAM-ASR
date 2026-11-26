@@ -25,7 +25,7 @@ def test_forward_shapes_and_unit_rms_memory():
 def test_parameter_budget_matches_the_design():
     model = TransducerModel(cmvn_path=None)
     enc = sum(p.numel() for p in model.encoder.parameters()) / 1e6
-    assert abs(enc - 35.56) < 0.01  # §2: [4, 8, 0, 8], every block attention then MLP
+    assert abs(enc - 61.78) < 0.01  # §2: [4, 8, 0, 8] at [320, 512, 640, 512], attention then MLP
 
 
 def test_joint_loss_finite_with_finite_grads_band_on_and_off():

@@ -4,12 +4,12 @@
 import json
 import multiprocessing as mp
 import time
-from typing import Iterator
+from typing import Any, Iterator
 
 import numpy as np
 import torch
 
-from src.shared_kernel.AudioIO_Adapter import load_audio, speed_perturb
+from src.shared_kernel.AudioIO_Adapter import load_row_audio
 from src.shared_kernel.LogMel_Transform import compute_log_mel
 from src.shared_kernel.Logging_Adapter import configure_logging
 from src.slices.ExtractFeatures.FeatureCache import (
@@ -39,11 +39,10 @@ def _init_worker() -> None:
     torch.set_num_threads(1)
 
 
-def _mel_for(job: tuple[str, float]) -> np.ndarray:
-    # The row's speed factor is applied HERE, so the perturbation is baked into the cache and the
-    # training loader stays an mmap slice. speed == 1.0 makes speed_perturb a no-op.
-    path, speed = job
-    return compute_log_mel(speed_perturb(load_audio(path), speed)).numpy().astype(np.float16)
+def _mel_for(row: dict[str, Any]) -> np.ndarray:
+    # The row's trim span and speed factor are applied HERE, so both are baked into the cache and
+    # the training loader stays an mmap slice.
+    return compute_log_mel(load_row_audio(row)).numpy().astype(np.float16)
 
 
 def _log_progress(mels: Iterator[np.ndarray], split: str, total: int) -> Iterator[np.ndarray]:
@@ -68,13 +67,12 @@ def precompute_features(cmd: PrecomputeFeaturesCommand) -> int:
         return done
 
     rows = [json.loads(line) for line in open(cmd.manifest, encoding="utf-8")]
-    jobs = [(row["audio_filepath"], row.get("speed", 1.0)) for row in rows]
 
     def _mels() -> Iterator[np.ndarray]:
         with _CTX.Pool(cmd.num_workers, initializer=_init_worker) as pool:
-            yield from pool.imap(_mel_for, jobs, chunksize=64)  # ordered
+            yield from pool.imap(_mel_for, rows, chunksize=64)  # ordered
 
     write_feature_cache(
-        cmd.cache_dir, cmd.split, _log_progress(_mels(), cmd.split, len(jobs)), fingerprint
+        cmd.cache_dir, cmd.split, _log_progress(_mels(), cmd.split, len(rows)), fingerprint
     )
-    return len(jobs)
+    return len(rows)

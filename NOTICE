@@ -26,3 +26,15 @@ The trained model checkpoints and the derived data artifacts (manifests,
 tokenizer, CMVN statistics, feature caches) are covered by the same terms.
 LibriSpeech itself is distributed by its own authors under CC BY 4.0 and is
 not part of this repository.
+
+THIRD-PARTY DATA
+----------------
+The acoustic model is trained on Mozilla Common Voice Scripted Speech
+(English), released under CC0 1.0 by the Mozilla Foundation. Common Voice
+audio is not part of this repository.
+
+The language model's training text includes FineWeb-Edu (HuggingFaceFW,
+https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu), made available
+under the Open Data Commons Attribution License (ODC-By) v1.0 and subject to
+the terms of use of the underlying Common Crawl data. FineWeb-Edu text is not
+part of this repository.

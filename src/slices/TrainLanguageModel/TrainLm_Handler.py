@@ -1,6 +1,7 @@
-# STREAM-LM training: Muon+AdamW + warmup->cosine, bf16 autocast (eager), z-loss, val perplexity,
-# best-ckpt. Windows are document-masked, so a training position only ever attends its own corpus
-# line -- the same context a rescored ASR hypothesis has at decode time.
+# STREAM-LM training: Muon + AdamW under a WSD schedule with kept branch points, bf16 autocast with
+# per-block compile on CUDA, z-loss, whole-val-set perplexity, best-ckpt. Windows are
+# document-masked, so a training position only ever attends [EOS] + its own corpus line -- the same
+# context a rescored ASR hypothesis has at decode time.
 # Terminal logging mirrors the acoustic trainers (Logging_Adapter loguru sink + TensorBoard) so a
 # multi-hour LM run is monitored the same way.
 import math
@@ -10,21 +11,30 @@ from datetime import timedelta
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, RandomSampler
 from torch.utils.tensorboard import SummaryWriter
 
-from src.shared_kernel.Config_Adapter import LmConfig, get_config
 from src.shared_kernel.Checkpoint_Adapter import resume_if_available, save_checkpoint
+from src.shared_kernel.Config_Adapter import LmConfig, get_config
+from src.shared_kernel.GradientClipping import (
+    clip_grads_per_tensor,
+    guarded_parameters,
+    unguarded_parameters,
+)
 from src.shared_kernel.Logging_Adapter import configure_logging
+from src.shared_kernel.LrSchedule import lr_at
 from src.shared_kernel.Muon_Optimizer import Muon
-from src.shared_kernel.Optimizer_Adapter import partition_params
+from src.shared_kernel.Optimizer_Adapter import lr_groups, partition_params
 from src.shared_kernel.SignalGuard import SignalGuard
 from src.slices.TrainLanguageModel.LmDataset import LmDataset
 from src.slices.TrainLanguageModel.StreamLmModel import StreamLmModel
 from src.slices.TrainLanguageModel.TrainLm_Command import TrainLm_Command
 
-# Windows scored per validation pass. Bounded so a mid-run eval costs seconds, not minutes.
-_VAL_WINDOWS = 1280
+# dynamo's recompile limit is per code object, and one _Block.forward serves all 16 blocks: with and
+# without the value residual, times grad modes. Exceeding it does not raise, it silently demotes the
+# block to eager for the rest of the process.
+_RECOMPILE_LIMIT = 64
 
 
 class TrainLm_Handler:
@@ -49,7 +59,10 @@ class TrainLm_Handler:
         # Peak LR per group, captured once: the schedule below is a SHAPE in [0, 1] that multiplies
         # them, so Muon's and AdamW's very different peaks keep their ratio through warmup + decay.
         peak_lrs = [[g["lr"] for g in opt.param_groups] for opt in optimizers]
-        steps = min(cmd.max_steps, lm.total_steps)
+        # Matrices clip as one group; vectors and scalars per tensor, so no single scalar's gradient
+        # sets the factor every matrix (and Muon's momentum EMA) is scaled by.
+        matrices, vectors = guarded_parameters(model), unguarded_parameters(model)
+        steps = cmd.total_steps
         Path(cmd.out_dir).mkdir(parents=True, exist_ok=True)
         best_ckpt = f"{cmd.out_dir}/lm_best.pt"
         last_ckpt = f"{cmd.out_dir}/lm_last.pt"
@@ -66,8 +79,9 @@ class TrainLm_Handler:
                 f"resumed from {last_ckpt} @ step {start:,} (resume #{resume_count}, "
                 f"best val ppl {best:.3f})"
             )
-        # Sampler seed carries resume_count so a restart draws a fresh stretch of the window stream
-        # instead of re-walking the windows the interrupted run already trained on.
+        # Compile only on CUDA: it buys GPU kernel fusion, and on CPU (tests) it only costs time.
+        # nn.Module.compile keeps state_dict keys, so checkpoints load into the eager decode path.
+        n_compiled = self._compile_blocks(model) if lm.compile_blocks and device == "cuda" else 0
         loader = self._loader(cmd.train_bin, lm.context_len, micro, lm.seed + resume_count)
         val = LmDataset(cmd.val_bin, lm.context_len)
         writer = SummaryWriter(cmd.log_dir)
@@ -75,16 +89,20 @@ class TrainLm_Handler:
         n_params = sum(p.numel() for p in model.parameters())
         log.info(
             f"STREAM · LM │ device {device} · params {n_params / 1e6:.1f} M · "
-            f"steps {start:,} → {steps:,}"
+            f"vocab {lm.vocab_size} · steps {start:,} → {steps:,}"
         )
         log.info(
             f"d_model {lm.d_model} · layers {lm.layers} · heads {lm.heads} "
-            f"(kv {lm.kv_groups}) · ctx {lm.context_len}"
+            f"(kv {lm.kv_groups}) · ctx {lm.context_len} · compiled blocks {n_compiled or 'off'}"
         )
         log.info(
             f"batch {lm.batch_size} ({lm.grad_accum} x {micro}) · adamw lr {lm.lr_peak:g} / "
-            f"muon lr {lm.muon_lr:g} / warmup {lm.warmup_steps:,} · "
-            f"eval every {lm.eval_interval:,}"
+            f"muon lr {lm.muon_lr:g} / warmup {lm.warmup_steps:,} / WSD decay last "
+            f"{lm.lr_decay_frac:.0%} · branch points {list(lm.branch_points) or 'none'}"
+        )
+        log.info(
+            f"train {len(loader):,} micro-batches per pass · "
+            f"val windows {len(val):,} · eval every {lm.eval_interval:,}"
         )
         log.info(
             f"resume {'#' + str(resume_count) if start else 'fresh'} · "
@@ -94,16 +112,17 @@ class TrainLm_Handler:
         run_start = time.perf_counter()
         win_start, win_step = run_start, start  # throughput/ETA window
         win_loss = torch.zeros((), device=device)  # accumulate on-device; sync only at log_every
+        grad_norm = torch.zeros((), device=device)
         it = iter(loader)
         step = start  # survives an already-finished budget, where the loop below never runs
         log.info(f"Training loop started: step {start:,} -> {steps:,}.")
         with SignalGuard() as guard:
             for step in range(start + 1, steps + 1):
-                shape = self._lr_shape(step, lm)
+                shape = lr_at(step, 1.0, lm.warmup_steps, steps, decay_frac=lm.lr_decay_frac)
                 for opt, peaks in zip(optimizers, peak_lrs):
                     for g, peak in zip(opt.param_groups, peaks):
                         g["lr"] = peak * shape
-                lr = optimizers[-1].param_groups[0]["lr"]
+                lr = optimizers[-1].param_groups[0]["lr"]  # AdamW
                 for opt in optimizers:
                     opt.zero_grad(set_to_none=True)
                 # Micro-batches share one optimiser step. Every micro-batch holds the same token
@@ -111,30 +130,24 @@ class TrainLm_Handler:
                 # is exactly the full-batch loss -- CE and the z-loss term are both per-position
                 # means -- and the accumulated gradient is the full-batch gradient, not an
                 # approximation of it.
-                step_loss = torch.zeros((), device=device)
+                step_ce = torch.zeros((), device=device)
                 for _ in range(lm.grad_accum):
                     try:
                         x, y, seg = next(it)
-                    except StopIteration:
+                    except StopIteration:  # a full pass done; the next one is a fresh shuffle
                         it = iter(loader)
                         x, y, seg = next(it)
                     x, y, seg = x.to(device), y.to(device), seg.to(device)
                     with torch.autocast(device_type=device, dtype=torch.bfloat16, enabled=amp):
                         logits = model(x, segments=seg)
-                        flat = logits.reshape(-1, logits.shape[-1])
-                        loss = torch.nn.functional.cross_entropy(flat, y.reshape(-1))
-                        if lm.z_loss:
-                            # log Z is exactly the log-sum-exp the cross-entropy already computes;
-                            # squaring it pulls the softmax normaliser back toward 1 and keeps the
-                            # logits from drifting.
-                            loss = loss + lm.z_loss * flat.logsumexp(dim=-1).pow(2).mean()
-                        loss = loss / lm.grad_accum
-                    loss.backward()
-                    step_loss += loss.detach()  # kept on-device; no per-micro sync
-                torch.nn.utils.clip_grad_norm_(model.parameters(), lm.grad_clip)
+                    ce, loss = self._loss(logits, y, lm.z_loss)
+                    (loss / lm.grad_accum).backward()
+                    step_ce += ce.detach() / lm.grad_accum  # kept on-device; no per-micro sync
+                grad_norm = torch.nn.utils.clip_grad_norm_(matrices, lm.grad_clip)
+                clip_grads_per_tensor(vectors, lm.grad_clip)
                 for opt in optimizers:
                     opt.step()
-                win_loss += step_loss
+                win_loss += step_ce
 
                 if step % lm.log_every == 0:
                     now = time.perf_counter()
@@ -144,10 +157,11 @@ class TrainLm_Handler:
                     pct = 100.0 * step / steps
                     log.info(
                         f"step {step:>7,}/{steps:,} ({pct:4.1f}%) │ "
-                        f"loss {avg_loss:7.3f} │ lr {lr:.2e} │ {its:5.2f} it/s │ eta {eta}"
+                        f"ce {avg_loss:7.3f} │ lr {lr:.2e} │ {its:5.2f} it/s │ eta {eta}"
                     )
                     writer.add_scalar("train/loss", avg_loss, step)
                     writer.add_scalar("train/lr", lr, step)
+                    writer.add_scalar("train/grad_norm", float(grad_norm), step)
                     writer.add_scalar("train/it_per_s", its, step)
                     win_start, win_step = now, step
                     win_loss.zero_()
@@ -167,6 +181,12 @@ class TrainLm_Handler:
 
                 if step % lm.ckpt_every == 0:
                     self._save(last_ckpt, model, optimizers, step, resume_count, best)
+                if step in lm.branch_points:
+                    # The trunk at a shorter budget's decay start, never overwritten: copy it to a
+                    # fresh out-dir as lm_last.pt and resume with that budget to anneal it.
+                    branch = f"{cmd.out_dir}/lm_branch{step}.pt"
+                    self._save(branch, model, optimizers, step, resume_count, best)
+                    log.info(f"branch point kept → {branch}")
                 if guard.stop_requested:
                     self._save(last_ckpt, model, optimizers, step, resume_count, best)
                     log.warning(f"interrupt received; checkpointed @ step {step:,}, exiting.")
@@ -182,6 +202,27 @@ class TrainLm_Handler:
         )
         log.success(f"last → {last_ckpt} · best → {best_ckpt}")
         return best
+
+    @staticmethod
+    def _loss(
+        logits: torch.Tensor, y: torch.Tensor, z_loss: float
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # In fp32, with ONE log-normaliser serving both terms: CE = logZ - logit[y], and the z-loss
+        # (Chowdhery et al.) penalises logZ^2 to hold the partition function near 1.
+        flat = logits.float().reshape(-1, logits.shape[-1])
+        log_z = flat.logsumexp(dim=-1)
+        ce = (log_z - flat.gather(-1, y.reshape(-1, 1)).squeeze(-1)).mean()
+        return ce, (ce + z_loss * log_z.pow(2).mean()) if z_loss else ce
+
+    @staticmethod
+    def _compile_blocks(model: StreamLmModel) -> int:
+        torch._dynamo.config.recompile_limit = max(
+            torch._dynamo.config.recompile_limit, _RECOMPILE_LIMIT
+        )
+        for block in model.blocks:
+            # Static shapes: every training micro-batch is [micro, context_len].
+            block.compile(dynamic=False)
+        return len(model.blocks)
 
     def _save(
         self,
@@ -205,61 +246,53 @@ class TrainLm_Handler:
     def _loader(
         self, bin_path: str, ctx: int, batch: int, seed: int
     ) -> DataLoader[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-        # replacement=True is load-bearing at corpus scale: the whole LibriSpeech-LM corpus packs
-        # to ~1.6e9 windows, and shuffle=True (replacement=False) would make RandomSampler
-        # materialize torch.randperm(1.6e9).tolist(), a ~13 GB tensor plus a billion-element
-        # Python list, which OOM-swaps before step 1 (RAM pinned, GPU idle). Sampling with
-        # replacement draws lazy torch.randint chunks instead (flat memory), and at 1.6e9 windows
-        # the collision rate over a run is negligible. This is the nanoGPT-style sampling this
-        # file wants.
+        # Non-overlapping windows shuffled WITHOUT replacement: one pass reads every token exactly
+        # once. (Random offsets drawn with replacement leave e^-1 = 37 % of the tokens unread over a
+        # one-pass budget.) The permutation is over ~9e6 windows, not one per token, so it is a
+        # 72 MB tensor rather than the 13 GB that a per-offset randperm would need.
         ds = LmDataset(bin_path, ctx)
         # Explicit generator rather than the global RNG: resume_if_available restores the RNG state
         # the interrupted run was at, which would make the restart replay the same windows. Seeding
-        # from lm.seed + resume_count instead makes the stream reproducible from config alone and
-        # gives every resume a different stretch of it.
+        # from lm.seed + resume_count instead makes the order reproducible from config alone and
+        # gives every resume a fresh permutation.
         return DataLoader(
             ds,
             batch_size=batch,
-            sampler=RandomSampler(
-                ds, replacement=True, generator=torch.Generator().manual_seed(seed)
-            ),
+            sampler=RandomSampler(ds, generator=torch.Generator().manual_seed(seed)),
             drop_last=True,
         )
 
     def _optimizers(self, model: StreamLmModel, lm: LmConfig) -> list[torch.optim.Optimizer]:
-        # Muon on the block weight matrices, AdamW on the tied embedding/readout and the norms --
-        # the same split the acoustic stack uses, which is why partition_params is shared.
-        # `head` is named as a readout so the tied table is stepped once, by AdamW.
+        # Muon on the block weight matrices; AdamW on the embedding, the readout (`head`, named so
+        # partition_params keeps it off Muon) and the value-residual scalars. lr_groups exempts
+        # every vector and scalar from weight decay: 0 is no neutral target for a mixing weight.
         muon_p, adamw_p = partition_params(model, head_patterns=("head",))
+        fused = next(model.parameters()).is_cuda  # fused AdamW kernel on CUDA; False on CPU (tests)
         return [
             Muon(muon_p, lr=lm.muon_lr, weight_decay=lm.weight_decay),
             torch.optim.AdamW(
-                adamw_p, lr=lm.lr_peak, weight_decay=lm.weight_decay, betas=(0.9, 0.95)
+                lr_groups(adamw_p, lm.lr_peak, lm.weight_decay),
+                lr=lm.lr_peak,
+                betas=(0.9, 0.95),
+                fused=fused,
             ),
         ]
 
-    def _lr_shape(self, step: int, lm: LmConfig) -> float:
-        # Warmup -> cosine decay as a multiplier in [0, 1] on each group's own peak LR.
-        if step < lm.warmup_steps:
-            return step / max(1, lm.warmup_steps)
-        prog = (step - lm.warmup_steps) / max(1, lm.total_steps - lm.warmup_steps)
-        return 0.5 * (1 + math.cos(math.pi * min(1.0, prog)))
-
     @torch.no_grad()
     def _perplexity(self, model: StreamLmModel, val: LmDataset, batch: int, device: str) -> float:
+        # Every window of val.bin, token-weighted, eager. Each window is a distinct stretch of the
+        # bin, so the whole val set is scored once (the first val_words of the interleaved corpus,
+        # i.e. a proportional sample of every source).
         model.eval()
-        loader = DataLoader(val, batch_size=batch, drop_last=True)
-        total, count = 0.0, 0
-        for x, y, seg in loader:
-            # Bounded in WINDOWS, not batches, so val ppl scores the same slice of val.bin
-            # regardless of what grad_accum does to the micro-batch size.
-            if count * batch >= _VAL_WINDOWS:
-                break
-            x, y, seg = x.to(device), y.to(device), seg.to(device)
-            loss = torch.nn.functional.cross_entropy(
-                model(x, segments=seg).reshape(-1, model.vocab), y.reshape(-1)
-            )
-            total += float(loss)
-            count += 1
+        total = torch.zeros((), device=device)
+        count = 0
+        with torch.compiler.set_stance("force_eager"):
+            for x, y, seg in DataLoader(val, batch_size=batch):
+                x, y, seg = x.to(device), y.to(device), seg.to(device)
+                logits = model(x, segments=seg).float()
+                total += F.cross_entropy(
+                    logits.reshape(-1, logits.shape[-1]), y.reshape(-1), reduction="sum"
+                )
+                count += y.numel()
         model.train()
-        return math.exp(total / max(1, count))
+        return math.exp(total.item() / count)

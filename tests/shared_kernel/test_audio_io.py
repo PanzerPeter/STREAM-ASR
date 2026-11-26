@@ -26,3 +26,23 @@ def test_speed_perturb_changes_length_by_inverse_speed():
     fast = speed_perturb(wave, 1.1)
     assert abs(slow.numel() - round(n / 0.9)) <= 2
     assert abs(fast.numel() - round(n / 1.1)) <= 2
+
+
+def test_load_row_audio_reads_the_span_then_applies_speed(tmp_path):
+    import numpy as np
+    import soundfile as sf
+
+    from src.shared_kernel.AudioIO_Adapter import load_row_audio
+
+    sr = get_config().audio.sample_rate
+    wave = np.random.default_rng(0).standard_normal(sr).astype(np.float32) * 0.1
+    path = str(tmp_path / "a.wav")
+    sf.write(path, wave, sr, subtype="FLOAT")
+    whole = load_row_audio({"audio_filepath": path, "num_samples": sr})
+    assert torch.equal(whole, load_audio(path))
+    span = load_row_audio({"audio_filepath": path, "start_sample": 4000, "num_samples": 8000})
+    assert torch.equal(span, whole[4000:12000])
+    slowed = load_row_audio(
+        {"audio_filepath": path, "start_sample": 4000, "num_samples": 8000, "speed": 0.9}
+    )
+    assert torch.equal(slowed, speed_perturb(whole[4000:12000], 0.9))

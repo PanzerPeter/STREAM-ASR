@@ -1,53 +1,70 @@
-# STREAM-LM: deep-narrow causal Transformer that rescores the acoustic decoder's n-best list.
-# 512 x 16 layers ~= 44M params; ffn_expansion 4 -> SwiGLU hidden ~= 2.67*d_model (the 2/3 factor
-# lives in SwiGluFfn). At 320 the rescorer was capacity-bound (val ppl ~42) and the n-best oracle
-# floor (~2.3% WER) leaves headroom only a stronger LM converts. Scoring stays one utterance-end
-# forward per beam, so decode RTF is unaffected.
-# d_model is load-bearing at inference: lm_best.pt must match it or load_checkpoint fails on a size
-# mismatch. To decode with a 320 checkpoint, set this back to 320 first.
+# STREAM-LM: deep-narrow causal Transformer that rescores the acoustic decoder's n-best list
+# (MODEL_ARCHITECTURE.md §8.2). Scoring is one batched forward per utterance, so the LM's size costs
+# training time, not decode RTF.
+#
+# Its own tokenizer, not the acoustic BPE-500: rescoring reads hypothesis TEXT, so the LM's vocab is
+# free. Measured on the corpus, BPE-500 spends 2.24 tokens per word, a 8k unigram 1.23 and a 16k one
+# 1.14. 8k halves the tokens per word (twice the text per step, the same lines in half the
+# positions) while 16k would buy another 8 % for twice the embedding and readout.
+tokenizer: data/tokenizer/lm8k.model
+vocab_size: 8192
+# The SentencePiece control id the tokenizer trainer reserves for end-of-line. It doubles as BOS: a
+# packed line is [EOS] + line, so the sentence-start context the LM trains on is exactly the one a
+# rescored hypothesis is scored from.
+eos_id: 1
+
+# 512 x 16 layers, SwiGLU hidden ~= 2.67 * d_model (the 2/3 factor lives in SwiGluFfn).
 d_model: 512
 layers: 16
 heads: 8
 kv_groups: 2                 # GQA: 8 query heads share 2 KV heads
 ffn_expansion: 4
-# 0.0 on purpose: ~1.6e9 packed tokens against ~44M params means the run never revisits data, so
-# dropout only removes capacity. Raise it only if train/val loss ever diverge.
+# 0.0 on purpose: the budget is ~one pass over the corpus, so the run never revisits a window and
+# dropout only removes capacity.
 dropout: 0.0
 context_len: 256
-value_residual_lambda: 1.0   # inject layer-0 values into deeper layers; 0.0 = vanilla
-# BiasNorm window lm_best.pt was trained and evaluated under. Part of that checkpoint's function,
-# so it stays fixed while the checkpoint is in use.
-norm_log_scale_min: -2.0
-norm_log_scale_max: 1.0
-norm_max_amplification: 4.0
-norm_eps: 1.0e-5
+# Initial weight of layer 0's values mixed into every deeper layer's (v + lambda * v0). Learned per
+# layer from here; 0.0 starts as a plain Transformer.
+value_residual_lambda: 1.0
 
 # training
 muon_lr: 2.0e-2              # Muon peak LR for the 2D block weight matrices (rest -> AdamW)
-lr_peak: 1.0e-3              # AdamW peak LR (embeddings/norms), also the schedule's reference
-# Softmax z-loss (Chowdhery et al.): penalises log^2(Z) to hold the partition function near 1. Free
-# at 502 classes, and it keeps the logits from drifting through the long cosine tail.
+lr_peak: 1.0e-3              # AdamW peak LR (embedding, readout, value-residual weights)
+# Softmax z-loss (Chowdhery et al.): penalises log^2(Z) to hold the partition function near 1.
 z_loss: 1.0e-4
 warmup_steps: 2000
-total_steps: 70000           # ~0.5-0.9 epoch of the ~803M-word corpus: never revisits a window
+# 140k x 64 x 256 = 2.29e9 tokens, one pass over the fully packed corpus (~1.8e9 words at 1.29
+# tokens per word with the EOS). WSD rather than cosine, so a shorter budget is a branch, not a
+# second run (COMMANDS.md, Step 5).
+total_steps: 140000
+lr_decay_frac: 0.25          # WSD: 1-sqrt anneal over the last quarter (shared LrSchedule)
+# lm_branch{N}.pt is kept at each step listed: the trunk at the decay start of a shorter budget.
+# 52500 is the decay start of a 70k budget (half the tokens), so one 17.5k-step anneal from it
+# measures what the second half of the corpus buys.
+branch_points: [52500]
 weight_decay: 0.01
+# Matrices clip as one group, vectors and scalars per tensor (shared GradientClipping), so no
+# single scalar's gradient sets the factor every matrix is scaled by.
 grad_clip: 1.0
 batch_size: 64               # effective sequences per optimiser step
-# Activations, not parameters, set the VRAM ceiling: 16 x 64 x 256 x 512 peaks at 9.4 GB and OOMs a
-# 12 GB card, while params+grads+optimiser states are only 0.52 GB. Micro-batching is
-# gradient-identical here (equal token counts -> the mean of the micro-losses IS the full-batch
-# loss) and costs no recompute, unlike activation checkpointing.
-# 2 -> 5.1 GB peak; 4 -> 2.9 GB if the desktop is also on the GPU.
+# Activations, not parameters, set the VRAM ceiling: 64 x 256 x 512 in one pass OOMs a 12 GB card.
+# Micro-batching is gradient-identical here (equal token counts -> the mean of the micro-losses IS
+# the full-batch loss) and costs no recompute, unlike activation checkpointing. At 2, expect ~6 GB
+# peak (estimated: ~5 GB of block activations plus ~0.8 GB of fp32 8k-wide logits); raise it to 4
+# if the desktop shares the GPU.
 grad_accum: 2
+# torch.compile each block on CUDA (static shapes: every training micro-batch is [B, context_len]).
+# Validation runs eager. Set false if this torch build's inductor rejects the block.
+compile_blocks: true
 eval_interval: 1000
 log_every: 50
 # Steps between lm_last.pt writes, the file the trainer auto-resumes from. Matched to eval_interval
-# so a crash costs at most one eval window; each write is ~0.5 GB (params + Muon/AdamW state).
+# so a crash costs at most one eval window.
 ckpt_every: 1000
 
-# data (PrepareLmData). subset_words caps train words; >= corpus size (LibriSpeech-LM ~803M) packs
-# the WHOLE corpus, and the training DataLoader shuffles the memmap for uniform coverage. Lower it
-# only for a quick smoke/dev run; train.bin is then just the corpus head.
-subset_words: 1000000000
+# data (PrepareLmData). The first val_words of the interleaved corpus go to val.bin, the rest up to
+# subset_words to train.bin. 2e9 is above the ~1.8e9-word corpus, so the whole corpus is packed;
+# lower it only for a smoke run (train.bin is then a proportional prefix).
+subset_words: 2000000000
 val_words: 200000
 seed: 1234

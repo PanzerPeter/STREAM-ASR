@@ -12,10 +12,10 @@ def test_loads_representative_values():
     assert isinstance(cfg, StreamConfig)
     assert cfg.audio.sample_rate == 16000
     assert cfg.audio.n_mels == 80
-    assert cfg.model.stack_dims == (256, 384, 512, 384)
+    assert cfg.model.stack_dims == (320, 512, 640, 512)
     assert cfg.model.stack_blocks == (4, 8, 0, 8)
     assert cfg.model.vocab_size == 500
-    assert cfg.training.transducer.total_steps == 600000
+    assert cfg.training.transducer.total_steps == 1200000
     assert cfg.training.transducer.warmup_steps == 5000
 
 
@@ -36,6 +36,7 @@ def test_validation_rejects_bad_type(tmp_path):
         "audio.yaml",
         "augment.yaml",
         "features.yaml",
+        "trim.yaml",
         "model.yaml",
         "training.yaml",
         "decode.yaml",
@@ -52,15 +53,20 @@ def test_validation_rejects_bad_type(tmp_path):
         get_config(str(tmp_path))
 
 
-def test_bos_eos_decoder_vocab_ids():
-    # These label-space ids back no acoustic decoder (the acoustic model is a transducer), but
-    # STREAM-LM (TrainLanguageModel slice) consumes them for BOS-conditioned next-token
-    # prediction, so they stay live on ModelConfig. BOS == EOS
-    # because the packed corpus separates lines with EOS and has no other start symbol.
-    m = get_config().model
-    assert m.bos_id == m.eos_id == 501
-    assert m.eos_id == m.vocab_size + 1 == 501
-    assert m.decoder_vocab_size == m.vocab_size + 2 == 502
+def test_lm_owns_its_token_ids():
+    # STREAM-LM reads its own tokenizer; its EOS (also its BOS) must fit the table and a uint16 bin.
+    lm = get_config().lm
+    assert 0 <= lm.eos_id < lm.vocab_size <= 2**16
+    assert not hasattr(get_config().model, "eos_id")
+
+
+def test_lm_rejects_an_eos_outside_the_vocab(tmp_path):
+    for f in (Path(__file__).resolve().parents[2] / "config").glob("*.yaml"):
+        shutil.copy(f, tmp_path / f.name)
+    lm = tmp_path / "lm.yaml"
+    lm.write_text(lm.read_text().replace("eos_id: 1", "eos_id: 8192"))
+    with pytest.raises(ValidationError):
+        get_config(str(tmp_path))
 
 
 def test_decode_config_loads():

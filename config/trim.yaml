@@ -1,0 +1,11 @@
+# Leading/trailing silence trim, cv-train only (BuildCommonVoiceManifest). Conservative on purpose:
+# a cut into speech is a corrupted label, extra silence is only extra frames. Frame energies are dB
+# over 25 ms windows at a 10 ms hop; floor = 10th percentile, peak = 99th percentile per clip.
+# Speech frames sit above floor + threshold_fraction * (peak - floor).
+threshold_fraction: 0.25
+margin_s: 0.5                # kept on each side of the first and last speech frame
+# Below this peak-floor spread the clip is too noisy for the estimate to be trusted: untrimmed.
+min_dynamic_range_db: 15.0
+# A kept span shorter than this means the estimate failed, not that the clip is that short:
+# untrimmed.
+min_span_s: 1.0

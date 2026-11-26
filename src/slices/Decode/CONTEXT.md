@@ -13,7 +13,9 @@ Transcribe audio with the trained transducer, streaming or offline, via a single
 ## Data Ownership
 - Consumes artifacts: `data/checkpoints/transducer_avg.pt` (the averaged tail of
   `TrainAcousticModel`'s snapshots), `data/tokenizer/bpe500.model`, `data/features/cmvn.pt` (loaded
-  inside the encoder), and `data/checkpoints/lm_best.pt` when `decode.lm_weight > 0`.
+  inside the encoder), and `data/checkpoints/lm_best.pt` + `data/tokenizer/lm8k.model` (`lm.tokenizer`)
+  when `decode.lm_weight > 0`. The LM pair can be overridden per handler (`lm_checkpoint`,
+  `lm_tokenizer`), which is how a released `.safetensors` LM is used.
 - Produces: nothing on disk.
 
 ## Shared Kernel
@@ -34,7 +36,10 @@ rather than one per hypothesis. When an LM is attached (`fuse_lm`, `decode.lm_we
 `StreamingDecoder_Handler._search_rescore` re-ranks the n-best by
 `acoustic + alpha·lm_seq - beta·ilm_seq + length_bonus·len`. That is n-best rescoring, not
 per-emission shallow fusion, which costs far more GPU time for a corpus decode. Both LM terms are
-one batched forward over the whole n-best rather than one call per hypothesis.
+one batched forward over the whole n-best rather than one call per hypothesis. The external LM has
+its own tokenizer, so `LmScorer` takes hypothesis TEXT (decoded with the acoustic tokenizer) and
+re-encodes it with `lm.tokenizer`; ILME stays on the acoustic token ids, the path the transducer
+actually scored.
 
 **ILME.** `beta` (`decode.ilm_weight`) is internal-LM estimation (`InternalLmScorer`, after
 arXiv:2011.01991): the predictor+joiner already carry a language prior learned from the 960 h
@@ -46,7 +51,7 @@ regime LODR argues is the right thing to subtract. `beta = 0` reproduces plain f
 **Streaming** feeds the encoder `4·decode.chunk_size` mel frames per step through
 `S2Encoder.streaming_forward` with a cache from `init_stream(1, decode.left_context)`: frontend
 tails, each block's conv tail, and a ring of the last `left_context` frames of pre-RoPE keys and
-values per attention block, so the state is constant-size (1.32 M values, 5.3 MB in fp32, at
+values per attention block, so the state is constant-size (1.73 M values, 6.9 MB in fp32, at
 5.12 s) for any stream length. Offline runs one full-context `forward`. Both funnel into the same search.
 
 **Tail.** The final partial chunk is completed and `decode.tail_chunks` (1) whole chunks follow;

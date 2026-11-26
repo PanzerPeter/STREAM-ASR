@@ -5,8 +5,9 @@
 #
 # Run: PYTHONPATH=. .venv/bin/python -m src.slices.Demo.serve_demo  (open http://127.0.0.1:8000)
 # The LM re-ranks the acoustic n-best; it is off by default (decode.lm_weight=0 reproduces the
-# plain decoder). Pass the weights tuned on dev by `evaluate.py --tune` to run the demo at the
-# configuration the reported WER was measured with: --lm-weight 0.6 --ilm-weight 0.2.
+# plain decoder). Pass dev-tuned weights (MODEL_ARCHITECTURE.md §12.1) to run the demo at a
+# configuration a reported WER was measured with, e.g. dev-other's
+# --lm-weight 0.8 --ilm-weight 0.2 --length-bonus 0.5.
 import argparse
 
 import torch
@@ -29,14 +30,22 @@ def main() -> None:
         "--lm-weight",
         type=float,
         default=None,
-        help="n-best rescoring weight (alpha); >0 loads the LM. Tuned value: 0.6",
+        help="n-best rescoring weight (alpha); >0 loads the LM. Default: decode.lm_weight",
     )
     ap.add_argument(
         "--ilm-weight",
         type=float,
         default=None,
-        help="ILME subtraction weight (beta); only acts alongside --lm-weight. Tuned value: 0.2",
+        help="ILME subtraction weight (beta); only acts alongside --lm-weight",
     )
+    ap.add_argument(
+        "--length-bonus",
+        type=float,
+        default=None,
+        help="per-token rescoring bonus offsetting deletions. Default: decode.length_bonus",
+    )
+    ap.add_argument("--lm-checkpoint", default=None, help="default decode.lm_checkpoint")
+    ap.add_argument("--lm-tokenizer", default=None, help="default lm.tokenizer")
     ap.add_argument(
         "--beam-size",
         type=int,
@@ -55,11 +64,18 @@ def main() -> None:
         beam_size=args.beam_size,
         lm_weight=args.lm_weight,
         ilm_weight=args.ilm_weight,
+        length_bonus=args.length_bonus,
+        lm_checkpoint=args.lm_checkpoint,
+        lm_tokenizer=args.lm_tokenizer,
     )
     # Echo the *resolved* decode configuration (CLI flag or decode.yaml fallback), so a demo run
     # that silently fell back to the alpha=0 regression lock is visible instead of just sounding
     # slightly worse than the reported numbers.
-    lm = f"alpha={handler.lm_weight} beta={handler.ilm_weight}" if handler.lm_scorer else "off"
+    lm = (
+        f"alpha={handler.lm_weight} beta={handler.ilm_weight} lb={handler.length_bonus}"
+        if handler.lm_scorer
+        else "off"
+    )
     print(
         f"STREAM ASR demo on http://{args.host}:{args.port}"
         f"  (device={device}, beam={handler.beam_size}, LM {lm})"

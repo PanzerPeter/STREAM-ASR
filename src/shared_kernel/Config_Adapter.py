@@ -3,7 +3,7 @@ from functools import lru_cache
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, ConfigDict, computed_field
+from pydantic import BaseModel, ConfigDict, computed_field, model_validator
 
 _CONFIG_DIR = Path(__file__).resolve().parents[2] / "config"
 
@@ -27,6 +27,13 @@ class AugmentConfig(BaseModel):
 
 class FeaturesConfig(BaseModel):
     cache_dir: str
+
+
+class TrimConfig(BaseModel):
+    threshold_fraction: float
+    margin_s: float
+    min_dynamic_range_db: float
+    min_span_s: float
 
 
 class ModelConfig(BaseModel):
@@ -54,33 +61,6 @@ class ModelConfig(BaseModel):
     @property
     def logits_width(self) -> int:
         return self.vocab_size + 1
-
-    # bos_id/eos_id/decoder_vocab_size: the acoustic model is a transducer and has no attention
-    # decoder, but STREAM-LM (TrainLanguageModel slice) frames next-token prediction as
-    # BOS-conditioned generation over this same vocab, so the ids stay live.
-    #
-    # BOS *is* EOS on purpose. PrepareLmData packs the corpus as `line tokens + eos_id` with no
-    # separate start symbol, so the only sentence-start context the LM is ever trained on is
-    # "previous line's EOS". A distinct start id would index an embedding row that never appears as
-    # a model input during training, making the first-token score of every rescored hypothesis
-    # come out of an untrained vector. Reusing EOS keeps decode-time scoring in-distribution.
-    @computed_field  # type: ignore[prop-decorator]
-    @property
-    def bos_id(self) -> int:
-        return self.vocab_size + 1
-
-    @computed_field  # type: ignore[prop-decorator]
-    @property
-    def eos_id(self) -> int:
-        return self.vocab_size + 1
-
-    # +2, not +1: id `vocab_size` is an unused hole (it was the old separate start symbol) that the
-    # table must still span to make eos_id = vocab_size + 1 addressable. Renumbering it away would
-    # invalidate every packed LM bin and LM checkpoint for one wasted embedding row.
-    @computed_field  # type: ignore[prop-decorator]
-    @property
-    def decoder_vocab_size(self) -> int:
-        return self.vocab_size + 2
 
 
 class TransducerConfig(BaseModel):
@@ -134,6 +114,11 @@ class DecodeConfig(BaseModel):
 
 
 class LmConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    tokenizer: str
+    vocab_size: int
+    eos_id: int
     d_model: int
     layers: int
     heads: int
@@ -142,21 +127,20 @@ class LmConfig(BaseModel):
     dropout: float
     context_len: int
     value_residual_lambda: float
-    norm_log_scale_min: float
-    norm_log_scale_max: float
-    norm_max_amplification: float
-    norm_eps: float
     muon_lr: float
     z_loss: float
     lr_peak: float
     warmup_steps: int
     total_steps: int
+    lr_decay_frac: float
+    branch_points: tuple[int, ...]
     weight_decay: float
     grad_clip: float
     batch_size: int
     # batch_size is the EFFECTIVE (optimiser-step) batch; it is split into grad_accum micro-batches
     # so peak activation memory scales with batch_size/grad_accum while the gradient is unchanged.
     grad_accum: int = 1
+    compile_blocks: bool
     eval_interval: int
     log_every: int
     ckpt_every: int
@@ -164,10 +148,19 @@ class LmConfig(BaseModel):
     val_words: int
     seed: int
 
+    @model_validator(mode="after")
+    def _ids_fit(self) -> "LmConfig":
+        # Packed bins are uint16, and the EOS id indexes the embedding table.
+        if not 0 <= self.eos_id < self.vocab_size <= 2**16:
+            raise ValueError(
+                f"need 0 <= eos_id < vocab_size <= 65536, got {self.eos_id}, {self.vocab_size}"
+            )
+        return self
+
 
 class EvalConfig(BaseModel):
     ablation_stages: tuple[str, ...]
-    report_path: str  # may contain a {split} placeholder (clean|other)
+    report_path: str  # may contain a {split} placeholder (clean|other|cv)
     workers: int
     rtf_probe_utts: int
 
@@ -184,6 +177,7 @@ class StreamConfig(BaseModel):
     audio: AudioConfig
     augment: AugmentConfig
     features: FeaturesConfig
+    trim: TrimConfig
     model: ModelConfig
     training: TrainingConfig
     decode: DecodeConfig

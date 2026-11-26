@@ -1,4 +1,4 @@
-# Text corpus -> BPE-500 token ids (+EOS per line) -> packed uint16 train/val bins. The whole
+# Text corpus -> LM-tokenizer ids (+EOS per line) -> packed uint16 train/val bins. The whole
 # corpus is streamed straight to disk in flushed shards, so RAM stays bounded no matter how large
 # it is; uniform coverage comes from the training DataLoader shuffling the memmapped bin, not from
 # an in-RAM shuffle here. The first val_words go to val.bin (a monitoring set); the remainder, up to
@@ -22,13 +22,24 @@ _FLUSH_TOKENS = 8_000_000
 
 
 class _Tokenizer(Protocol):
+    @property
+    def vocab_size(self) -> int: ...
+
     def encode(self, text: str) -> list[int]: ...
 
 
 class PrepareLmData_Handler:
     def __init__(self, tokenizer: _Tokenizer) -> None:
+        lm = get_config().lm
+        # The bins are ids of this tokenizer and the model's table is lm.vocab_size wide; a
+        # mismatch would train on ids the decode-time scorer never produces, or index past the
+        # table.
+        if tokenizer.vocab_size != lm.vocab_size:
+            raise ValueError(
+                f"tokenizer has {tokenizer.vocab_size} pieces, lm.vocab_size is {lm.vocab_size}"
+            )
         self.tok = tokenizer
-        self.eos = get_config().model.eos_id
+        self.eos = lm.eos_id
 
     def run(self, cmd: PrepareLmData_Command) -> None:
         log = configure_logging()

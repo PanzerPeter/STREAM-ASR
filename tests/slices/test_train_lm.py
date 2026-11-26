@@ -3,6 +3,8 @@ import pytest
 import torch
 from torch.utils.data import RandomSampler
 
+from src.slices.TrainLanguageModel.LmDataset import LmDataset
+
 from src.shared_kernel.Config_Adapter import get_config
 from src.slices.TrainLanguageModel.TrainLm_Command import TrainLm_Command
 from src.slices.TrainLanguageModel.TrainLm_Handler import TrainLm_Handler
@@ -21,15 +23,30 @@ _TINY_LM = {
 }
 
 
-def test_loader_samples_with_replacement(tmp_path):
-    # Regression guard: shuffle=True over the ~1.6e9-window production corpus makes RandomSampler
-    # materialize torch.randperm(1.6e9).tolist() (~13 GB tensor + billion-element list) and OOM-swap
-    # before step 1. The loader MUST sample with replacement so the sampler stays lazy/flat-memory.
+def test_loader_reads_every_window_once_per_pass(tmp_path):
+    # A one-pass budget must read every token once: non-overlapping windows, shuffled without
+    # replacement. (Random offsets with replacement leave e^-1 of the tokens unread.)
     bin_path = tmp_path / "toy.bin"
-    bin_path.write_bytes(np.arange(500, dtype=np.uint16).tobytes())
+    bin_path.write_bytes(np.arange(2, 502, dtype=np.uint16).tobytes())
     loader = TrainLm_Handler()._loader(str(bin_path), ctx=8, batch=4, seed=0)
     assert isinstance(loader.sampler, RandomSampler)
-    assert loader.sampler.replacement is True
+    assert loader.sampler.replacement is False
+    seen = sorted(int(x[0]) for xb, _, _ in loader for x in xb)
+    n = len(LmDataset(str(bin_path), 8))
+    assert len(seen) == n // 4 * 4 and len(set(seen)) == len(seen)  # drop_last trims < one batch
+    assert all((s - 2) % 8 == 0 for s in seen)
+
+
+def test_loss_is_cross_entropy_plus_z_loss_on_one_normaliser():
+    torch.manual_seed(0)
+    logits = torch.randn(2, 5, 11, dtype=torch.bfloat16)
+    y = torch.randint(0, 11, (2, 5))
+    ce, loss = TrainLm_Handler._loss(logits, y, 1e-2)
+    flat = logits.float().reshape(-1, 11)
+    torch.testing.assert_close(ce, torch.nn.functional.cross_entropy(flat, y.reshape(-1)))
+    torch.testing.assert_close(loss, ce + 1e-2 * flat.logsumexp(-1).pow(2).mean())
+    ce0, loss0 = TrainLm_Handler._loss(logits, y, 0.0)
+    assert torch.equal(ce0, loss0)
 
 
 @pytest.mark.slow
@@ -50,7 +67,7 @@ def test_lm_overfits_tiny_corpus(tmp_path, monkeypatch):
         train_bin=str(tmp_path / "train.bin"),
         val_bin=str(tmp_path / "val.bin"),
         out_dir=str(tmp_path / "ckpt"),
-        max_steps=300,
+        total_steps=300,
         log_dir=str(tmp_path / "runs"),  # keep TensorBoard events out of the repo's runs/
     )
     best_ppl = TrainLm_Handler().run(cmd)
@@ -81,7 +98,7 @@ def _one_step(tmp_path, monkeypatch, grad_accum: int) -> dict[str, torch.Tensor]
             train_bin=str(run_dir / "train.bin"),
             val_bin=str(run_dir / "val.bin"),
             out_dir=str(run_dir),
-            max_steps=1,
+            total_steps=1,
             log_dir=str(run_dir / "runs"),
         )
     )
@@ -90,20 +107,21 @@ def _one_step(tmp_path, monkeypatch, grad_accum: int) -> dict[str, torch.Tensor]
 
 def _resume_fixture(tmp_path, monkeypatch):
     lm = get_config().lm
-    for field, value in {**_TINY_LM, "grad_accum": 1, "ckpt_every": 2, "eval_interval": 2}.items():
+    tiny = {**_TINY_LM, "grad_accum": 1, "ckpt_every": 2, "eval_interval": 2, "branch_points": (2,)}
+    for field, value in tiny.items():
         monkeypatch.setattr(lm, field, value)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     tokens = np.tile(np.arange(97, dtype=np.uint16), 40)
     (tmp_path / "train.bin").write_bytes(tokens.tobytes())
     (tmp_path / "val.bin").write_bytes(tokens[:200].tobytes())
 
-    def run(max_steps: int, resume: bool = True) -> dict:
+    def run(total_steps: int, resume: bool = True) -> dict:
         TrainLm_Handler().run(
             TrainLm_Command(
                 train_bin=str(tmp_path / "train.bin"),
                 val_bin=str(tmp_path / "val.bin"),
                 out_dir=str(tmp_path),
-                max_steps=max_steps,
+                total_steps=total_steps,
                 log_dir=str(tmp_path / "runs"),
                 resume=resume,
             )
@@ -122,6 +140,9 @@ def test_run_resumes_from_lm_last(tmp_path, monkeypatch):
     run = _resume_fixture(tmp_path, monkeypatch)
     first = run(2)
     assert (first["step"], first["resume_count"]) == (2, 0)
+    # The branch point is kept beside lm_last.pt and is a resumable checkpoint at that step.
+    branch = torch.load(tmp_path / "lm_branch2.pt", map_location="cpu", weights_only=False)
+    assert branch["step"] == 2 and branch["optimizers"]
     second = run(4)
     assert (second["step"], second["resume_count"]) == (4, 1)
     assert second["extra"]["val_ppl"] <= first["extra"]["val_ppl"]

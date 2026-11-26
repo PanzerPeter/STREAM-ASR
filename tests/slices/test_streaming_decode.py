@@ -84,13 +84,14 @@ def test_nbest_for_rescore_separates_acoustic_and_lm(tmp_path, monkeypatch):
     # Rescore-mode tuning contract: nbest_for_rescore runs the beam LM-OFF (so the hypothesis set +
     # acoustic scores are alpha-independent, byte-identical to a plain acoustic search over the same
     # memory) and attaches the *unweighted* LM sequence logprob per hypothesis for external alpha
-    # rescoring. A stub scorer (raw logprob = -len(ids)) proves the wiring without a real LM.
+    # rescoring. A stub scorer (raw logprob = -words in the decoded text, and the stub tokenizer
+    # writes one word per id) proves the wiring without a real LM.
     torch.manual_seed(0)
     model = TransducerModel(cmvn_path=None).eval()
 
     class _StubScorer:
-        def raw_sequence_logprobs(self, nbest: list[list[int]]) -> list[float]:
-            return [-float(len(ids)) for ids in nbest]
+        def raw_sequence_logprobs(self, texts: list[str]) -> list[float]:
+            return [-float(len(t.split())) for t in texts]
 
     monkeypatch.setattr(StreamingDecoder_Handler, "_load_lm", lambda self: _StubScorer())
     handler = StreamingDecoder_Handler(model, _StubTok(), beam_size=4, fuse_lm=True, lm_weight=1.0)

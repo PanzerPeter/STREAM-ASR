@@ -21,19 +21,25 @@ def _header_from_config() -> dict[str, int]:
 
 
 def manifest_fingerprint(manifest_path: str) -> str:
-    """Content hash over the (uttid, speed) sequence a cache was built from.
+    """Content hash over the (uttid, speed[, span]) sequence a cache was built from.
 
     The cache is a flat memmap indexed by manifest ROW ORDER, so the manifest is not metadata --
     it is half the data structure. Pairing a clean-mel cache with a speed-perturbed manifest reads
     the right row count and the right shapes and trains on audio that belongs to a different
     utterance, which no downstream check would catch. Hashing the identity of every row makes that
     a load-time error instead of a silent one.
+
+    A trimmed row adds its span, so re-trimming with other parameters invalidates the cache. A row
+    without one hashes exactly as before spans existed, which keeps every untrimmed cache valid.
     """
     digest = hashlib.sha1()
     with open(manifest_path, encoding="utf-8") as handle:
         for line in handle:
             row = json.loads(line)
-            digest.update(f"{row['uttid']}:{row.get('speed', 1.0)}\n".encode())
+            key = f"{row['uttid']}:{row.get('speed', 1.0)}"
+            if "start_sample" in row:
+                key += f":{row['start_sample']}:{row['num_samples']}"
+            digest.update(f"{key}\n".encode())
     return digest.hexdigest()
 
 

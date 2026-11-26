@@ -12,11 +12,12 @@ def main() -> None:
     p.add_argument("--train-bin", default="data/lm_data/train.bin")
     p.add_argument("--val-bin", default="data/lm_data/val.bin")
     p.add_argument("--out-dir", default="data/checkpoints")
+    p.add_argument("--log-dir", default="runs/lm")
     p.add_argument(
-        "--max-steps",
+        "--total-steps",
         type=int,
         default=lm.total_steps,
-        help="step cap; defaults to config lm.total_steps. Lower it for a smoke run.",
+        help="WSD budget; defaults to lm.total_steps. A cooldown branch passes its own.",
     )
     p.add_argument(
         "--fresh", action="store_true", help="ignore any lm_last.pt and start from step 0"
@@ -26,7 +27,8 @@ def main() -> None:
         train_bin=a.train_bin,
         val_bin=a.val_bin,
         out_dir=a.out_dir,
-        max_steps=a.max_steps,
+        total_steps=a.total_steps,
+        log_dir=a.log_dir,
         resume=not a.fresh,
     )
     best = TrainLm_Handler().run(cmd)

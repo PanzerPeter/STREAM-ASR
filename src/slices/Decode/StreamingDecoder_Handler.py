@@ -11,6 +11,7 @@ from src.shared_kernel.AudioIO_Adapter import load_audio
 from src.shared_kernel.Checkpoint_Adapter import load_checkpoint
 from src.shared_kernel.Config_Adapter import get_config
 from src.shared_kernel.LogMel_Transform import compute_log_mel
+from src.shared_kernel.Tokenizer_Adapter import SentencePieceTokenizer
 from src.slices.Decode.InternalLmScorer import InternalLmScorer
 from src.slices.Decode.LmScorer import LmScorer
 from src.slices.Decode.StreamingDecode_Command import StreamingDecode_Command
@@ -43,6 +44,8 @@ class StreamingDecoder_Handler:
         lm_weight: float | None = None,
         ilm_weight: float | None = None,
         length_bonus: float | None = None,
+        lm_checkpoint: str | None = None,
+        lm_tokenizer: str | None = None,
     ) -> None:
         # The overrides let Evaluate sweep weights on dev without mutating decode.yaml, whose zeros
         # are the pure-acoustic regression lock; None = the configured value.
@@ -58,16 +61,25 @@ class StreamingDecoder_Handler:
         beta = ilm_weight if ilm_weight is not None else d.ilm_weight
         self.ilm_weight = beta if fuse_lm else 0.0
         self.ilm_scorer = InternalLmScorer(model)
+        # A released LM is a .safetensors file beside its own tokenizer, not the paths in the yaml.
+        self._lm_checkpoint = lm_checkpoint or d.lm_checkpoint
+        self._lm_tokenizer = lm_tokenizer or self.cfg.lm.tokenizer
         self.lm_scorer = self._load_lm() if fuse_lm and self.lm_weight > 0 else None
         self.searcher = TransducerBeamSearch(model, self.beam_size, d.max_symbols)
         self.model.encoder.check_window(d.chunk_size, d.left_context)
 
     def _load_lm(self) -> LmScorer:
         device = self.model.ctc_head.weight.device
+        lm_tok = SentencePieceTokenizer(self._lm_tokenizer)
+        if lm_tok.vocab_size != self.cfg.lm.vocab_size:
+            raise ValueError(
+                f"{self._lm_tokenizer} has {lm_tok.vocab_size} pieces, "
+                f"lm.vocab_size is {self.cfg.lm.vocab_size}"
+            )
         lm = StreamLmModel()
-        load_checkpoint(self.cfg.decode.lm_checkpoint, lm)
+        load_checkpoint(self._lm_checkpoint, lm)
         lm.to(device).eval()
-        return LmScorer(lm, self.lm_weight)
+        return LmScorer(lm, lm_tok, self.lm_weight)
 
     @property
     def frame_s(self) -> float:
@@ -124,7 +136,11 @@ class StreamingDecoder_Handler:
         if self.lm_scorer is None and self.ilm_weight == 0.0 and lb == 0.0:
             return nbest
         ids_only = [ids for ids, _, _ in nbest]
-        lm = self.lm_scorer.sequence_scores(ids_only) if self.lm_scorer is not None else None
+        lm = (
+            self.lm_scorer.sequence_scores([self.tok.decode(ids) for ids in ids_only])
+            if self.lm_scorer is not None
+            else None
+        )
         ilm = self.ilm_scorer.sequence_logprob_batch(ids_only) if self.ilm_weight else None
         scored = [
             (
@@ -148,7 +164,7 @@ class StreamingDecoder_Handler:
         memory, _ = self._encode(load_audio(cmd.audio_path), cmd.streaming, time.perf_counter())
         nbest = self._search(memory)
         ids_only = [ids for ids, _, _ in nbest]
-        lm = self.lm_scorer.raw_sequence_logprobs(ids_only)
+        lm = self.lm_scorer.raw_sequence_logprobs([self.tok.decode(ids) for ids in ids_only])
         ilm = self.ilm_scorer.sequence_logprob_batch(ids_only)
         return [
             NbestEntry(ids=ids, acoustic=ac, lm=lm[i], ilm=ilm[i])

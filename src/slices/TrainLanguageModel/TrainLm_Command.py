@@ -6,7 +6,9 @@ class TrainLm_Command:
     train_bin: str
     val_bin: str
     out_dir: str
-    max_steps: int  # cap for smoke/overfit; production uses get_config().lm.total_steps
+    # The WSD budget: the loop runs to it and the anneal ends exactly on it. Production passes
+    # lm.total_steps; a cooldown branch passes its own shorter budget (COMMANDS.md, Step 5).
+    total_steps: int
     log_dir: str = (
         "runs/lm"  # TensorBoard scalars (train/loss, train/lr, val/ppl), as the acoustic trainers
     )

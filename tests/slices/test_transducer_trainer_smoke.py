@@ -22,6 +22,7 @@ from src.slices.TrainAcousticModel.SnapshotRotation import (
 from src.slices.TrainAcousticModel.TransducerModel import TransducerModel
 from src.slices.TrainAcousticModel.TransducerTrainer_Command import (
     DevSplit,
+    TrainSource,
     TransducerTrainCommand,
 )
 from src.slices.TrainAcousticModel.TransducerTrainer_Handler import (
@@ -116,6 +117,18 @@ def _corpus(tmp_path, name: str, n: int) -> str:
     return str(manifest)
 
 
+def _trimmed_corpus(tmp_path, name: str, n: int) -> str:
+    # A second source shaped like cv-train: every row reads a span of its file.
+    sr = get_config().audio.sample_rate
+    rows = [json.loads(line) for line in open(_corpus(tmp_path, name, n), encoding="utf-8")]
+    for row in rows:
+        row["start_sample"] = sr // 10
+        row["num_samples"] -= sr // 5
+    manifest = tmp_path / f"{name}.jsonl"
+    manifest.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    return str(manifest)
+
+
 @pytest.mark.skipif(not os.path.isfile(_TOKENIZER), reason="needs the BPE-500 tokenizer")
 def test_run_transducer_end_to_end_on_cpu(tmp_path, monkeypatch):
     # Every phase in four steps: full-lattice warmup, the band switch, validation (label-looping
@@ -140,8 +153,10 @@ def test_run_transducer_end_to_end_on_cpu(tmp_path, monkeypatch):
     cmvn = tmp_path / "cmvn.pt"
     torch.save({"mean": torch.full((80,), -5.0), "std": torch.full((80,), 4.0)}, cmvn)
     cmd = TransducerTrainCommand(
-        train_manifest=_corpus(tmp_path, "train", 6),
-        train_cache_split="absent",
+        train_sources=(
+            TrainSource(_corpus(tmp_path, "train", 6), "absent"),
+            TrainSource(_trimmed_corpus(tmp_path, "cv", 3), "absent"),
+        ),
         dev_splits=(DevSplit("other", _corpus(tmp_path, "dev", 3), "absent"),),
         cache_dir=str(tmp_path / "no_cache"),
         tokenizer_model=_TOKENIZER,

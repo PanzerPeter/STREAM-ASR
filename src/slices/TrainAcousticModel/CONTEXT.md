@@ -6,7 +6,9 @@ in one joint stage, from scratch. Ground truth for every operator is `MODEL_ARCH
 
 ## Entry Point
 - Type: CLI (`train_transducer.py`) → `run_transducer`
-- Input: `TransducerTrainCommand` (validated in `__post_init__`)
+- Input: `TransducerTrainCommand` (validated in `__post_init__`): `train_sources`, a tuple of
+  `TrainSource(manifest, cache_split)` pairs read side by side; CLI `--train-manifest` /
+  `--train-cache-split` are repeatable and pair in order
 - Output: `str` (checkpoint path, `transducer_last.pt`)
 - Model surface (the artifact contract Decode, Evaluate and Demo use):
   - `TransducerModel(features, lengths, chunk_size=0, left_context=-1) -> (memory, out_lengths,
@@ -19,7 +21,8 @@ in one joint stage, from scratch. Ground truth for every operator is `MODEL_ARCH
   - `S2Encoder.init_stream(batch, left_context)` / `streaming_forward(chunk, cache, n_valid)`.
 
 ## Data Ownership
-- Consumes artifacts: `data/manifests/{train_sp2,dev,dev-other}.jsonl`, their mel caches
+- Consumes artifacts: `data/manifests/{train_sp2,cv-train,dev,cv-dev2k,dev-other}.jsonl`, their
+  mel caches
   (`data/features/mel/<split>.*`, paired by manifest fingerprint), `data/tokenizer/bpe500.model`,
   `data/features/cmvn.pt` (required; absent is a `FileNotFoundError`).
 - Produces artifacts: `data/checkpoints/transducer_last.pt` (resume point), `transducer_best.pt`
@@ -44,6 +47,8 @@ in one joint stage, from scratch. Ground truth for every operator is `MODEL_ARCH
   bounded pre-RoPE key ring.
 - `StreamCache`: frontend tails + per-block conv tail and k/v/valid ring.
 - `TransducerModel`: heads, objective, band, label-looping greedy, the batched streaming window.
+- `TrainingLoaders`: a `ConcatDataset` of one `LibriSpeechDataset` per train source plus one
+  `FrameBucketSampler` over all their manifests (same order, so the indices agree).
 - `TransducerTrainer_Handler` (+ `TrainingLoaders`, `TrainingHealth`, `DevMetrics`,
   `SnapshotRotation`, `GradNormGuard`): the loop, its loaders, its logged scalars, validation,
   checkpoint files, runaway guard.
@@ -52,7 +57,8 @@ in one joint stage, from scratch. Ground truth for every operator is `MODEL_ARCH
 - `total_steps` counts loader batches, not optimizer updates (`grad_accum` batches per update).
 - The first `band_warmup_steps` batches run the full lattice; the band is built from the detached
   CTC blank posteriors with both repair passes, and `train/band_infeasible` must read 0.
-- Validation runs eager (`force_eager`) over every dev split: greedy CTC and label-looping greedy
+- Validation runs eager (`force_eager`) over every dev split (clean, cv, other; the last one
+  supplies the fixed probe batch): greedy CTC and label-looping greedy
   transducer WER, offline and in the deployed streaming condition (decode chunk, left context,
   completed final chunk, kept tail chunk), plus `dev/band_loss_gap` and the attention-gate
   saturation on one fixed dev-other batch.

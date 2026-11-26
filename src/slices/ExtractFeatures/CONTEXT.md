@@ -6,7 +6,8 @@ Turn manifest rows into padded log-mel/token training batches.
 ## Entry Point
 - Type: PyTorch Dataset + collate + sampler (`LibriSpeechDataset`, `FeatureCollator`,
   `FrameBucketSampler`), plus the cache builder CLI `scripts/precompute_features.py`
-- Input: manifest path + `SentencePieceTokenizer`; `PrecomputeFeaturesCommand` for the cache
+- Input: manifest path + `SentencePieceTokenizer` (dataset), a manifest tuple (sampler);
+  `PrecomputeFeaturesCommand` for the cache
 - Output: `FeatureBatch`; side effect: the fp16 mel cache
 
 ## Data Ownership
@@ -15,14 +16,16 @@ Turn manifest rows into padded log-mel/token training batches.
   cache, read back through `FeatureCacheReader` as a mmap so the training epoch loop is GPU-bound.
 
 ## Shared Kernel
-- AudioIO_Adapter, LogMel_Transform: audio → features
+- AudioIO_Adapter (`load_row_audio`: trim span, then speed), LogMel_Transform: audio → features
 - Config_Adapter.get_config(): feature/augmentation tunables (`cfg.audio.*`, `cfg.augment.*`)
 
 ## Notes
 `FrameBucketSampler` batches by budget, not by a fixed count: `max_frames_per_batch` and
 `max_tokens_per_batch` are sums (they bound the average batch), while `max_lattice_per_batch` caps
 `B × max(frames) × max(chars)` on the *worst* batch, which is the full RNN-T lattice and binds during
-the transducer's band warmup. Order is a plain duration sort.
+the transducer's band warmup. Order is a plain duration sort. Several manifests are read back to back, so sampler index `i` is
+row `i` of their concatenation, the indexing of a `ConcatDataset` over one `LibriSpeechDataset` per
+manifest in the same order (test-locked); bucketing runs over the pooled rows.
 
 The batch list is built once and cached. It depends only on the fixed sort order and the three
 budgets, so it is identical every epoch; `__iter__` shuffles a copy, leaving the cached order
@@ -41,7 +44,8 @@ per row, for a run without a cache.
 Because the cache is a flat memmap indexed by manifest ROW ORDER, the manifest is half the data
 structure, not metadata: pairing a cache with the wrong manifest reads the right row count and the
 right shapes and trains on another utterance's audio. `manifest_fingerprint` (sha1 over each row's
-`(uttid, speed)`) is written into the cache header and checked by both `FeatureCacheReader` and
+`(uttid, speed)`, plus `(start_sample, num_samples)` for a trimmed row; an untrimmed row hashes
+exactly as before spans existed, so existing caches stay valid) is written into the cache header and checked by both `FeatureCacheReader` and
 `LibriSpeechDataset.__init__`, turning that into a load-time error. The header is also the
 completion marker (it is written last, after the whole flat file), so `cached_utt_count` (header
 present, fingerprint matching, index rows and `.f16` byte count agreeing with it) lets

@@ -1,8 +1,8 @@
 # Corpus WER/CER/RTF/latency + ablation table (GPU; user-run).
 #
-# `--clean` / `--other` (exactly one, no default) name a LibriSpeech condition, not a file: each
-# binds BOTH the test manifest that is scored and the dev manifest the rescoring weights are tuned
-# on, so a test-other table can never be reported against weights tuned on dev-clean, and the two
+# `--clean` / `--other` / `--cv` (exactly one, no default) name an acoustic condition, not a file:
+# each binds BOTH the test manifest that is scored and the dev manifest the rescoring weights are
+# tuned on, so a test-other table can never be reported against weights tuned on dev-clean, and the
 # reports cannot land on the same path.
 #
 # The run has two passes, deliberately separated:
@@ -22,6 +22,7 @@
 # streaming's acoustic scores are weaker, and the weight that best offsets them is not the offline
 # one.
 import argparse
+import hashlib
 import json
 import multiprocessing as mp
 import time
@@ -53,7 +54,7 @@ _MODES = ("offline", "streaming")
 
 @dataclass(frozen=True)
 class _Split:
-    # A LibriSpeech acoustic condition: the test manifest to score and the dev manifest to tune on.
+    # An acoustic condition: the test manifest to score and the dev manifest to tune on.
     # They must move together -- dev-clean weights applied to test-other is tuning on the wrong
     # acoustics, and one shared report path lets the second run silently overwrite the first.
     name: str
@@ -64,6 +65,9 @@ class _Split:
 _SPLITS = {
     "clean": _Split("clean", "data/manifests/test.jsonl", "data/manifests/dev.jsonl"),
     "other": _Split("other", "data/manifests/test-other.jsonl", "data/manifests/dev-other.jsonl"),
+    # Tuned on the strided 2,000-clip slice of cv-dev: the full 16k-clip dev would cost more decode
+    # time than the test pass it tunes, for weights that the slice already pins.
+    "cv": _Split("cv", "data/manifests/cv-test.jsonl", "data/manifests/cv-dev2k.jsonl"),
 }
 
 
@@ -113,7 +117,7 @@ def _sweep(
     # and the corpus WER over those picks scores the point. The ranking expression must match the
     # live decode one (StreamingDecoder_Handler._search_rescore) so the weights chosen here are the
     # weights used there. _prepare already aligned every hypothesis, so a point costs one argmax
-    # per utterance -- a 13x7x5 grid is seconds of CPU inside a pass that costs GPU hours.
+    # per utterance -- a 13x7x8 grid is seconds of CPU inside a pass that costs GPU hours.
     total_words = max(1, sum(p[2] for p in prepared))
     wer_by_point: dict[tuple[float, float, float], float] = {}
     for alpha in alpha_grid:
@@ -303,6 +307,13 @@ def main() -> None:
         const="other",
         help="test-other, tuned on dev-other",
     )
+    split.add_argument(
+        "--cv",
+        dest="split",
+        action="store_const",
+        const="cv",
+        help="Common Voice test, tuned on the cv-dev 2,000-clip slice",
+    )
     # The averaged tail, not transducer_best.pt: `_best` is one validation's minimum, so part of
     # its lead over its neighbours is noise. Run scripts/average_checkpoints.py after training.
     ap.add_argument("--checkpoint", default="data/checkpoints/transducer_avg.pt")
@@ -339,8 +350,16 @@ def main() -> None:
         "--ilm-grid", default="0.0,0.1,0.2,0.3,0.4,0.5,0.6", help="beta grid for the dev sweep"
     )
     ap.add_argument(
+        "--length-bonus",
+        type=float,
+        default=None,
+        help="fixed length bonus for both modes; giving it skips the dev sweep",
+    )
+    # Past 1.0 because the 1.2M-batch model's dev sweeps chose 1.0, the old ceiling, on clean and
+    # cv offline: a weight on the edge of its grid is a bound, not an optimum.
+    ap.add_argument(
         "--lb-grid",
-        default="0.0,0.25,0.5,0.75,1.0",
+        default="0.0,0.25,0.5,0.75,1.0,1.25,1.5,2.0",
         help="length_bonus grid for the dev sweep (per-token bonus offsetting RNN-T deletions)",
     )
     ap.add_argument(
@@ -397,7 +416,7 @@ def main() -> None:
     n_test = len(subsample(load_manifest(sp.test_manifest), args.limit))
 
     gpu = torch.cuda.get_device_name(0) if device == "cuda" else "cpu"
-    log(f"=== evaluate: LibriSpeech {sp.name} =========================================")
+    log(f"=== evaluate: {sp.name} =========================================")
     log(f"  test      {sp.test_manifest}  (n={n_test})")
     log(f"  dev       {sp.dev_manifest}")
     log(f"  model     {args.checkpoint}  |  tokenizer {args.tokenizer}")
@@ -412,7 +431,7 @@ def main() -> None:
     log("=" * 78)
 
     t_start = time.perf_counter()
-    fixed_weight = args.lm_weight is not None or args.ilm_weight is not None
+    fixed_weight = any(w is not None for w in (args.lm_weight, args.ilm_weight, args.length_bonus))
     fixed = args.on_dev or args.no_tune or fixed_weight
     tuning: dict[str, dict[str, float | None]] = {}
     if any(stage_uses_lm(s) for s in stages) and not fixed:
@@ -440,7 +459,7 @@ def main() -> None:
         # lm_weight=0.0 (the alpha=0 regression lock), so sweeps never mutate it.
         a = args.lm_weight if args.lm_weight is not None else cfg.decode.lm_weight
         b = args.ilm_weight if args.ilm_weight is not None else cfg.decode.ilm_weight
-        lb = cfg.decode.length_bonus
+        lb = args.length_bonus if args.length_bonus is not None else cfg.decode.length_bonus
         weights = {m: (a, b, lb) for m in _MODES}
         log(f"--- fixed weights (no dev sweep): alpha={a} beta={b} lb={lb}")
     for m in _MODES:
@@ -509,6 +528,16 @@ def main() -> None:
     _print_table(rows)
     out = Path(args.report or cfg.eval.report_path.format(split=sp.name))
     out.parent.mkdir(parents=True, exist_ok=True)
+    # Artifact paths are reused across versions (every run writes transducer_avg.pt, and the
+    # previous one is moved aside), so a path alone does not say which model scored; a digest does.
+    uses_lm = any(stage_uses_lm(s) for s in stages)
+    lm_checkpoint, lm_tokenizer = (
+        (cfg.decode.lm_checkpoint, cfg.lm.tokenizer) if uses_lm else (None, None)
+    )
+    sha256 = {}
+    for p in filter(None, (args.checkpoint, args.tokenizer, lm_checkpoint, lm_tokenizer)):
+        with open(p, "rb") as f:
+            sha256[p] = hashlib.file_digest(f, "sha256").hexdigest()
     # Which split produced these numbers, and where the weights came from, is part of the result --
     # a test-other table is not comparable to a test-clean one, and neither is comparable to a run
     # whose alpha was fixed by hand.
@@ -520,6 +549,9 @@ def main() -> None:
                 "tune_manifest": sp.dev_manifest if tuning else None,
                 "checkpoint": args.checkpoint,
                 "tokenizer": args.tokenizer,
+                "lm_checkpoint": lm_checkpoint,
+                "lm_tokenizer": lm_tokenizer,
+                "sha256": sha256,
                 "beam_size": cfg.decode.beam_size,
                 "chunk_size": cfg.decode.chunk_size,
                 "left_context": cfg.decode.left_context,
