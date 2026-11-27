@@ -99,16 +99,7 @@ modes worth knowing first.
 
 ## How it works
 
-```
-raw log-mel [B, T, 80] ──► CMVN, mean fill past each length, pad to 16 frames
-  └► DwSepSubsampling (x4, stride-aligned causal pad) ──► rms_norm            25 Hz, d 320
-       └► S0: 4 blocks                                                        25 Hz
-            └► pool ► S1: 8 blocks ─────────────────────── skip ──┐          12.5 Hz, d 512
-                 └► pool ► S2: linear path ► upsample ► (+) ◄─────┘          6.25 Hz, d 640
-                                              └► S3: 8 blocks ► rms_norm      12.5 Hz memory
-memory ─► CTC head (sets the band, auxiliary CTC loss)
-       └► additive joiner on the band ◄── stateless predictor (BPE-500 + blank)
-```
+![STREAM ASR architecture: S2 encoder, banded RNN-T heads and STREAM-LM rescoring](docs/architecture.png)
 
 * **Encoder.** A three-rate U-Net with 20 blocks. Each block is gated QK-norm RoPE attention, then a
   conv-gated MLP on its result, each a residual step `x + β ⊙ rms_norm(y)` with a per-channel gate
@@ -145,6 +136,7 @@ src/slices/
 scripts/                data prep, checkpoint averaging, safetensors export, step profiler
 tests/                  CPU suite (pytest), GPU gates under -m slow
 release/                model cards, tokenizer and checksums per released version
+docs/                   the README architecture sketch and the script that draws it
 ```
 
 The code follows Vertical Slice Architecture ([VSA.md](VSA.md)): slices talk only through artifact
